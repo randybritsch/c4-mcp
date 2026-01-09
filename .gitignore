@@ -1,0 +1,82 @@
+# .gitignore for Control4 MCP Integration
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.log.*
+/var/log/
+
+# Flask
+instance/
+.webassets-cache
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Control4
+*.c4z
+*.c4p
+*.c4i
+
+# Documentation
+docs/_build/
+
+# Redis
+dump.rdb
+
+# Nginx
+ssl/*.key
+ssl/*.pem
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+# OS
+Thumbs.db
