@@ -1,23 +1,36 @@
-from flask import Flask, jsonify
-from flask_mcp_server import mount_mcp, Mcp
-from flask_mcp_server.http_integrated import mw_auth, mw_ratelimit, mw_cors
+# app.py (recovered + reformatted)
+
+from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
+from flask import Flask, jsonify
+from flask_mcp_server import Mcp, mount_mcp
+from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
+
+from control4_gateway import Control4Gateway
 from control4_adapter import (
-    list_rooms,
     get_all_items,
+    item_execute_command,
+    item_get_commands,
     item_get_variables,
-    light_get_state,
     light_get_level,
-    light_set_level,
+    light_get_state,
     light_ramp,
+    light_set_level,
+    list_rooms,
     lock_get_state,
     lock_lock,
     lock_unlock,
 )
 
+# ---------- App / Gateway ----------
 app = Flask(__name__)
+gateway = Control4Gateway()
+
+# Locks can block (cloud/driver latency); run them in a small thread pool
+_lock_pool = ThreadPoolExecutor(max_workers=4)
 
 # Return JSON for any unhandled error so PowerShell doesn't hide it
 @app.errorhandler(Exception)
@@ -32,10 +45,27 @@ def ping() -> dict:
     return {"ok": True}
 
 
+@Mcp.tool(name="c4_director_methods", description="List callable methods on the Director object (debug).")
+def c4_director_methods() -> dict:
+    d = gateway._loop_thread.run(gateway._director_async(), timeout_s=10)
+    names = sorted([n for n in dir(d) if callable(getattr(d, n, None)) and not n.startswith("_")])
+    return {"ok": True, "methods": names}
+
+
 @Mcp.tool(name="c4_item_variables", description="Get raw Director variables for an item (debug).")
 def c4_item_variables(device_id: str) -> dict:
     vars_ = item_get_variables(int(device_id))
     return {"ok": True, "device_id": str(device_id), "variables": vars_}
+
+
+@Mcp.tool(name="c4_item_commands", description="Get available Director commands for an item (debug).")
+def c4_item_commands(device_id: str) -> dict:
+    return {"ok": True, **item_get_commands(int(device_id))}
+
+
+@Mcp.tool(name="c4_item_execute_command", description="Execute a specific Director command by command_id (debug).")
+def c4_item_execute_command(device_id: str, command_id: int) -> dict:
+    return {"ok": True, **item_execute_command(int(device_id), int(command_id))}
 
 
 @Mcp.tool(name="c4_list_rooms", description="List rooms from Control4 (live).")
@@ -109,8 +139,8 @@ def c4_list_devices(category: str) -> dict:
     }
 
     allowed = category_controls[category]
-
     devices = []
+
     for i in items:
         if not isinstance(i, dict):
             continue
@@ -164,12 +194,10 @@ def c4_light_set_level_tool(device_id: str, level: int) -> dict:
 def c4_light_ramp_tool(device_id: str, level: int, time_ms: int) -> dict:
     level = int(level)
     time_ms = int(time_ms)
-
     if level < 0 or level > 100:
         return {"ok": False, "error": "level must be 0-100"}
     if time_ms < 0:
         return {"ok": False, "error": "time_ms must be >= 0"}
-
     state = light_ramp(int(device_id), level, time_ms)
     return {"ok": True, "device_id": str(device_id), "level": level, "time_ms": time_ms, "state": bool(state)}
 
@@ -178,24 +206,43 @@ def c4_light_ramp_tool(device_id: str, level: int, time_ms: int) -> dict:
 
 @Mcp.tool(name="c4_lock_get_state", description="Get current lock state (locked/unlocked) for a Control4 lock.")
 def c4_lock_get_state_tool(device_id: str) -> dict:
-    result = lock_get_state(int(device_id))
-    return {"ok": True, **result}
-
-
-@Mcp.tool(name="c4_lock_lock", description="Lock a Control4 lock.")
-def c4_lock_lock_tool(device_id: str) -> dict:
-    result = lock_lock(int(device_id))
-    return {"ok": True, **result}
+    try:
+        fut = _lock_pool.submit(lock_get_state, int(device_id))
+        result = fut.result(timeout=20)
+        return {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
+    except FutureTimeout:
+        return {"ok": False, "device_id": int(device_id), "error": "tool timeout (20s)"}
+    except Exception as e:
+        return {"ok": False, "device_id": int(device_id), "error": repr(e)}
 
 
 @Mcp.tool(name="c4_lock_unlock", description="Unlock a Control4 lock.")
 def c4_lock_unlock_tool(device_id: str) -> dict:
-    result = lock_unlock(int(device_id))
-    return {"ok": True, **result}
+    try:
+        fut = _lock_pool.submit(lock_unlock, int(device_id))
+        result = fut.result(timeout=20)
+        return {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
+    except FutureTimeout:
+        return {"ok": False, "device_id": int(device_id), "error": "tool timeout (20s)"}
+    except Exception as e:
+        return {"ok": False, "device_id": int(device_id), "error": repr(e)}
+
+
+@Mcp.tool(name="c4_lock_lock", description="Lock a Control4 lock.")
+def c4_lock_lock_tool(device_id: str) -> dict:
+    try:
+        fut = _lock_pool.submit(lock_lock, int(device_id))
+        result = fut.result(timeout=20)
+        return {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
+    except FutureTimeout:
+        return {"ok": False, "device_id": int(device_id), "error": "tool timeout (20s)"}
+    except Exception as e:
+        return {"ok": False, "device_id": int(device_id), "error": repr(e)}
 
 
 # ✅ In 0.6.1: mount without passing a registry object or Mcp() instance
 mount_mcp(app, url_prefix="/mcp", middlewares=[mw_auth, mw_ratelimit, mw_cors])
 
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=3333, debug=False, use_reloader=False)
+    app.run(host="127.0.0.1", port=3333, debug=False, use_reloader=False, threaded=True)
