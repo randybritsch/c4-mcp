@@ -6,6 +6,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 from flask import Flask, jsonify
+from werkzeug.exceptions import HTTPException
 from flask_mcp_server import Mcp, mount_mcp
 from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
 
@@ -26,6 +27,13 @@ from control4_adapter import (
     lock_get_state,
     lock_lock,
     lock_unlock,
+    thermostat_get_state,
+    thermostat_set_cool_setpoint_f,
+    thermostat_set_fan_mode,
+    thermostat_set_heat_setpoint_f,
+    thermostat_set_hold_mode,
+    thermostat_set_hvac_mode,
+    thermostat_set_target_f,
 )
 
 # ---------- App / Gateway ----------
@@ -59,9 +67,24 @@ def _augment_lock_result(result: dict, desired_locked: bool | None = None) -> di
 
     return result
 
-# Return JSON for any unhandled error so PowerShell doesn't hide it
+# Return JSON errors, but preserve correct HTTP status codes (e.g., 404).
+@app.errorhandler(HTTPException)
+def _handle_http_exception(e: HTTPException):
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "error": e.name,
+                "status": int(getattr(e, "code", 500) or 500),
+                "details": str(getattr(e, "description", "")) or None,
+            }
+        ),
+        int(getattr(e, "code", 500) or 500),
+    )
+
+
 @app.errorhandler(Exception)
-def _handle_any_exception(e):
+def _handle_any_exception(e: Exception):
     return jsonify({"ok": False, "error": repr(e)}), 500
 
 
@@ -242,6 +265,66 @@ def c4_list_devices(category: str) -> dict:
 
     devices.sort(key=lambda d: ((d.get("roomName") or ""), (d.get("name") or "")))
     return {"ok": True, "category": category, "devices": devices}
+
+
+# ---- Thermostats ----
+
+@Mcp.tool(name="c4_thermostat_get_state", description="Get current state for a Control4 thermostat.")
+def c4_thermostat_get_state_tool(device_id: str) -> dict:
+    result = thermostat_get_state(int(device_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(name="c4_thermostat_set_hvac_mode", description="Set HVAC mode (Off/Heat/Cool/Auto) on a Control4 thermostat.")
+def c4_thermostat_set_hvac_mode_tool(device_id: str, mode: str, confirm_timeout_s: float = 8.0) -> dict:
+    result = thermostat_set_hvac_mode(int(device_id), str(mode or ""), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(name="c4_thermostat_set_fan_mode", description="Set fan mode (On/Auto/Circulate) on a Control4 thermostat.")
+def c4_thermostat_set_fan_mode_tool(device_id: str, mode: str, confirm_timeout_s: float = 8.0) -> dict:
+    result = thermostat_set_fan_mode(int(device_id), str(mode or ""), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(name="c4_thermostat_set_hold_mode", description="Set hold mode (Off/2 Hours/Next Event/Permanent/Hold Until) on a Control4 thermostat.")
+def c4_thermostat_set_hold_mode_tool(device_id: str, mode: str, confirm_timeout_s: float = 8.0) -> dict:
+    result = thermostat_set_hold_mode(int(device_id), str(mode or ""), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(name="c4_thermostat_set_heat_setpoint_f", description="Set heat setpoint (F) on a Control4 thermostat.")
+def c4_thermostat_set_heat_setpoint_f_tool(device_id: str, setpoint_f: float, confirm_timeout_s: float = 8.0) -> dict:
+    result = thermostat_set_heat_setpoint_f(int(device_id), float(setpoint_f), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(name="c4_thermostat_set_cool_setpoint_f", description="Set cool setpoint (F) on a Control4 thermostat.")
+def c4_thermostat_set_cool_setpoint_f_tool(device_id: str, setpoint_f: float, confirm_timeout_s: float = 8.0) -> dict:
+    result = thermostat_set_cool_setpoint_f(int(device_id), float(setpoint_f), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_thermostat_set_target_f",
+    description=(
+        "Set a target temperature (F) without changing HVAC mode. "
+        "Heat sets heat setpoint; Cool sets cool setpoint; Auto sets heat=target and cool=target+deadband."
+    ),
+)
+def c4_thermostat_set_target_f_tool(
+    device_id: str,
+    target_f: float,
+    confirm_timeout_s: float = 10.0,
+    deadband_f: float | None = None,
+) -> dict:
+    result = thermostat_set_target_f(
+        int(device_id),
+        float(target_f),
+        float(confirm_timeout_s),
+        (float(deadband_f) if deadband_f is not None else None),
+    )
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
 # ---- Lights ----

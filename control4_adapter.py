@@ -107,3 +107,43 @@ def light_ramp(device_id: int, level: int, time_ms: int) -> bool:
     if hasattr(gateway, "light_ramp"):
         return bool(gateway.light_ramp(int(device_id), int(level), int(time_ms)))  # type: ignore[misc]
     return False
+
+
+# --------- Thermostats ---------
+
+def thermostat_get_state(device_id: int) -> Json:
+    return gateway.thermostat_get_state(int(device_id))  # type: ignore[misc]
+
+
+def thermostat_set_hvac_mode(device_id: int, mode: str, confirm_timeout_s: float = 8.0) -> Json:
+    return gateway.thermostat_set_hvac_mode(int(device_id), str(mode or ""), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
+
+
+def thermostat_set_fan_mode(device_id: int, mode: str, confirm_timeout_s: float = 8.0) -> Json:
+    return gateway.thermostat_set_fan_mode(int(device_id), str(mode or ""), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
+
+
+def thermostat_set_hold_mode(device_id: int, mode: str, confirm_timeout_s: float = 8.0) -> Json:
+    return gateway.thermostat_set_hold_mode(int(device_id), str(mode or ""), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
+
+
+def thermostat_set_heat_setpoint_f(device_id: int, setpoint_f: float, confirm_timeout_s: float = 8.0) -> Json:
+    return gateway.thermostat_set_heat_setpoint_f(int(device_id), float(setpoint_f), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
+
+
+def thermostat_set_cool_setpoint_f(device_id: int, setpoint_f: float, confirm_timeout_s: float = 8.0) -> Json:
+    return gateway.thermostat_set_cool_setpoint_f(int(device_id), float(setpoint_f), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
+
+
+def thermostat_set_target_f(
+    device_id: int,
+    target_f: float,
+    confirm_timeout_s: float = 10.0,
+    deadband_f: float | None = None,
+) -> Json:
+    return gateway.thermostat_set_target_f(
+        int(device_id),
+        float(target_f),
+        confirm_timeout_s=float(confirm_timeout_s),
+        deadband_f=(float(deadband_f) if deadband_f is not None else None),
+    )  # type: ignore[misc]

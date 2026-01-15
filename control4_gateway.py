@@ -1191,6 +1191,358 @@ class Control4Gateway:
         except Exception:
             return None
 
+    @staticmethod
+    def _coerce_float(v: Any) -> float | None:
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip()
+        if not s:
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _vars_to_map(variables: list[dict[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for row in variables:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("varName")
+            if name is None:
+                continue
+            out[str(name)] = row.get("value")
+        return out
+
+    @staticmethod
+    def _thermostat_state_from_vars(vars_by_name: dict[str, Any]) -> dict[str, Any]:
+        # Prefer display-friendly values when present.
+        def pick(*names: str) -> Any:
+            for n in names:
+                if n in vars_by_name:
+                    return vars_by_name.get(n)
+            return None
+
+        return {
+            "temperature_f": pick("DISPLAY_TEMPERATURE", "TEMPERATURE_F"),
+            "temperature_c": pick("TEMPERATURE_C"),
+            "heat_setpoint_f": pick("DISPLAY_HEATSETPOINT", "HEAT_SETPOINT_F"),
+            "cool_setpoint_f": pick("DISPLAY_COOLSETPOINT", "COOL_SETPOINT_F"),
+            "heatcool_deadband_f": pick("HEATCOOL_SETPOINTS_DEADBAND_F"),
+            "hvac_mode": pick("HVAC_MODE", "ANA_HVACMODE", "V1 HVACMODE"),
+            "hvac_state": pick("HVAC_STATE", "ANA_HVACSTATE"),
+            "fan_mode": pick("FAN_MODE", "ANA_FANMODE"),
+            "fan_state": pick("FAN_STATE", "ANA_FANSTATE"),
+            "hold_mode": pick("HOLD_MODE", "ANA_HOLDMODE"),
+            "humidity": pick("HUMIDITY"),
+            "humidity_mode": pick("HUMIDITY_MODE"),
+            "humidity_state": pick("HUMIDITY_STATE"),
+            "outdoor_temperature_f": pick("OUTDOOR_TEMPERATURE_F"),
+        }
+
+    async def _thermostat_get_state_async(self, device_id: int) -> dict[str, Any]:
+        device_id = int(device_id)
+        fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+        var_list: list[dict[str, Any]] = (
+            fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+        )
+        vars_by_name = self._vars_to_map(var_list)
+        state = self._thermostat_state_from_vars(vars_by_name)
+
+        # Coerce some common numeric fields for predictable tool output.
+        for k in (
+            "temperature_f",
+            "temperature_c",
+            "heat_setpoint_f",
+            "cool_setpoint_f",
+            "heatcool_deadband_f",
+            "humidity",
+            "outdoor_temperature_f",
+        ):
+            if state.get(k) is not None:
+                state[k] = self._coerce_float(state.get(k))
+
+        return {
+            "ok": bool(fetched.get("ok")) or True,
+            "device_id": device_id,
+            "source": fetched.get("source") or "director.getItemVariables",
+            "state": state,
+        }
+
+    def thermostat_get_state(self, device_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._thermostat_get_state_async(int(device_id)), timeout_s=12)
+
+    async def _thermostat_send_and_confirm_async(
+        self,
+        device_id: int,
+        command: str,
+        params: dict[str, Any],
+        confirm_predicate,
+        confirm_timeout_s: float = 8.0,
+        poll_interval_s: float = 0.5,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        before = await self._thermostat_get_state_async(device_id)
+
+        exec_result = await self._item_send_command_async(device_id, command, params)
+        if not exec_result.get("ok"):
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "requested": {"command": str(command or ""), "params": params},
+                "accepted": False,
+                "confirmed": False,
+                "before": before,
+                "execute": exec_result,
+            }
+
+        deadline = asyncio.get_running_loop().time() + float(confirm_timeout_s)
+        last = before
+
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(max(0.2, float(poll_interval_s)))
+            now = await self._thermostat_get_state_async(device_id)
+            last = now
+            try:
+                if confirm_predicate(now):
+                    return {
+                        "ok": True,
+                        "device_id": device_id,
+                        "requested": {"command": str(command or ""), "params": params},
+                        "accepted": True,
+                        "confirmed": True,
+                        "before": before,
+                        "after": now,
+                        "execute": exec_result,
+                    }
+            except Exception:
+                # If predicate is buggy, don't crash tool.
+                continue
+
+        return {
+            "ok": True,
+            "device_id": device_id,
+            "requested": {"command": str(command or ""), "params": params},
+            "accepted": True,
+            "confirmed": False,
+            "before": before,
+            "after": last,
+            "execute": exec_result,
+            "confirm_timeout_s": float(confirm_timeout_s),
+        }
+
+    def thermostat_set_hvac_mode(self, device_id: int, mode: str, confirm_timeout_s: float = 8.0) -> dict[str, Any]:
+        mode = str(mode or "").strip()
+        if not mode:
+            return {"ok": False, "device_id": int(device_id), "error": "mode is required"}
+
+        async def _run() -> dict[str, Any]:
+            return await self._thermostat_send_and_confirm_async(
+                int(device_id),
+                "SET_MODE_HVAC",
+                {"MODE": mode},
+                lambda r: (r.get("state") or {}).get("hvac_mode") == mode,
+                confirm_timeout_s=float(confirm_timeout_s),
+            )
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 18.0)
+
+    def thermostat_set_fan_mode(self, device_id: int, mode: str, confirm_timeout_s: float = 8.0) -> dict[str, Any]:
+        mode = str(mode or "").strip()
+        if not mode:
+            return {"ok": False, "device_id": int(device_id), "error": "mode is required"}
+
+        async def _run() -> dict[str, Any]:
+            return await self._thermostat_send_and_confirm_async(
+                int(device_id),
+                "SET_MODE_FAN",
+                {"MODE": mode},
+                lambda r: (r.get("state") or {}).get("fan_mode") == mode,
+                confirm_timeout_s=float(confirm_timeout_s),
+            )
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 18.0)
+
+    def thermostat_set_hold_mode(self, device_id: int, mode: str, confirm_timeout_s: float = 8.0) -> dict[str, Any]:
+        mode = str(mode or "").strip()
+        if not mode:
+            return {"ok": False, "device_id": int(device_id), "error": "mode is required"}
+
+        async def _run() -> dict[str, Any]:
+            return await self._thermostat_send_and_confirm_async(
+                int(device_id),
+                "SET_MODE_HOLD",
+                {"MODE": mode},
+                lambda r: (r.get("state") or {}).get("hold_mode") == mode,
+                confirm_timeout_s=float(confirm_timeout_s),
+            )
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 18.0)
+
+    def thermostat_set_heat_setpoint_f(
+        self, device_id: int, setpoint_f: float, confirm_timeout_s: float = 8.0
+    ) -> dict[str, Any]:
+        sp = self._coerce_float(setpoint_f)
+        if sp is None:
+            return {"ok": False, "device_id": int(device_id), "error": "setpoint_f must be a number"}
+
+        target = float(round(sp))
+
+        async def _run() -> dict[str, Any]:
+            return await self._thermostat_send_and_confirm_async(
+                int(device_id),
+                "SET_SETPOINT_HEAT",
+                {"FAHRENHEIT": str(int(round(target)))},
+                lambda r: self._coerce_float((r.get("state") or {}).get("heat_setpoint_f")) == target,
+                confirm_timeout_s=float(confirm_timeout_s),
+            )
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 18.0)
+
+    def thermostat_set_cool_setpoint_f(
+        self, device_id: int, setpoint_f: float, confirm_timeout_s: float = 8.0
+    ) -> dict[str, Any]:
+        sp = self._coerce_float(setpoint_f)
+        if sp is None:
+            return {"ok": False, "device_id": int(device_id), "error": "setpoint_f must be a number"}
+
+        target = float(round(sp))
+
+        async def _run() -> dict[str, Any]:
+            return await self._thermostat_send_and_confirm_async(
+                int(device_id),
+                "SET_SETPOINT_COOL",
+                {"FAHRENHEIT": str(int(round(target)))},
+                lambda r: self._coerce_float((r.get("state") or {}).get("cool_setpoint_f")) == target,
+                confirm_timeout_s=float(confirm_timeout_s),
+            )
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 18.0)
+
+    def thermostat_set_target_f(
+        self,
+        device_id: int,
+        target_f: float,
+        confirm_timeout_s: float = 10.0,
+        deadband_f: float | None = None,
+    ) -> dict[str, Any]:
+        """Set a target temperature without changing HVAC mode.
+
+        - Heat: sets heat setpoint
+        - Cool: sets cool setpoint
+        - Auto: sets heat setpoint to target, cool setpoint to target+deadband
+
+        Returns accepted/confirmed semantics based on observed variable updates.
+        """
+        sp = self._coerce_float(target_f)
+        if sp is None:
+            return {"ok": False, "device_id": int(device_id), "error": "target_f must be a number"}
+
+        target = float(round(sp))
+
+        async def _run() -> dict[str, Any]:
+            before = await self._thermostat_get_state_async(int(device_id))
+            st = before.get("state") if isinstance(before, dict) else None
+            hvac_mode_raw = (st or {}).get("hvac_mode") if isinstance(st, dict) else None
+            mode = str(hvac_mode_raw or "").strip().lower()
+            if not mode:
+                return {
+                    "ok": False,
+                    "device_id": int(device_id),
+                    "error": "Could not determine hvac_mode",
+                    "before": before,
+                }
+            if mode == "off":
+                return {
+                    "ok": False,
+                    "device_id": int(device_id),
+                    "error": "HVAC mode is Off; refusing to set target without changing mode",
+                    "before": before,
+                }
+
+            def clamp(v: float, lo: float, hi: float) -> float:
+                return float(max(lo, min(hi, v)))
+
+            # Use provided deadband, else state deadband, else default 2F.
+            db = self._coerce_float(deadband_f)
+            if db is None:
+                db = self._coerce_float((st or {}).get("heatcool_deadband_f")) if isinstance(st, dict) else None
+            if db is None:
+                db = 2.0
+            db = float(max(1.0, round(db)))
+
+            steps: list[dict[str, Any]] = []
+
+            if mode == "heat":
+                heat = clamp(target, 40.0, 90.0)
+                r = await self._thermostat_send_and_confirm_async(
+                    int(device_id),
+                    "SET_SETPOINT_HEAT",
+                    {"FAHRENHEIT": str(int(round(heat)))},
+                    lambda x: self._coerce_float((x.get("state") or {}).get("heat_setpoint_f")) == heat,
+                    confirm_timeout_s=float(confirm_timeout_s),
+                )
+                steps.append(r)
+            elif mode == "cool":
+                cool = clamp(target, 50.0, 99.0)
+                r = await self._thermostat_send_and_confirm_async(
+                    int(device_id),
+                    "SET_SETPOINT_COOL",
+                    {"FAHRENHEIT": str(int(round(cool)))},
+                    lambda x: self._coerce_float((x.get("state") or {}).get("cool_setpoint_f")) == cool,
+                    confirm_timeout_s=float(confirm_timeout_s),
+                )
+                steps.append(r)
+            else:
+                # Treat any non-off/non-heat/non-cool as auto.
+                heat = clamp(target, 40.0, 90.0)
+                cool = clamp(target + db, 50.0, 99.0)
+                if cool < heat + db:
+                    cool = clamp(heat + db, 50.0, 99.0)
+
+                r_heat = await self._thermostat_send_and_confirm_async(
+                    int(device_id),
+                    "SET_SETPOINT_HEAT",
+                    {"FAHRENHEIT": str(int(round(heat)))},
+                    lambda x: self._coerce_float((x.get("state") or {}).get("heat_setpoint_f")) == heat,
+                    confirm_timeout_s=float(confirm_timeout_s),
+                )
+                steps.append(r_heat)
+
+                r_cool = await self._thermostat_send_and_confirm_async(
+                    int(device_id),
+                    "SET_SETPOINT_COOL",
+                    {"FAHRENHEIT": str(int(round(cool)))},
+                    lambda x: self._coerce_float((x.get("state") or {}).get("cool_setpoint_f")) == cool,
+                    confirm_timeout_s=float(confirm_timeout_s),
+                )
+                steps.append(r_cool)
+
+            accepted = all(bool(s.get("accepted")) for s in steps if isinstance(s, dict)) if steps else False
+            confirmed = all(bool(s.get("confirmed")) for s in steps if isinstance(s, dict)) if steps else False
+            ok = all(bool(s.get("ok")) for s in steps if isinstance(s, dict)) if steps else False
+
+            # Best-effort after snapshot from last step.
+            after = steps[-1].get("after") if steps and isinstance(steps[-1], dict) else None
+
+            return {
+                "ok": bool(ok),
+                "device_id": int(device_id),
+                "requested": {
+                    "target_f": target,
+                    "hvac_mode": str(hvac_mode_raw or ""),
+                    "deadband_f": db,
+                },
+                "accepted": bool(accepted),
+                "confirmed": bool(confirmed),
+                "before": before,
+                "after": after,
+                "steps": steps,
+            }
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) * 2.0 + 25.0)
+
     async def _light_get_state_async(self, device_id: int) -> bool:
         fetched = await self._fetch_item_variables_list_async(int(device_id))
         variables: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
