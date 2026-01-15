@@ -9,12 +9,15 @@ from flask import Flask, jsonify
 from flask_mcp_server import Mcp, mount_mcp
 from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
 
-from control4_gateway import Control4Gateway
 from control4_adapter import (
+    gateway as adapter_gateway,
+    debug_trace_command,
     get_all_items,
     item_execute_command,
+    item_get_bindings,
     item_get_commands,
     item_get_variables,
+    item_send_command,
     light_get_level,
     light_get_state,
     light_ramp,
@@ -27,10 +30,34 @@ from control4_adapter import (
 
 # ---------- App / Gateway ----------
 app = Flask(__name__)
-gateway = Control4Gateway()
 
 # Locks can block (cloud/driver latency); run them in a small thread pool
 _lock_pool = ThreadPoolExecutor(max_workers=4)
+
+
+def _augment_lock_result(result: dict, desired_locked: bool | None = None) -> dict:
+    """Add derived fields without changing existing semantics."""
+    accepted = bool(result.get("accepted"))
+    confirmed = bool(result.get("confirmed"))
+
+    estimate = result.get("estimate") if isinstance(result.get("estimate"), dict) else None
+    est_locked = estimate.get("locked") if isinstance(estimate, dict) else None
+
+    success_likely = accepted and (confirmed or (desired_locked is not None and est_locked == desired_locked))
+    result["success_likely"] = bool(success_likely)
+
+    # Provide a single "best guess" state for consumers when Director state is stale.
+    locked = result.get("locked")
+    if locked in (True, False):
+        result["effective_state"] = "locked" if locked else "unlocked"
+    elif isinstance(result.get("after"), dict) and result["after"].get("locked") in (True, False):
+        result["effective_state"] = "locked" if result["after"].get("locked") else "unlocked"
+    elif est_locked in (True, False):
+        result["effective_state"] = "locked" if est_locked else "unlocked"
+    else:
+        result["effective_state"] = result.get("state") or "unknown"
+
+    return result
 
 # Return JSON for any unhandled error so PowerShell doesn't hide it
 @app.errorhandler(Exception)
@@ -47,7 +74,7 @@ def ping() -> dict:
 
 @Mcp.tool(name="c4_director_methods", description="List callable methods on the Director object (debug).")
 def c4_director_methods() -> dict:
-    d = gateway._loop_thread.run(gateway._director_async(), timeout_s=10)
+    d = adapter_gateway._loop_thread.run(adapter_gateway._director_async(), timeout_s=10)
     names = sorted([n for n in dir(d) if callable(getattr(d, n, None)) and not n.startswith("_")])
     return {"ok": True, "methods": names}
 
@@ -58,14 +85,57 @@ def c4_item_variables(device_id: str) -> dict:
     return {"ok": True, "device_id": str(device_id), "variables": vars_}
 
 
+@Mcp.tool(name="c4_item_bindings", description="Get Director bindings for an item (debug).")
+def c4_item_bindings(device_id: str) -> dict:
+    result = item_get_bindings(int(device_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
 @Mcp.tool(name="c4_item_commands", description="Get available Director commands for an item (debug).")
 def c4_item_commands(device_id: str) -> dict:
-    return {"ok": True, **item_get_commands(int(device_id))}
+    result = item_get_commands(int(device_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
 @Mcp.tool(name="c4_item_execute_command", description="Execute a specific Director command by command_id (debug).")
 def c4_item_execute_command(device_id: str, command_id: int) -> dict:
-    return {"ok": True, **item_execute_command(int(device_id), int(command_id))}
+    result = item_execute_command(int(device_id), int(command_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_item_send_command",
+    description="Send a named Director command to an item (debug). Example: command='UNLOCK' or 'CLOSE'.",
+)
+def c4_item_send_command(device_id: str, command: str, params: dict | None = None) -> dict:
+    result = item_send_command(int(device_id), str(command or ""), params)
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_debug_trace_command",
+    description=(
+        "Force-send a named Director command and poll for variable/state changes (debug). "
+        "Useful when cached lock state is stale."
+    ),
+)
+def c4_debug_trace_command(
+    device_id: str,
+    command: str,
+    params: dict | None = None,
+    watch_var_names: list[str] | None = None,
+    poll_interval_s: float = 0.5,
+    timeout_s: float = 30.0,
+) -> dict:
+    result = debug_trace_command(
+        int(device_id),
+        str(command or ""),
+        params,
+        watch_var_names=watch_var_names,
+        poll_interval_s=float(poll_interval_s),
+        timeout_s=float(timeout_s),
+    )
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
 @Mcp.tool(name="c4_list_rooms", description="List rooms from Control4 (live).")
@@ -109,7 +179,8 @@ def c4_list_devices(category: str) -> dict:
 
     category_controls = {
         "lights": {"light_v2", "control4_lights_gen3", "outlet_light", "outlet_module_v2"},
-        "locks": {"lock"},
+        # Locks may appear either as a lock proxy (control=lock) or as a relay-style door lock proxy.
+        "locks": {"lock", "control4_relaysingle"},
         "thermostat": {"thermostatV2"},
         "media": {
             "media_player",
@@ -146,17 +217,25 @@ def c4_list_devices(category: str) -> dict:
             continue
         if i.get("typeName") != "device":
             continue
-        if (i.get("control") or "") not in allowed:
+        control = (i.get("control") or "")
+        categories = i.get("categories")
+        is_lock_category = category == "locks" and isinstance(categories, list) and any(
+            str(c).lower() == "locks" for c in categories
+        )
+        if control not in allowed and not is_lock_category:
             continue
 
+        room_id = i.get("roomId")
         parent_id = i.get("parentId")
+        resolved_room_id = room_id if room_id is not None else parent_id
+        resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(resolved_room_id)) if resolved_room_id is not None else None)
         devices.append(
             {
                 "id": str(i.get("id")),
                 "name": i.get("name"),
                 "control": i.get("control"),
-                "roomId": str(parent_id) if parent_id is not None else None,
-                "roomName": rooms_by_id.get(str(parent_id)) if parent_id is not None else None,
+                "roomId": str(resolved_room_id) if resolved_room_id is not None else None,
+                "roomName": resolved_room_name,
                 "uris": i.get("URIs") or {},
             }
         )
@@ -209,7 +288,9 @@ def c4_lock_get_state_tool(device_id: str) -> dict:
     try:
         fut = _lock_pool.submit(lock_get_state, int(device_id))
         result = fut.result(timeout=20)
-        return {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
+        if isinstance(result, dict):
+            return _augment_lock_result(result, desired_locked=None)
+        return {"ok": True, "result": result}
     except FutureTimeout:
         return {"ok": False, "device_id": int(device_id), "error": "tool timeout (20s)"}
     except Exception as e:
@@ -221,7 +302,9 @@ def c4_lock_unlock_tool(device_id: str) -> dict:
     try:
         fut = _lock_pool.submit(lock_unlock, int(device_id))
         result = fut.result(timeout=20)
-        return {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
+        if isinstance(result, dict):
+            return _augment_lock_result(result, desired_locked=False)
+        return {"ok": True, "result": result}
     except FutureTimeout:
         return {"ok": False, "device_id": int(device_id), "error": "tool timeout (20s)"}
     except Exception as e:
@@ -233,7 +316,9 @@ def c4_lock_lock_tool(device_id: str) -> dict:
     try:
         fut = _lock_pool.submit(lock_lock, int(device_id))
         result = fut.result(timeout=20)
-        return {"ok": True, **(result if isinstance(result, dict) else {"result": result})}
+        if isinstance(result, dict):
+            return _augment_lock_result(result, desired_locked=True)
+        return {"ok": True, "result": result}
     except FutureTimeout:
         return {"ok": False, "device_id": int(device_id), "error": "tool timeout (20s)"}
     except Exception as e:

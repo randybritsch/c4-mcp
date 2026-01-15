@@ -1,0 +1,346 @@
+Below is a **complete, ready-to-commit `PROJECT_OVERVIEW.md`**, filled in for your **Control4 MCP Server** project based on everything we’ve built and debugged together. You can tweak names or wording later, but this is a solid “project brain” starting point.
+
+---
+
+```markdown
+# PROJECT_OVERVIEW.md
+
+## Project name
+**Control4 MCP Server**
+
+---
+
+## 1. Executive summary
+
+The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, and future devices) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate.
+
+---
+
+## 2. Architecture
+
+### Logical architecture
+
+```
+
+[MCP Clients / AI Agents]
+|
+v
+Flask + MCP
+(app.py)
+|
+v
+Sync Adapter Layer
+(control4_adapter.py)
+|
+v
+Async Control4 Gateway
+(control4_gateway.py)
+|
+v
+pyControl4
+|
+v
+Control4 Director
+(local controller + cloud)
+
+````
+
+### Runtime architecture
+
+- **Single asyncio event loop** runs forever in a background thread.
+- All Control4 I/O (cloud auth, Director calls, command execution) occurs **only** on that loop.
+- Flask handlers never run async Control4 code directly; they delegate to the adapter.
+- Flask tools run synchronously; operations execute in a small threadpool to avoid blocking request handling.
+- Long-running or flaky operations (e.g., cloud lock drivers, bindings endpoints) are isolated from Flask request threads.
+
+### External dependencies
+
+- Control4 Director (local controller)
+- Control4 cloud services (authentication, cloud drivers)
+- pyControl4 library
+- flask-mcp-server (MCP protocol implementation)
+
+---
+
+## 3. Directory structure
+
+```text
+.
+├── app.py                  # Flask app + MCP tool registration
+├── control4_gateway.py     # Async Control4 integration core (single event loop)
+├── control4_adapter.py     # Thin synchronous facade over the gateway
+├── config.json             # Local config (host, credentials) – not committed
+├── docs/                   # Project documentation (architecture/spec/context)
+├── tools/                  # Local debug / inspection scripts
+├── logs/                   # Local logs from debug tools (not committed)
+└── README.md               # Basic setup and usage instructions
+````
+
+**Key principles**
+
+* `app.py` = MCP + HTTP only
+* `control4_adapter.py` = sync-only, no logic
+* `control4_gateway.py` = async-only, owns Control4 and pyControl4
+
+---
+
+## 4. Module inventory
+
+| Module                | Purpose                    | Inputs                            | Outputs                      | Boundaries                                      |
+| --------------------- | -------------------------- | --------------------------------- | ---------------------------- | ----------------------------------------------- |
+| `app.py`              | Expose MCP tools over HTTP | MCP requests                      | JSON responses               | No async Control4 logic                         |
+| `control4_adapter.py` | Sync API for app layer     | Primitive types                   | Dicts / primitives           | Sync-only pass-through; no business logic       |
+| `control4_gateway.py` | Control4 orchestration     | Device IDs, commands, timeouts    | Structured results / booleans | Owns asyncio loop thread + pyControl4 + HTTP fallback |
+| `pyControl4`          | Control4 protocol client   | Tokens, commands                  | Director responses           | External dependency                             |
+
+---
+
+## 5. Data & schemas
+
+### Key data shapes
+
+#### Item (from Director)
+
+```json
+{
+  "id": 2214,
+  "typeName": "device",
+  "name": "Front Door Lock",
+  "control": "lock",
+  "parentId": 2213,
+  "URIs": {
+    "commands": "/api/v1/items/2214/commands",
+    "variables": "/api/v1/items/2214/variables"
+  }
+}
+```
+
+#### Variable
+
+```json
+{
+  "varName": "LockStatus",
+  "value": "locked"
+}
+```
+
+#### Command
+
+```json
+{
+  "id": 0,
+  "command": "UNLOCK",
+  "display": "Unlock Front Door"
+}
+```
+
+#### Command response (Director acknowledgement)
+
+```json
+{
+  "name": "SendToDevice",
+  "result": 1,
+  "seq": "..."
+}
+```
+
+### Versioning strategy
+
+* No persistent storage yet
+* Tool contracts are versioned implicitly via MCP tool names
+* Backward compatibility preserved by adding tools, not changing signatures
+
+---
+
+## 6. API surface
+
+### MCP tools (external)
+
+* `ping`
+* `c4_list_rooms`
+* `c4_list_typenames`
+* `c4_list_controls`
+* `c4_list_devices(category)`
+* `c4_director_methods` (debug)
+* `c4_item_variables(device_id)`
+* `c4_item_bindings(device_id)`
+* `c4_item_commands(device_id)`
+* `c4_item_execute_command(device_id, command_id)`
+* `c4_item_send_command(device_id, command, params)` (debug)
+* `c4_debug_trace_command(device_id, command, params, ...)` (debug)
+* `c4_light_get_state`
+* `c4_light_get_level`
+* `c4_light_set_level`
+* `c4_light_ramp`
+* `c4_lock_get_state`
+* `c4_lock_unlock`
+* `c4_lock_lock`
+
+### Authentication
+
+* MCP auth handled by `flask-mcp-server` middleware
+* Control4 auth handled internally via pyControl4 (cloud + Director tokens)
+
+---
+
+## 7. Decision log (ADR-style)
+
+* **Single asyncio loop**
+  → Prevents deadlocks and race conditions with pyControl4.
+
+* **Strict layer separation**
+  → Keeps Flask simple and recoverable; isolates Control4 quirks.
+
+* **pyControl4 for all Director access**
+  → Avoids 401s and protocol mismatches seen with raw REST calls.
+
+* **Command execution by name, not ID**
+  → Director REST rejects `commandId`; named commands are accepted.
+
+* **Separate “accepted” vs “confirmed”**
+  → Some devices physically actuate without reliable Director variable updates; tools report Director acknowledgement separately from observed state change.
+
+* **Best-effort state estimate when stale**
+  → The gateway tracks recent lock intent and returns an estimate when confirmation via variables is unreliable.
+
+---
+
+## 8. Non-functional requirements
+
+### Performance
+
+* Local network latency preferred
+* Gateway calls must return within bounded timeouts
+
+### Security
+
+* No public exposure by default (localhost binding)
+* Credentials stored locally only (not in repo)
+
+### Scalability
+
+* Single-user / single-controller scope
+* Designed for correctness over throughput
+
+### Reliability
+
+* Retries and backoff on cloud auth
+* Timeouts around all async calls
+
+### Observability
+
+* Structured return objects for debugging
+* Debug tools expose raw variables and commands
+
+---
+
+## 9. Testing strategy
+
+### Unit tests
+
+* Adapter passthroughs
+* Variable parsing logic
+
+### Integration tests
+
+* Live Director connection
+* Command execution paths (lights, locks)
+
+### End-to-end
+
+* MCP client → Flask → Adapter → Gateway → Director
+
+### Coverage goals
+
+* Gateway logic: ~70%
+* Adapter/app wiring: ~80%
+
+---
+
+## 10. Operational runbook
+
+### Environments
+
+* Local dev (Windows/macOS/Linux)
+* Same config for prod (on-prem)
+
+### Configuration
+
+* `config.json`:
+
+  * `host`
+  * `username`
+  * `password`
+
+### Secrets
+
+* Never committed
+* Rotated manually
+
+### Alerts / SLIs
+
+* Startup failures
+* Repeated auth failures
+* Excessive command timeouts
+
+---
+
+## 11. Coding conventions
+
+* Python 3.11+ (validated on Python 3.14)
+* Type hints everywhere
+* Explicit timeouts on I/O
+* No silent exception swallowing
+* Logging via structured dicts (not print)
+
+---
+
+## 12. Current risks & unknowns
+
+* Cloud lock drivers may ignore or delay commands
+* Director state/variables may remain stale even when the device physically actuates (locks observed)
+* pyControl4 API differences across versions
+* Limited documentation from Control4
+
+---
+
+## 13. Roadmap
+
+### Short-term (0–2 weeks)
+
+* Harden lock semantics and monitoring (stale state, intent estimates, tracing)
+* Add thermostat tools
+* Add/expand debug tools for item inspection and variable/binding tracing
+
+### Recently completed
+
+* Implement light write-path (`OFF`/`ON`/`SET_LEVEL`/`RAMP_TO_LEVEL`) and validate against real devices
+
+### Mid-term (2–8 weeks)
+
+* Room-based commands (e.g., “lock all doors”)
+* Friendly name resolution (room + device)
+* Media control (power, volume, input)
+* Optional caching of item metadata
+
+---
+
+## 14. Glossary
+
+* **MCP** – Model Context Protocol
+* **Director** – Control4 controller API
+* **Gateway** – Async Control4 integration layer
+* **Adapter** – Sync facade for app layer
+* **Cloud driver** – Device driver that relies on vendor cloud APIs
+* **Confirmed** – State change observed
+* **Accepted** – Command acknowledged by Director
+
+---
+
+```
+
+If you want, next we can:
+- Split this into **`ARCHITECTURE.md` + `RUNBOOK.md`**
+- Add **sequence diagrams** (ASCII or Mermaid)
+- Turn the ADR section into separate numbered ADR files
+```

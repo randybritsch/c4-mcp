@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 import inspect
 import json
 import threading
@@ -73,6 +74,36 @@ class Control4Gateway:
         self._director_token: Optional[str] = None
         self._director_token_time: float = 0.0
         self._controller_name: Optional[str] = None
+
+        # Some cloud lock drivers don't update Director variables reliably.
+        # Track last *accepted* lock intent so tools can provide an estimate.
+        self._last_lock_intent: dict[int, dict[str, Any]] = {}
+
+    def _get_lock_intent_estimate(self, device_id: int, max_age_s: float = 600.0) -> dict[str, Any] | None:
+        rec = self._last_lock_intent.get(int(device_id))
+        if not isinstance(rec, dict):
+            return None
+        ts = rec.get("ts")
+        intent = rec.get("intent")
+        if not isinstance(ts, (int, float)) or not isinstance(intent, str):
+            return None
+        age = time.time() - float(ts)
+        if age < 0 or age > float(max_age_s):
+            return None
+
+        intent_u = intent.upper()
+        if intent_u == "UNLOCK":
+            return {"locked": False, "state": "unlocked", "age_s": round(age, 1), "intent": intent_u}
+        if intent_u == "LOCK":
+            return {"locked": True, "state": "locked", "age_s": round(age, 1), "intent": intent_u}
+        return None
+
+    def _record_lock_intent(self, device_id: int, intent: str, execute: dict[str, Any] | None = None) -> None:
+        self._last_lock_intent[int(device_id)] = {
+            "ts": time.time(),
+            "intent": str(intent or "").strip().upper(),
+            "seq": (execute or {}).get("json", {}).get("seq") if isinstance((execute or {}).get("json"), dict) else None,
+        }
 
     # ---------- config / auth ----------
 
@@ -145,101 +176,140 @@ class Control4Gateway:
     def _director_base_url(self) -> str:
         base = self._cfg.host.strip()
         if not base.startswith(("http://", "https://")):
-            base = "http://" + base
+            # Director is typically served over HTTPS; keep HTTP as a fallback
+            base = "https://" + base
         if not base.endswith("/"):
             base += "/"
         return base
+
+    def _director_base_urls(self) -> list[str]:
+        host = self._cfg.host.strip()
+        if host.startswith(("http://", "https://")):
+            base = host
+            if not base.endswith("/"):
+                base += "/"
+            return [base]
+
+        https_base = f"https://{host}/"
+        http_base = f"http://{host}/"
+        return [https_base, http_base]
 
     # ---------- low-level Director HTTP helpers ----------
 
     async def _director_http_get(self, path: str) -> dict[str, Any]:
         token = await self._ensure_director_token_async()
-        url = urljoin(self._director_base_url(), path.lstrip("/"))
         headers = {"Authorization": f"Bearer {token}"}
         timeout = aiohttp.ClientTimeout(total=self._http_timeout_s)
 
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, headers=headers, ssl=False) as r:
-                    text = await r.text()
-                    try:
-                        data = await r.json(content_type=None)
-                    except Exception:
-                        data = None
-                    return {"ok": r.status < 300, "status": r.status, "url": url, "json": data, "text": text}
-        except Exception as e:
-            return {
-                "ok": False,
-                "status": 0,
-                "url": url,
-                "json": None,
-                "text": "",
-                "error": str(e),
-                "error_type": type(e).__name__,
-            }
+        last: dict[str, Any] | None = None
+        for base in self._director_base_urls():
+            url = urljoin(base, path.lstrip("/"))
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, headers=headers, ssl=False) as r:
+                        text = await r.text()
+                        try:
+                            data = await r.json(content_type=None)
+                        except Exception:
+                            data = None
+                        resp = {"ok": r.status < 300, "status": r.status, "url": url, "json": data, "text": text}
+                        if resp["ok"]:
+                            return resp
+                        # Try next base URL if we got a 404 (common HTTP vs HTTPS mismatch)
+                        last = resp
+                        if r.status == 404:
+                            continue
+                        return resp
+            except Exception as e:
+                last = {
+                    "ok": False,
+                    "status": 0,
+                    "url": url,
+                    "json": None,
+                    "text": "",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                }
+                continue
+
+        return last or {"ok": False, "status": 0, "url": "", "json": None, "text": "", "error": "No base URL"}
 
     async def _director_http_post(self, path: str, payload: dict | None = None) -> dict[str, Any]:
         token = await self._ensure_director_token_async()
-        url = urljoin(self._director_base_url(), path.lstrip("/"))
         headers = {"Authorization": f"Bearer {token}"}
         timeout = aiohttp.ClientTimeout(total=self._http_timeout_s)
 
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.post(url, headers=headers, json=(payload or {}), ssl=False) as r:
-                    text = await r.text()
-                    try:
-                        data = await r.json(content_type=None)
-                    except Exception:
-                        data = None
-                    return {"ok": r.status < 300, "status": r.status, "url": url, "json": data, "text": text}
-        except Exception as e:
-            return {
-                "ok": False,
-                "status": 0,
-                "url": url,
-                "json": None,
-                "text": "",
-                "error": str(e),
-                "error_type": type(e).__name__,
-            }
+        last: dict[str, Any] | None = None
+        for base in self._director_base_urls():
+            url = urljoin(base, path.lstrip("/"))
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.post(url, headers=headers, json=(payload or {}), ssl=False) as r:
+                        text = await r.text()
+                        try:
+                            data = await r.json(content_type=None)
+                        except Exception:
+                            data = None
+                        resp = {"ok": r.status < 300, "status": r.status, "url": url, "json": data, "text": text}
+                        if resp["ok"]:
+                            return resp
+                        last = resp
+                        if r.status == 404:
+                            continue
+                        return resp
+            except Exception as e:
+                last = {
+                    "ok": False,
+                    "status": 0,
+                    "url": url,
+                    "json": None,
+                    "text": "",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                }
+                continue
+
+        return last or {"ok": False, "status": 0, "url": "", "json": None, "text": "", "error": "No base URL"}
 
     # ---------- pyControl4 sendPostRequest helper (signature-safe) ----------
 
-    async def _send_post_via_director(self, director: C4Director, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        """
-        Calls director.sendPostRequest with the correct arg ordering (differs across pyControl4 versions).
-        Returns normalized dict containing ok/json/text/error.
+    async def _send_post_via_director(
+        self,
+        director: C4Director,
+        uri: str,
+        command: str,
+        params: dict[str, Any] | None = None,
+        async_variable: bool = True,
+    ) -> dict[str, Any]:
+        """Calls director.sendPostRequest with correct signature across pyControl4 versions.
+
+        Newer pyControl4 uses: (uri, command, params, async_variable=True)
+        Older variants may use different ordering; we detect via signature.
         """
         try:
             fn = director.sendPostRequest
             sig = inspect.signature(fn)
 
-            # after "self", expect 3 args in some order:
-            # (path, params, body) OR (path, body, params)
             param_names = [p.name.lower() for p in sig.parameters.values()]
             if param_names and param_names[0] == "self":
                 param_names = param_names[1:]
 
-            params_obj: dict[str, Any] = {}
+            params_obj: dict[str, Any] = params or {}
 
-            if len(param_names) >= 3:
-                second = param_names[1]
-                third = param_names[2]
-                if "param" in second and ("body" in third or "data" in third or "payload" in third):
-                    res = await fn(path, params_obj, body)  # (path, params, body)
-                elif ("body" in second or "data" in second or "payload" in second) and "param" in third:
-                    res = await fn(path, body, params_obj)  # (path, body, params)
-                else:
-                    try:
-                        res = await fn(path, params_obj, body)
-                    except TypeError:
-                        res = await fn(path, body, params_obj)
-            else:
+            # pyControl4 (current) signature: (uri, command, params, async_variable=True)
+            if len(param_names) >= 3 and "command" in param_names and "param" in "".join(param_names):
                 try:
-                    res = await fn(path, params_obj, body)
+                    res = await fn(uri, command, params_obj, async_variable)
                 except TypeError:
-                    res = await fn(path, body, params_obj)
+                    # Some versions omit async_variable
+                    res = await fn(uri, command, params_obj)
+            else:
+                # Legacy/fallback: best-effort ordering (uri, params, body) style.
+                body = {"async": async_variable, "command": command, "tParams": params_obj}
+                try:
+                    res = await fn(uri, params_obj, body)
+                except TypeError:
+                    res = await fn(uri, body, params_obj)
 
             if isinstance(res, str):
                 txt = res
@@ -247,11 +317,17 @@ class Control4Gateway:
                     js = json.loads(txt)
                 except Exception:
                     js = None
-                return {"ok": True, "path": path, "text": txt, "json": js}
+                return {"ok": True, "uri": uri, "command": command, "text": txt, "json": js}
 
-            return {"ok": True, "path": path, "json": res}
+            return {"ok": True, "uri": uri, "command": command, "json": res}
         except Exception as e:
-            return {"ok": False, "path": path, "error": str(e), "error_type": type(e).__name__}
+            return {
+                "ok": False,
+                "uri": uri,
+                "command": command,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
 
     # ---------- async item helpers (IMPORTANT: no deadlocks) ----------
 
@@ -287,24 +363,152 @@ class Control4Gateway:
         http = await self._director_http_get(f"/api/v1/items/{device_id}/commands")
         return {"device_id": device_id, "source": "http:/api/v1/items/{id}/commands", **http}
 
-    async def _item_execute_command_async(self, device_id: int, command_id: int) -> dict[str, Any]:
+    async def _item_execute_command_async(
+        self, device_id: int, command_id: int, command_name: str | None = None
+    ) -> dict[str, Any]:
         device_id = int(device_id)
         command_id = int(command_id)
         director = await self._director_async()
 
         attempts: list[dict[str, Any]] = []
-        body = {"commandId": command_id}
 
-        for path in (
-            f"/items/{device_id}/commands",        # prefer this
-            f"/api/v1/items/{device_id}/commands", # fallback
-        ):
-            r = await self._send_post_via_director(director, path, body)
-            attempts.append({"method": f"director.sendPostRequest {path} {{commandId}}", **r})
-            if r.get("ok"):
-                return {"ok": True, "device_id": device_id, "command_id": command_id, "attempts": attempts}
+        # Resolve command name if not provided (prefer named commands over IDs).
+        resolved_name = command_name
+        if not resolved_name:
+            cmds_resp = await self._item_get_commands_async(device_id)
+            cmds = cmds_resp.get("commands")
+            if isinstance(cmds, list):
+                for c in cmds:
+                    if isinstance(c, dict) and int(c.get("id") or -1) == command_id:
+                        resolved_name = str(c.get("command") or "").strip().upper() or None
+                        break
 
-        return {"ok": False, "device_id": device_id, "command_id": command_id, "attempts": attempts}
+        if not resolved_name:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "command_id": command_id,
+                "command": command_name,
+                "attempts": attempts,
+                "error": "Could not resolve command name for command_id",
+            }
+
+        uri = f"/api/v1/items/{device_id}/commands"
+
+        # Primary: sendPostRequest(uri, command, tParams)
+        # In practice, async_variable=False yields a meaningful response (e.g., SendToDevice result/seq)
+        # and has proven more reliable than async mode for device commands.
+        r = await self._send_post_via_director(director, uri, resolved_name, {}, async_variable=False)
+        attempts.append({"method": f"director.sendPostRequest {uri} {resolved_name}", **r})
+        if r.get("ok"):
+            return {
+                "ok": True,
+                "device_id": device_id,
+                "command_id": command_id,
+                "command": resolved_name,
+                "attempts": attempts,
+            }
+
+        return {
+            "ok": False,
+            "device_id": device_id,
+            "command_id": command_id,
+            "command": resolved_name,
+            "attempts": attempts,
+        }
+
+    async def _item_send_command_async(
+        self, device_id: int, command: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        command = str(command or "").strip().upper()
+        if not command:
+            return {"ok": False, "device_id": device_id, "error": "command is required"}
+
+        director = await self._director_async()
+        uri = f"/api/v1/items/{device_id}/commands"
+        return await self._send_post_via_director(director, uri, command, params or {}, async_variable=False)
+
+    @staticmethod
+    def _select_vars_for_trace(
+        variables: list[dict[str, Any]],
+        watch_var_names: list[str] | None,
+    ) -> dict[str, Any]:
+        if not watch_var_names:
+            return {
+                str(v.get("varName")): v.get("value")
+                for v in variables
+                if isinstance(v, dict) and v.get("varName") is not None
+            }
+
+        wanted = {str(n).strip().lower() for n in watch_var_names}
+        out: dict[str, Any] = {}
+        for row in variables:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("varName") or "").strip()
+            if name.lower() in wanted:
+                out[name] = row.get("value")
+        return out
+
+    async def _debug_trace_command_async(
+        self,
+        device_id: int,
+        command: str,
+        params: dict[str, Any] | None = None,
+        watch_var_names: list[str] | None = None,
+        poll_interval_s: float = 0.5,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        command = str(command or "").strip().upper()
+        if not command:
+            return {"ok": False, "device_id": device_id, "error": "command is required"}
+
+        before_fetch = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+        before_vars: list[dict[str, Any]] = (
+            before_fetch.get("variables") if isinstance(before_fetch.get("variables"), list) else []
+        )
+        before = {
+            "state": self._parse_lock_state_from_variables(device_id, before_vars),
+            "vars": self._select_vars_for_trace(before_vars, watch_var_names),
+        }
+
+        execute = await self._item_send_command_async(device_id, command, params)
+
+        start = asyncio.get_running_loop().time()
+        deadline = start + float(timeout_s)
+        last = before
+        changes: list[dict[str, Any]] = []
+
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(max(float(poll_interval_s), 0.1))
+            fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+            var_list: list[dict[str, Any]] = (
+                fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+            )
+            now = {
+                "state": self._parse_lock_state_from_variables(device_id, var_list),
+                "vars": self._select_vars_for_trace(var_list, watch_var_names),
+            }
+            if now != last:
+                changes.append(
+                    {"t": round(asyncio.get_running_loop().time() - start, 2), "snapshot": now}
+                )
+                last = now
+
+        return {
+            "ok": True,
+            "device_id": device_id,
+            "command": command,
+            "params": params or {},
+            "before": before,
+            "execute": execute,
+            "after": last,
+            "changes": changes,
+            "timeout_s": float(timeout_s),
+            "poll_interval_s": float(poll_interval_s),
+        }
 
     # ---------- sync wrappers (OK to call from Flask/MCP) ----------
 
@@ -314,41 +518,245 @@ class Control4Gateway:
     def item_execute_command(self, device_id: int, command_id: int) -> dict[str, Any]:
         return self._loop_thread.run(self._item_execute_command_async(int(device_id), int(command_id)), timeout_s=12)
 
-    # ---------- lock state ----------
+    def item_send_command(self, device_id: int, command: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._item_send_command_async(int(device_id), str(command or ""), params),
+            timeout_s=12,
+        )
 
-    async def _lock_get_state_async(self, device_id: int) -> dict[str, Any]:
+    def debug_trace_command(
+        self,
+        device_id: int,
+        command: str,
+        params: dict[str, Any] | None = None,
+        watch_var_names: list[str] | None = None,
+        poll_interval_s: float = 0.5,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._debug_trace_command_async(
+                int(device_id),
+                str(command or ""),
+                params,
+                watch_var_names=watch_var_names,
+                poll_interval_s=float(poll_interval_s),
+                timeout_s=float(timeout_s),
+            ),
+            timeout_s=float(timeout_s) + 20.0,
+        )
+
+    # ---------- items / rooms (used by c4_list_devices, c4_list_rooms) ----------
+
+    @staticmethod
+    def _normalize_items_payload(payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                return []
+
+        if isinstance(payload, dict):
+            payload = payload.get("items") or payload.get("Items") or payload.get("data") or payload
+
+        if not isinstance(payload, list):
+            return []
+
+        items: list[dict[str, Any]] = []
+        for row in payload:
+            if isinstance(row, dict):
+                items.append(row)
+        return items
+
+    async def _get_all_items_async(self) -> list[dict[str, Any]]:
+        director = await self._director_async()
+
+        for method_name in ("getAllItemInfo", "getAllItems", "getItems"):
+            fn = getattr(director, method_name, None)
+            if fn is None:
+                continue
+            try:
+                res = await asyncio.wait_for(fn(), timeout=self._director_timeout_s)
+                items = self._normalize_items_payload(res)
+                if items:
+                    return items
+            except TypeError:
+                # Some pyControl4 versions require args; ignore and fallback.
+                continue
+            except Exception:
+                continue
+
+        # Some pyControl4 versions support category-based listing.
+        fn_by_cat = getattr(director, "getAllItemsByCategory", None)
+        if fn_by_cat is not None:
+            for category in ("room", "device"):
+                try:
+                    res = await asyncio.wait_for(fn_by_cat(category), timeout=self._director_timeout_s)
+                    items = self._normalize_items_payload(res)
+                    if items:
+                        return items
+                except Exception:
+                    continue
+
+        http = await self._director_http_get("/api/v1/items")
+        if http.get("ok"):
+            items = self._normalize_items_payload(http.get("json"))
+            if items:
+                return items
+        return []
+
+    def get_all_items(self) -> list[dict[str, Any]]:
+        return self._loop_thread.run(self._get_all_items_async(), timeout_s=18)
+
+    def list_rooms(self) -> list[dict[str, Any]]:
+        items = self.get_all_items()
+        rooms = [i for i in items if isinstance(i, dict) and i.get("typeName") == "room"]
+        rooms.sort(key=lambda r: (str(r.get("name") or ""), str(r.get("id") or "")))
+        return rooms
+
+    # ---------- item variables (debug tool support) ----------
+
+    async def _item_get_variables_async(self, device_id: int) -> dict[str, Any]:
+        device_id = int(device_id)
+        director = await self._director_async()
+
+        if hasattr(director, "getItemVariables"):
+            try:
+                vars_ = await asyncio.wait_for(director.getItemVariables(device_id), timeout=self._director_timeout_s)
+                if isinstance(vars_, str):
+                    try:
+                        vars_ = json.loads(vars_)
+                    except Exception:
+                        return {
+                            "ok": False,
+                            "device_id": device_id,
+                            "source": "director.getItemVariables",
+                            "error": "variables string was not valid JSON",
+                            "raw": vars_,
+                        }
+                if not isinstance(vars_, list):
+                    return {
+                        "ok": False,
+                        "device_id": device_id,
+                        "source": "director.getItemVariables",
+                        "error": f"Unexpected variables type: {type(vars_).__name__}",
+                        "raw": vars_,
+                    }
+                return {"ok": True, "device_id": device_id, "source": "director.getItemVariables", "variables": vars_}
+            except asyncio.TimeoutError:
+                return {"ok": False, "device_id": device_id, "source": "director.getItemVariables", "error": "timeout"}
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "device_id": device_id,
+                    "source": "director.getItemVariables",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                }
+
+        http = await self._director_http_get(f"/api/v1/items/{device_id}/variables")
+        if http.get("ok"):
+            vars_ = http.get("json")
+            if isinstance(vars_, dict):
+                vars_ = vars_.get("variables") or vars_.get("data") or vars_
+            if isinstance(vars_, list):
+                return {"ok": True, "device_id": device_id, "source": "http:/api/v1/items/{id}/variables", "variables": vars_}
+        return {"ok": False, "device_id": device_id, "source": "http:/api/v1/items/{id}/variables", **http}
+
+    def item_get_variables(self, device_id: int, timeout_s: float = 12.0) -> dict[str, Any]:
+        device_id = int(device_id)
+        try:
+            return self._loop_thread.run(self._item_get_variables_async(device_id), timeout_s=float(timeout_s))
+        except FuturesTimeoutError:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "source": "gateway.item_get_variables",
+                "error": "timeout",
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "source": "gateway.item_get_variables",
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+
+    def item_get_bindings(self, device_id: int, timeout_s: float = 12.0) -> dict[str, Any]:
+        device_id = int(device_id)
+        try:
+            return self._loop_thread.run(self._item_get_bindings_async(device_id), timeout_s=float(timeout_s))
+        except FuturesTimeoutError:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "source": "gateway.item_get_bindings",
+                "error": "timeout",
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "source": "gateway.item_get_bindings",
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+
+    async def _item_get_bindings_async(self, device_id: int) -> dict[str, Any]:
+        http = await self._director_http_get(f"/api/v1/items/{int(device_id)}/bindings")
+        if http.get("ok"):
+            payload = http.get("json")
+            bindings = payload.get("bindings") if isinstance(payload, dict) else payload
+            return {
+                "ok": True,
+                "device_id": int(device_id),
+                "source": "http:/api/v1/items/{id}/bindings",
+                "bindings": bindings,
+            }
+
+        return {
+            "ok": False,
+            "device_id": int(device_id),
+            "source": "http:/api/v1/items/{id}/bindings",
+            "error": http.get("error") or "Failed to fetch bindings",
+            "http": http,
+        }
+
+    async def _fetch_item_variables_list_async(
+        self, device_id: int, timeout_s: float | None = None
+    ) -> dict[str, Any]:
         device_id = int(device_id)
         director = await self._director_async()
 
         if not hasattr(director, "getItemVariables"):
             return {
-                "ok": True,
+                "ok": False,
                 "device_id": device_id,
-                "locked": None,
-                "state": "unknown",
-                "source": "variables",
-                "raw": {"_error": "Director does not support getItemVariables()"},
+                "source": "director.getItemVariables",
+                "error": "Director does not support getItemVariables()",
+                "variables": [],
             }
 
         try:
-            vars_ = await asyncio.wait_for(director.getItemVariables(device_id), timeout=self._director_timeout_s)
+            vars_ = await asyncio.wait_for(
+                director.getItemVariables(device_id), timeout=(float(timeout_s) if timeout_s is not None else self._director_timeout_s)
+            )
         except asyncio.TimeoutError:
             return {
-                "ok": True,
+                "ok": False,
                 "device_id": device_id,
-                "locked": None,
-                "state": "unknown",
-                "source": "variables",
-                "raw": {"_error": "Timeout: getItemVariables"},
+                "source": "director.getItemVariables",
+                "error": "timeout",
+                "variables": [],
             }
         except Exception as e:
             return {
-                "ok": True,
+                "ok": False,
                 "device_id": device_id,
-                "locked": None,
-                "state": "unknown",
-                "source": "variables",
-                "raw": {"_error": str(e), "_error_type": type(e).__name__},
+                "source": "director.getItemVariables",
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "variables": [],
             }
 
         if isinstance(vars_, str):
@@ -356,57 +764,110 @@ class Control4Gateway:
                 vars_ = json.loads(vars_)
             except Exception:
                 return {
-                    "ok": True,
+                    "ok": False,
                     "device_id": device_id,
-                    "locked": None,
-                    "state": "unknown",
-                    "source": "variables",
-                    "raw": {"_error": "Variables were a string but not valid JSON", "variables": vars_},
+                    "source": "director.getItemVariables",
+                    "error": "variables string was not valid JSON",
+                    "raw": vars_,
+                    "variables": [],
                 }
 
         if not isinstance(vars_, list):
             return {
-                "ok": True,
+                "ok": False,
                 "device_id": device_id,
-                "locked": None,
-                "state": "unknown",
-                "source": "variables",
-                "raw": {"_note": f"Unexpected variables type: {type(vars_).__name__}", "variables": vars_},
+                "source": "director.getItemVariables",
+                "error": f"Unexpected variables type: {type(vars_).__name__}",
+                "raw": vars_,
+                "variables": [],
             }
 
+        cleaned: list[dict[str, Any]] = []
         for row in vars_:
+            if isinstance(row, dict):
+                cleaned.append(row)
+        return {"ok": True, "device_id": device_id, "source": "director.getItemVariables", "variables": cleaned}
+
+    @staticmethod
+    def _get_var_value(variables: list[dict[str, Any]], name: str) -> Any:
+        target = name.strip().lower()
+        for row in variables:
+            var = str(row.get("varName", "")).strip().lower()
+            if var == target:
+                return row.get("value")
+        return None
+
+    @staticmethod
+    def _coerce_bool(v: Any) -> bool | None:
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in {"true", "1", "yes", "on", "locked"}:
+            return True
+        if s in {"false", "0", "no", "off", "unlocked"}:
+            return False
+        return None
+
+    def _parse_lock_state_from_variables(self, device_id: int, variables: list[dict[str, Any]]) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        for row in variables:
             if not isinstance(row, dict):
                 continue
-            if str(row.get("varName", "")).strip().lower() != "lockstatus":
+            var = str(row.get("varName", "")).strip()
+            if not var:
                 continue
+            var_l = var.lower()
+            if var_l == "lockstatus":
+                candidates.insert(0, row)
+            elif var_l in {"lock_status", "locked", "islocked", "lock_state"}:
+                candidates.append(row)
+            elif "lock" in var_l and "status" in var_l:
+                candidates.append(row)
 
-            val = str(row.get("value", "")).strip().lower()
-            if val == "locked":
+        for row in candidates:
+            var = str(row.get("varName", "")).strip()
+            b = self._coerce_bool(row.get("value"))
+            if b is True:
                 return {
                     "ok": True,
                     "device_id": device_id,
                     "locked": True,
                     "state": "locked",
-                    "source": "variables:LockStatus",
+                    "source": f"variables:{var}",
                     "raw": row,
                 }
-            if val == "unlocked":
+            if b is False:
                 return {
                     "ok": True,
                     "device_id": device_id,
                     "locked": False,
                     "state": "unlocked",
-                    "source": "variables:LockStatus",
+                    "source": f"variables:{var}",
+                    "raw": row,
+                }
+            if str(var).strip():
+                return {
+                    "ok": True,
+                    "device_id": device_id,
+                    "locked": None,
+                    "state": "unknown",
+                    "source": f"variables:{var}",
                     "raw": row,
                 }
 
+        # Relay-style door lock proxy (common): RelayState 0=locked, 1=unlocked
+        relay_state = self._get_var_value(variables, "RelayState")
+        b = self._coerce_bool(relay_state)
+        if b is not None:
+            # _coerce_bool maps 0->False, 1->True; for RelayState, 0 means locked.
+            locked = not b
             return {
                 "ok": True,
                 "device_id": device_id,
-                "locked": None,
-                "state": "unknown",
-                "source": "variables:LockStatus",
-                "raw": row,
+                "locked": locked,
+                "state": "locked" if locked else "unlocked",
+                "source": "variables:RelayState",
+                "raw": {"varName": "RelayState", "value": relay_state},
             }
 
         return {
@@ -415,8 +876,40 @@ class Control4Gateway:
             "locked": None,
             "state": "unknown",
             "source": "variables",
-            "raw": {"_note": "No lock state variable found", "variables": vars_},
+            "raw": {"_note": "No lock state variable found", "variables": variables},
         }
+
+    # ---------- lock state ----------
+
+    async def _lock_get_state_async(self, device_id: int) -> dict[str, Any]:
+        device_id = int(device_id)
+        fetched = await self._fetch_item_variables_list_async(device_id)
+        if not fetched.get("ok"):
+            out = {
+                "ok": True,
+                "device_id": device_id,
+                "locked": None,
+                "state": "unknown",
+                "source": "variables",
+                "raw": {
+                    "_error": fetched.get("error") or "getItemVariables failed",
+                    "_error_type": fetched.get("error_type"),
+                },
+            }
+
+            est = self._get_lock_intent_estimate(device_id)
+            if est is not None:
+                out["estimate"] = est
+            return out
+
+        variables = fetched.get("variables")
+        if not isinstance(variables, list):
+            variables = []
+        out = self._parse_lock_state_from_variables(device_id, variables)
+        est = self._get_lock_intent_estimate(device_id)
+        if est is not None:
+            out["estimate"] = est
+        return out
 
     def lock_get_state(self, device_id: int) -> dict[str, Any]:
         return self._loop_thread.run(self._lock_get_state_async(int(device_id)), timeout_s=10)
@@ -428,6 +921,13 @@ class Control4Gateway:
 
         async def _run():
             before = await self._lock_get_state_async(device_id)
+            before_locked = before.get("locked")
+            before_vars = await self._fetch_item_variables_list_async(device_id)
+            before_list: list[dict[str, Any]] = before_vars.get("variables") if isinstance(before_vars.get("variables"), list) else []
+            before_activity = {
+                "LastActionDescription": self._get_var_value(before_list, "LastActionDescription"),
+                "LAST_UNLOCK_USER": self._get_var_value(before_list, "LAST_UNLOCK_USER"),
+            }
 
             cmds_resp = await self._item_get_commands_async(device_id)
             cmds = cmds_resp.get("commands")
@@ -441,26 +941,36 @@ class Control4Gateway:
                 }
 
             match = next(
-                (c for c in cmds if isinstance(c, dict) and str(c.get("command", "")).upper() == "UNLOCK"),
+                (
+                    c
+                    for c in cmds
+                    if isinstance(c, dict)
+                    and str(c.get("command", "")).upper() in {"UNLOCK", "CLOSE"}
+                ),
                 None,
             )
-            if not match or "id" not in match:
+            if not match or not match.get("command"):
                 return {
                     "ok": False,
                     "device_id": device_id,
-                    "error": "UNLOCK command not found",
+                    "error": "UNLOCK/CLOSE command not found",
                     "before": before,
                     "available": cmds,
                 }
 
-            cmd_id = int(match["id"])
-            exec_result = await self._item_execute_command_async(device_id, cmd_id)
-            if not exec_result.get("ok"):
+            cmd_name = str(match.get("command") or "").strip().upper()
+            director = await self._director_async()
+            uri = f"/api/v1/items/{device_id}/commands"
+            exec_result = await self._send_post_via_director(director, uri, cmd_name, {}, async_variable=False)
+            accepted = bool(exec_result.get("ok"))
+            if not accepted:
                 after = await self._lock_get_state_async(device_id)
                 return {
                     "ok": False,
                     "device_id": device_id,
-                    "requested": "UNLOCK",
+                    "requested": cmd_name,
+                    "accepted": False,
+                    "confirmed": False,
                     "success": False,
                     "before": before,
                     "after": after,
@@ -468,21 +978,44 @@ class Control4Gateway:
                     "error": "Execute failed",
                 }
 
-            deadline = asyncio.get_running_loop().time() + 6.0
+            # Record intent immediately on accepted send.
+            self._record_lock_intent(device_id, "UNLOCK", execute=exec_result)
+
+            # UNLOCK tends to lag more than LOCK on cloud drivers.
+            confirm_timeout_s = 12.0
+            deadline = asyncio.get_running_loop().time() + confirm_timeout_s
             last_after: dict[str, Any] | None = None
+            last_activity_after: dict[str, Any] | None = None
+            activity_changed = False
 
             while asyncio.get_running_loop().time() < deadline:
-                after = await self._lock_get_state_async(device_id)
+                fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=2.0)
+                var_list: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+                after = self._parse_lock_state_from_variables(device_id, var_list)
                 last_after = after
-                if after.get("locked") is False:
+                last_activity_after = {
+                    "LastActionDescription": self._get_var_value(var_list, "LastActionDescription"),
+                    "LAST_UNLOCK_USER": self._get_var_value(var_list, "LAST_UNLOCK_USER"),
+                }
+                if last_activity_after != before_activity:
+                    activity_changed = True
+                after_locked = after.get("locked")
+                if after_locked is False and (after_locked != before_locked or activity_changed):
                     return {
                         "ok": True,
                         "device_id": device_id,
-                        "requested": "UNLOCK",
+                        "requested": cmd_name,
+                        "accepted": True,
+                        "confirmed": True,
                         "success": True,
                         "before": before,
                         "after": after,
                         "execute": exec_result,
+                        "estimate": self._get_lock_intent_estimate(device_id),
+                        "activity": {
+                            "before": before_activity,
+                            "after": last_activity_after,
+                        },
                     }
                 await asyncio.sleep(0.35)
 
@@ -492,12 +1025,21 @@ class Control4Gateway:
             return {
                 "ok": True,
                 "device_id": device_id,
-                "requested": "UNLOCK",
+                "requested": cmd_name,
+                "accepted": True,
+                "confirmed": False,
                 "success": False,
                 "before": before,
                 "after": last_after,
                 "execute": exec_result,
                 "note": "State did not update before deadline (may still unlock; driver might poll slowly).",
+                "confirm_timeout_s": confirm_timeout_s,
+                "estimate": self._get_lock_intent_estimate(device_id),
+                "activity": {
+                    "changed": activity_changed,
+                    "before": before_activity,
+                    "after": last_activity_after,
+                },
             }
 
         return self._loop_thread.run(_run(), timeout_s=18)
@@ -506,6 +1048,15 @@ class Control4Gateway:
         device_id = int(device_id)
 
         async def _run():
+            before = await self._lock_get_state_async(device_id)
+            before_locked = before.get("locked")
+            before_vars = await self._fetch_item_variables_list_async(device_id)
+            before_list: list[dict[str, Any]] = before_vars.get("variables") if isinstance(before_vars.get("variables"), list) else []
+            before_activity = {
+                "LastActionDescription": self._get_var_value(before_list, "LastActionDescription"),
+                "LAST_UNLOCK_USER": self._get_var_value(before_list, "LAST_UNLOCK_USER"),
+            }
+
             cmds_resp = await self._item_get_commands_async(device_id)
             cmds = cmds_resp.get("commands")
             if not isinstance(cmds, list):
@@ -513,45 +1064,182 @@ class Control4Gateway:
                     "ok": False,
                     "device_id": device_id,
                     "error": "Could not load commands",
+                    "before": before,
                     "details": cmds_resp,
                 }
 
             match = next(
-                (c for c in cmds if isinstance(c, dict) and str(c.get("command", "")).upper() == "LOCK"),
+                (
+                    c
+                    for c in cmds
+                    if isinstance(c, dict)
+                    and str(c.get("command", "")).upper() in {"LOCK", "OPEN"}
+                ),
                 None,
             )
-            if not match or "id" not in match:
+            if not match or not match.get("command"):
                 return {
                     "ok": False,
                     "device_id": device_id,
-                    "error": "LOCK command not found",
+                    "error": "LOCK/OPEN command not found",
+                    "before": before,
                     "available": cmds,
                 }
 
-            cmd_id = int(match["id"])
-            exec_result = await self._item_execute_command_async(device_id, cmd_id)
+            cmd_name = str(match.get("command") or "").strip().upper()
+            # Do not short-circuit on "already locked".
+            # Some cloud lock drivers report stale state; skipping would prevent re-locking.
 
-            for _ in range(6):
-                await asyncio.sleep(0.35)
+            director = await self._director_async()
+            uri = f"/api/v1/items/{device_id}/commands"
+            exec_result = await self._send_post_via_director(director, uri, cmd_name, {}, async_variable=False)
+
+            accepted = bool(exec_result.get("ok"))
+            if not accepted:
                 after = await self._lock_get_state_async(device_id)
-                if after.get("locked") is True:
+                return {
+                    "ok": False,
+                    "device_id": device_id,
+                    "requested": cmd_name,
+                    "accepted": False,
+                    "confirmed": False,
+                    "success": False,
+                    "before": before,
+                    "after": after,
+                    "execute": exec_result,
+                    "error": "Execute failed",
+                }
+
+            # Record intent immediately on accepted send.
+            self._record_lock_intent(device_id, "LOCK", execute=exec_result)
+
+            confirm_timeout_s = 6.0
+            deadline = asyncio.get_running_loop().time() + confirm_timeout_s
+            last_after: dict[str, Any] | None = None
+            last_activity_after: dict[str, Any] | None = None
+            activity_changed = False
+
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.35)
+                fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=2.0)
+                var_list: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+                after = self._parse_lock_state_from_variables(device_id, var_list)
+                last_after = after
+                last_activity_after = {
+                    "LastActionDescription": self._get_var_value(var_list, "LastActionDescription"),
+                    "LAST_UNLOCK_USER": self._get_var_value(var_list, "LAST_UNLOCK_USER"),
+                }
+                if last_activity_after != before_activity:
+                    activity_changed = True
+                after_locked = after.get("locked")
+                if after_locked is True and (after_locked != before_locked or activity_changed):
                     return {
                         "ok": True,
                         "device_id": device_id,
-                        "requested": "LOCK",
+                        "requested": cmd_name,
+                        "accepted": True,
+                        "confirmed": True,
                         "success": True,
+                        "before": before,
                         "after": after,
                         "execute": exec_result,
+                        "estimate": self._get_lock_intent_estimate(device_id),
+                        "activity": {
+                            "before": before_activity,
+                            "after": last_activity_after,
+                        },
                     }
 
-            after = await self._lock_get_state_async(device_id)
+            if last_after is None:
+                last_after = await self._lock_get_state_async(device_id)
+
             return {
                 "ok": True,
                 "device_id": device_id,
-                "requested": "LOCK",
+                "requested": cmd_name,
+                "accepted": True,
+                "confirmed": False,
                 "success": False,
-                "after": after,
+                "before": before,
+                "after": last_after,
                 "execute": exec_result,
+                "note": "State did not update before deadline (may still lock; driver might poll slowly).",
+                "confirm_timeout_s": confirm_timeout_s,
+                "estimate": self._get_lock_intent_estimate(device_id),
+                "activity": {
+                    "changed": activity_changed,
+                    "before": before_activity,
+                    "after": last_activity_after,
+                },
             }
 
         return self._loop_thread.run(_run(), timeout_s=18)
+
+    # ---------- lights (basic) ----------
+
+    @staticmethod
+    def _coerce_int(v: Any) -> int | None:
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(round(v))
+        s = str(v).strip()
+        if not s:
+            return None
+        try:
+            return int(float(s))
+        except Exception:
+            return None
+
+    async def _light_get_state_async(self, device_id: int) -> bool:
+        fetched = await self._fetch_item_variables_list_async(int(device_id))
+        variables: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+
+        v = self._get_var_value(variables, "LIGHT_STATE")
+        b = self._coerce_bool(v)
+        if b is not None:
+            return bool(b)
+
+        # Fallback: if we have a brightness level, infer on/off
+        lvl = self._get_var_value(variables, "Brightness Percent")
+        li = self._coerce_int(lvl)
+        if li is not None:
+            return li > 0
+
+        return False
+
+    def light_get_state(self, device_id: int) -> bool:
+        return bool(self._loop_thread.run(self._light_get_state_async(int(device_id)), timeout_s=10))
+
+    async def _light_get_level_async(self, device_id: int) -> int:
+        fetched = await self._fetch_item_variables_list_async(int(device_id))
+        variables: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+
+        for name in ("Brightness Percent", "PRESET_LEVEL"):
+            v = self._get_var_value(variables, name)
+            li = self._coerce_int(v)
+            if li is not None:
+                return max(0, min(100, int(li)))
+        return 0
+
+    def light_get_level(self, device_id: int) -> int:
+        return int(self._loop_thread.run(self._light_get_level_async(int(device_id)), timeout_s=10))
+
+    async def _light_set_level_async(self, device_id: int, level: int) -> bool:
+        level = max(0, min(100, int(level)))
+        res = await self._item_send_command_async(int(device_id), "SET_LEVEL", {"LEVEL": level})
+        return bool(res.get("ok"))
+
+    def light_set_level(self, device_id: int, level: int) -> bool:
+        return bool(self._loop_thread.run(self._light_set_level_async(int(device_id), int(level)), timeout_s=12))
+
+    async def _light_ramp_async(self, device_id: int, level: int, time_ms: int) -> bool:
+        level = max(0, min(100, int(level)))
+        time_ms = max(0, int(time_ms))
+        res = await self._item_send_command_async(int(device_id), "RAMP_TO_LEVEL", {"LEVEL": level, "TIME": time_ms})
+        return bool(res.get("ok"))
+
+    def light_ramp(self, device_id: int, level: int, time_ms: int) -> bool:
+        return bool(
+            self._loop_thread.run(self._light_ramp_async(int(device_id), int(level), int(time_ms)), timeout_s=12)
+        )

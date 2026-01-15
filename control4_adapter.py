@@ -22,23 +22,20 @@ def list_rooms() -> List[Json]:
 
 
 def get_all_items() -> List[Json]:
-    # Your latest gateway (as formatted) doesn't implement get_all_items.
-    # Keep adapter compatible: return [] unless you later add gateway.get_all_items().
-    if hasattr(gateway, "get_all_items"):
-        return gateway.get_all_items()  # type: ignore[return-value]
-    return []
+    # Gateway provides item listing; adapter stays logic-free.
+    return gateway.get_all_items()  # type: ignore[return-value]
 
 
-def item_get_variables(device_id: int) -> Any:
+def item_get_variables(device_id: int, timeout_s: float = 12.0) -> Any:
     """
     Raw variables for an item. The latest gateway code doesn't expose item_get_variables,
     but lock_get_state reads variables internally. Keep this adapter callable for MCP debug tool.
     """
-    # If you later add gateway.item_get_variables, this will start working automatically.
-    if hasattr(gateway, "item_get_variables"):
-        return gateway.item_get_variables(int(device_id))  # type: ignore[misc]
-    # Provide a helpful error shape instead of throwing
-    return {"ok": False, "error": "item_get_variables not implemented on Control4Gateway"}
+    return gateway.item_get_variables(int(device_id), timeout_s=float(timeout_s))  # type: ignore[misc]
+
+
+def item_get_bindings(device_id: int, timeout_s: float = 12.0) -> Any:
+    return gateway.item_get_bindings(int(device_id), timeout_s=float(timeout_s))  # type: ignore[misc]
 
 
 def item_get_commands(device_id: int) -> Json:
@@ -47,6 +44,28 @@ def item_get_commands(device_id: int) -> Json:
 
 def item_execute_command(device_id: int, command_id: int) -> Json:
     return gateway.item_execute_command(int(device_id), int(command_id))
+
+
+def item_send_command(device_id: int, command: str, params: Optional[Dict[str, Any]] = None) -> Json:
+    return gateway.item_send_command(int(device_id), str(command or ""), params)
+
+
+def debug_trace_command(
+    device_id: int,
+    command: str,
+    params: Optional[Dict[str, Any]] = None,
+    watch_var_names: Optional[List[str]] = None,
+    poll_interval_s: float = 0.5,
+    timeout_s: float = 30.0,
+) -> Json:
+    return gateway.debug_trace_command(
+        int(device_id),
+        str(command or ""),
+        params,
+        watch_var_names=watch_var_names,
+        poll_interval_s=float(poll_interval_s),
+        timeout_s=float(timeout_s),
+    )
 
 
 # --------- Locks ---------
