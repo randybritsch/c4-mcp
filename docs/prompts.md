@@ -97,6 +97,7 @@ Create a compact “PROJECT BOOTSTRAP SUMMARY” focused on fast context reloads
 9) Links/paths to the full docs (`project_overview.md`, `/docs/...`)
 
 Keep it under ~400–700 words, highly scannable, with bolded section headers.
+Update it in 'docs\bootstrap_summary.md'
 ```
 
 ***

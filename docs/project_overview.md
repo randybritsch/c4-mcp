@@ -12,7 +12,7 @@ Below is a **complete, ready-to-commit `PROJECT_OVERVIEW.md`**, filled in for yo
 
 ## 1. Executive summary
 
-The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, and future devices) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate.
+The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, and media/AV) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`).
 
 ---
 
@@ -58,6 +58,7 @@ Control4 Director
 - Control4 Director (local controller)
 - Control4 cloud services (authentication, cloud drivers)
 - pyControl4 library
+- aiohttp (HTTP fallback + polling, e.g., Roku app confirmation)
 - flask-mcp-server (MCP protocol implementation)
 
 ---
@@ -157,10 +158,11 @@ Control4 Director
 ### MCP tools (external)
 
 * `ping`
+* `c4_server_info` (debug)
 * `c4_list_rooms`
 * `c4_list_typenames`
 * `c4_list_controls`
-* `c4_list_devices(category)`
+* `c4_list_devices(category)` (lights/locks/thermostat/media)
 * `c4_director_methods` (debug)
 * `c4_item_variables(device_id)`
 * `c4_item_bindings(device_id)`
@@ -168,10 +170,38 @@ Control4 Director
 * `c4_item_execute_command(device_id, command_id)`
 * `c4_item_send_command(device_id, command, params)` (debug)
 * `c4_debug_trace_command(device_id, command, params, ...)` (debug)
+* `c4_room_select_video_device(room_id, device_id, deselect)`
+
+**Media / AV**
+
+* `c4_media_get_state(device_id)`
+* `c4_media_send_command(device_id, command, params)`
+* `c4_media_remote(device_id, button, press)`
+* `c4_media_remote_sequence(device_id, buttons, press, delay_ms)`
+* `c4_media_now_playing(device_id)`
+* `c4_media_launch_app(device_id, app)`
+* `c4_media_watch_launch_app(device_id, app, room_id, pre_home)` (returns `summary` + `summary_text`)
+* `c4_media_roku_list_apps(device_id, search)`
+
+**Thermostats**
+
+* `c4_thermostat_get_state(device_id)`
+* `c4_thermostat_set_hvac_mode(device_id, mode, confirm_timeout_s)`
+* `c4_thermostat_set_fan_mode(device_id, mode, confirm_timeout_s)`
+* `c4_thermostat_set_hold_mode(device_id, mode, confirm_timeout_s)`
+* `c4_thermostat_set_heat_setpoint_f(device_id, setpoint_f, confirm_timeout_s)`
+* `c4_thermostat_set_cool_setpoint_f(device_id, setpoint_f, confirm_timeout_s)`
+* `c4_thermostat_set_target_f(device_id, target_f, confirm_timeout_s, deadband_f)`
+
+**Lights**
+
 * `c4_light_get_state`
 * `c4_light_get_level`
 * `c4_light_set_level`
 * `c4_light_ramp`
+
+**Locks**
+
 * `c4_lock_get_state`
 * `c4_lock_unlock`
 * `c4_lock_lock`
@@ -199,6 +229,12 @@ Control4 Director
 
 * **Separate “accepted” vs “confirmed”**
   → Some devices physically actuate without reliable Director variable updates; tools report Director acknowledgement separately from observed state change.
+
+* **Roku app launching: route + confirm**
+  → Roku devices appear as multiple Control4 proxy items; LaunchApp is broadcast across the Roku protocol group and success is confirmed via polling `CURRENT_APP_ID`.
+
+* **Room Watch before visible media actions**
+  → Selecting the room’s active video device (Watch/HDMI) is required for app launching to be reliably visible on-screen.
 
 * **Best-effort state estimate when stale**
   → The gateway tracks recent lock intent and returns an estimate when confirmation via variables is unreliable.
@@ -299,6 +335,7 @@ Control4 Director
 
 * Cloud lock drivers may ignore or delay commands
 * Director state/variables may remain stale even when the device physically actuates (locks observed)
+* Media/app actions can be accepted but not visible if the room is not actively “watching” the correct input
 * pyControl4 API differences across versions
 * Limited documentation from Control4
 
@@ -309,18 +346,22 @@ Control4 Director
 ### Short-term (0–2 weeks)
 
 * Harden lock semantics and monitoring (stale state, intent estimates, tracing)
-* Add thermostat tools
-* Add/expand debug tools for item inspection and variable/binding tracing
+* Continue hardening media reliability (Watch/HDMI selection + app launch confirmation)
+* Expand debug tooling for item inspection, variable/binding tracing, and process/tool-registry diagnostics
 
 ### Recently completed
 
 * Implement light write-path (`OFF`/`ON`/`SET_LEVEL`/`RAMP_TO_LEVEL`) and validate against real devices
+* Add thermostat end-to-end support (read + safe write/confirm patterns)
+* Add media/AV tooling (remote/navigation, now-playing best-effort, app launching)
+* Make Roku app launching reliable (Watch/HDMI selection + protocol-group routing + `CURRENT_APP_ID` confirmation)
+* Add server/process diagnostic tool to detect stale/multiple `app.py` instances on Windows
 
 ### Mid-term (2–8 weeks)
 
 * Room-based commands (e.g., “lock all doors”)
 * Friendly name resolution (room + device)
-* Media control (power, volume, input)
+* Expand room-level media control (power off / end session, volume, input)
 * Optional caching of item metadata
 
 ---

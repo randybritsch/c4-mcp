@@ -1,100 +1,66 @@
 # PROJECT BOOTSTRAP SUMMARY — Control4 MCP Server
 
----
-
 ## **1) One-line purpose**
-Expose Control4 home automation (lights, locks, thermostats, later media) as **stable, local MCP tools** using a strict async gateway + sync facade architecture that avoids deadlocks and flaky HTTP behavior.
+Expose Control4 home automation (lights, locks, thermostats, media/AV) as stable, local MCP tools with reliable confirmations and strict sync/async layering.
 
----
-
-## **2) Architecture overview**
-- **Three strict layers**: MCP/App → Sync Adapter → Async Gateway  
-- **Single asyncio event loop** owned by the gateway, running forever in one background thread  
-- **All Control4 / pyControl4 calls live in the gateway only**  
-- Flask handlers never call async code directly (thread offloading only)  
-- **pyControl4 Director protocol preferred**; raw REST avoided unless proven safe  
-- Commands are **accepted vs confirmed** (cloud drivers may lag state updates)
-
----
+## **2) Architecture overview (3–6 bullets)**
+- **Three strict layers**: MCP/Flask tool handlers (sync) -> Adapter (sync) -> Gateway (async).
+- **Single asyncio event loop** lives in the gateway and runs forever in one background thread.
+- All Control4 I/O (pyControl4 + any HTTP polling/fallback) runs **only** on that gateway loop.
+- Tools favor **bounded-time** behavior (timeouts + structured error results; no hangs).
+- For flaky/stale drivers, results separate **"accepted" (Director ack)** from **"confirmed" (observed state)**.
+- Media visibility requires room context: ensure the room is actively **Watch-ing** the correct input before app launch.
 
 ## **3) Key modules and roles**
-- **`control4_gateway.py`**  
-  Async core. Owns asyncio loop, Control4 auth, Director client, retries, command execution, polling, parsing.
-- **`control4_adapter.py`**  
-  Thin sync-only facade. No async, no pyControl4, no logic.
-- **`app.py`**  
-  Flask + MCP only. Tool registration, validation, timeouts, formatting.
-- **`config.json`** (local, uncommitted)  
-  Control4 host + credentials.
-- **`PROJECT_OVERVIEW.md`**  
-  Full project brain / living documentation.
+- **app.py** — Flask + MCP tool registration; validates inputs; adds small response summaries (e.g., `summary_text` for watch+launch); never does Control4 I/O.
+- **control4_adapter.py** — Thin sync facade; delegates to gateway; no business logic.
+- **control4_gateway.py** — Async orchestrator; owns loop + pyControl4; implements retries/confirmation logic (locks, Roku app launches, thermostat setpoints).
+- **tools/** — Local scripts for inspection/diagnostics and quick E2E checks (e.g., Roku current app, basement app launch).
+- **config.json** — Local, uncommitted runtime config (Director host + credentials).
 
----
+## **4) Data & contracts (top 3–5 only)**
+- **Item**: `{ id, typeName, name, control, roomId/parentId, URIs }` (device metadata from Director).
+- **Variable**: `{ varName, value }` (e.g., Roku `CURRENT_APP_ID`, lock `LockStatus`, thermostat setpoints).
+- **Command**: named command invocation (`"ON"`, `"OFF"`, `"SET_LEVEL"`, `"UNLOCK"`, `"LaunchApp"`, etc.).
+- **Accepted vs confirmed**: write tools must not claim confirmation unless an observed state matches within a timeout window.
+- **Tool result shape**: tools return JSON dicts (typically with `ok`, plus details); avoid returning bare primitives.
 
-## **4) Data & contracts (top essentials)**
-- **Item**: `{ id, typeName, name, control, parentId, URIs }`
-- **Variable**: `{ varName, value }` (e.g., `LockStatus`, `BATTERY_LEVEL`)
-- **Command**: `{ id, command, display }` (e.g., `UNLOCK`, `LOCK`)
-- **Lock state contract**:  
-  - `accepted`: command sent successfully  
-  - `confirmed`: state observed changing within window  
-- **Tool result shape**: always JSON dict, never raw lists
-
----
-
-## **5) APIs (key endpoints/tools)**
-**MCP tools (external):**
-- `ping`
-- `c4_list_rooms`
-- `c4_list_devices(category)`
-- `c4_item_variables(device_id)`
-- `c4_item_commands(device_id)`
-- `c4_item_execute_command(device_id, command_id)`
-- **Lights**: `c4_light_get_state`, `c4_light_get_level`, `c4_light_set_level`, `c4_light_ramp`
-- **Locks**: `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`
-
-**Internal (gateway-only):**
-- `getItemVariables`
-- `getItemCommands`
-- `sendPostRequest` (signature-safe wrapper)
-
----
+## **5) APIs (key tools/endpoints only)**
+- **Core discovery/diagnostics**: `ping`, `c4_server_info`, `c4_list_rooms`, `c4_list_devices(category)`.
+- **Low-level inspection**: `c4_item_variables`, `c4_item_commands`, `c4_item_bindings`, `c4_item_send_command`, `c4_debug_trace_command`.
+- **Media/AV**: `c4_media_get_state`, `c4_media_now_playing`, `c4_media_remote`, `c4_media_remote_sequence`, `c4_media_launch_app`, `c4_media_roku_list_apps`.
+- **Room source selection**: `c4_room_select_video_device`.
+- **High-level Roku helper**: `c4_media_watch_launch_app` (ensures Watch/input selection, launches app, confirms via Roku variables, returns `summary` + `summary_text`).
+- **Thermostats**: `c4_thermostat_get_state`, `c4_thermostat_set_hvac_mode`, `c4_thermostat_set_fan_mode`, `c4_thermostat_set_hold_mode`, `c4_thermostat_set_target_f` (mode-safe target setpoint).
+- **Lights/Locks**: `c4_light_get_state`, `c4_light_set_level`, `c4_light_ramp`; `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`.
 
 ## **6) Coding conventions (must-follow rules)**
-- **One event loop, one thread — gateway owns it**
-- **No asyncio in Flask handlers**
-- **No pyControl4 imports outside the gateway**
-- Adapter contains **no logic**, only delegation
-- Every I/O call has **explicit timeouts**
-- Never change tool signatures; add new tools instead
-- Prefer **named commands** over commandId unless proven safe
-- Always return structured dicts (`ok`, `error`, `details`), never bare values
-
----
+- Gateway owns the only asyncio loop; **no async Control4 code in app.py**.
+- **No pyControl4 imports outside control4_gateway.py**.
+- Adapter must remain a **thin pass-through** (no business logic).
+- Every network/Director action has **explicit timeouts** and returns structured failures.
+- **Do not change MCP tool names/signatures**; add new tools instead.
+- For stateful devices, preserve **accepted vs confirmed** semantics.
+- Prefer **deterministic, idempotent** writes and add auto-restore in validation scripts.
 
 ## **7) Current priorities (Top 5)**
-1. Finalize lock semantics (`accepted` vs `confirmed`) for cloud drivers  
-2. Add thermostat tools (get state, set heat/cool, read temperature)  
-3. Improve lock confirmation via additional variables (e.g., `LastActionDescription`)  
-4. Add debug tool for full variable dump on any item  
-5. Light metadata caching to reduce repeated Director calls
-
----
+1. Keep Roku watch+launch reliable: Watch selection + retries + confirmation via `CURRENT_APP_ID`.
+2. Expand room-level media control (room off/end session, volume/input) without breaking layering.
+3. Maintain thermostat write safety: mode-aware target logic + confirmation/restore patterns.
+4. Keep tooling robust on Windows: detect/avoid multiple `app.py` processes (use `c4_server_info`).
+5. Keep docs in sync with code (overview/context pack/bootstrap summary).
 
 ## **8) Open risks / unknowns (Top 5)**
-1. Cloud lock drivers may **accept commands but delay or skip state updates**
-2. pyControl4 API differences across versions
-3. Control4 Director undocumented quirks
-4. Variable naming inconsistencies across drivers
-5. No official Control4 contract stability guarantees
+1. Some drivers physically actuate but Director variables remain stale (locks especially).
+2. Media actions can be "accepted" but not visible if the room is not actively on the correct Watch input.
+3. Roku appears as multiple proxy items; command routing must stay robust across those IDs.
+4. Multi-process/stale server instances on Windows can present a wrong tool registry.
+5. pyControl4/Director quirks and variable naming differences across driver versions.
 
----
-
-## **9) Full docs & references**
-- **`PROJECT_OVERVIEW.md`** — complete architecture & runbook  
-- **`control4_gateway.py`** — source of truth for async + Control4 logic  
-- **`control4_adapter.py`** — sync API surface  
-- **`app.py`** — MCP tools + Flask wiring  
-- (Future) `/docs/architecture.md`, `/docs/runbook.md`, `/docs/adr/`
-
----
+## **9) Links / paths to full docs**
+- docs/project_overview.md
+- docs/context_pack.md
+- docs/architecture.md
+- docs/project_spec.md
+- app.py, control4_adapter.py, control4_gateway.py
+- tools/get_roku_current_app.py, tools/test_paramount_basement.py

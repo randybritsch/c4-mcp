@@ -1,67 +1,72 @@
-```markdown
-# CONTEXT PACK — Control4 MCP Server (Jan 15, 2026)
+# CONTEXT PACK — Control4 MCP Server (Jan 2026)
 
 ## Mini Executive Summary (≤120 words)
 
-This project exposes Control4 automation as MCP tools via a local Flask server. It enforces a strict 3-layer design: synchronous MCP/Flask entrypoints → sync adapter pass-through → async gateway that owns all Control4 I/O on a single background asyncio loop thread. We discovered some cloud lock drivers can physically actuate while Director variables remain stale; therefore lock actions report “accepted” (Director ack) separately from “confirmed” (observed state change) and include a best-effort estimate. We recently fixed a regression where light reads worked but light writes were missing; light `OFF/ON/SET_LEVEL/RAMP_TO_LEVEL` now succeed and were validated on real devices.
+This project exposes Control4 automation (lights, locks, thermostats, media/AV) as MCP tools via a local Flask server. It enforces a strict 3-layer design: synchronous MCP/Flask entrypoints -> sync adapter pass-through -> async gateway that owns all Control4 I/O on a single background asyncio loop thread. Some cloud lock drivers can physically actuate while Director variables remain stale; lock actions report "accepted" (Director ack) separately from "confirmed" (observed state change) and may include a best-effort estimate. Roku app launching is made reliable by selecting the room Watch source when needed, broadcasting LaunchApp across the Roku protocol group, and confirming success by polling Roku variables (notably CURRENT_APP_ID).
 
 ## Critical Architecture (≤6 bullets)
 
-- [app.py](../app.py): Flask + MCP tool registration only; synchronous handlers.
-- [control4_adapter.py](../control4_adapter.py): sync-only pass-through; no business logic.
-- [control4_gateway.py](../control4_gateway.py): all Control4 I/O; runs on one background asyncio loop thread.
-- pyControl4 is the primary Director integration; gateway may use HTTP fallback for select endpoints (e.g., bindings).
-- Result semantics: separate “Director accepted” from “state confirmed”; do not trust lock variables alone.
-- Debug tooling exists to inspect items, commands, variables, and trace activity.
+- app.py: MCP tool surface (Flask) + small response shaping (e.g., media watch+launch summaries).
+- control4_adapter.py: synchronous facade; minimal logic; hands work to the gateway.
+- control4_gateway.py: async orchestrator; owns the single background asyncio loop and all Control4 I/O.
+- "accepted" vs "confirmed": preserve this split for actions where Director state may lag (locks; Roku app changes).
+- Media visibility: ensure the room is "watching" the Roku input before launching apps (SELECT_VIDEO_DEVICE).
+- Roku reliability: broadcast LaunchApp across the Roku protocol group and confirm via CURRENT_APP_ID polling.
 
 ## Current Working Set (3–7 files)
 
-- [control4_gateway.py](../control4_gateway.py): lock semantics (accepted/confirmed/estimate), bindings/variables timeouts, light get/set/ramp implementations.
-- [control4_adapter.py](../control4_adapter.py): sync facade and pass-throughs (including timeouts for variables/bindings).
-- [app.py](../app.py): MCP tool surface; lock result augmentation fields; light tools wiring.
-- [tools/watch_lock_activity.py](../tools/watch_lock_activity.py): variable/activity watcher and logging improvements.
-- [tools/inspect_item.py](../tools/inspect_item.py): quick inspection of item info/commands/variables.
-- [docs/project_overview.md](project_overview.md): “project brain” updated to reflect current architecture/tools.
+- ../app.py — MCP tools + summaries.
+- ../control4_adapter.py — sync wrappers and gateway lifecycle.
+- ../control4_gateway.py — async Control4 integration; media watch+launch; thermostat safe set-target; lock semantics.
+- project_overview.md — tool list + decisions.
+- ../tools/get_roku_current_app.py — quick confirmation helper.
+- ../tools/test_paramount_basement.py — E2E watch+launch validation.
 
 ## Interfaces / Contracts That Must Not Break
 
-- MCP tool names and parameter shapes (external contract), including:
-  - `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`
-  - `c4_light_get_state`, `c4_light_get_level`, `c4_light_set_level`, `c4_light_ramp`
-  - discovery/debug tools like `c4_list_rooms`, `c4_list_devices`, `c4_item_variables`, `c4_item_commands`, `c4_item_bindings`, `c4_item_send_command`, `c4_debug_trace_command`
-- Layering contract: no Control4 I/O or async work in `app.py` or `control4_adapter.py`.
-- Lock response semantics: preserve `accepted` vs `confirmed`; only add fields (don’t rename/remove existing keys).
+- Discovery/debug: ping, c4_server_info, c4_list_rooms, c4_list_devices, c4_item_variables, c4_item_commands, c4_item_bindings, c4_item_send_command, c4_debug_trace_command
+- Rooms/media: c4_room_select_video_device, c4_media_watch_launch_app, c4_media_launch_app, c4_media_roku_list_apps, c4_media_remote, c4_media_remote_sequence, c4_media_now_playing, c4_media_get_state
+- Thermostats: c4_thermostat_get_state, c4_thermostat_set_hvac_mode, c4_thermostat_set_fan_mode, c4_thermostat_set_hold_mode, c4_thermostat_set_target_f, c4_thermostat_set_heat_setpoint_f, c4_thermostat_set_cool_setpoint_f
+- Lights: c4_light_get_state, c4_light_get_level, c4_light_set_level, c4_light_ramp
+- Locks: c4_lock_get_state, c4_lock_unlock, c4_lock_lock (must keep accepted/confirmed semantics)
 
 ## Today’s Objectives + Acceptance Criteria
 
-- Objective: Validate “no regressions” for lights + keep lock behavior safe under stale state.
-- Acceptance criteria:
-  - Light device can `OFF`, `ON`, `SET_LEVEL 30`, `SET_LEVEL 100` with read-back matching (`LIGHT_STATE`/brightness).
-  - Lock actions always send commands (no “already locked” short-circuit) and never claim confirmed unless an actual change is observed.
-  - Tools return bounded-time responses (timeouts handled as structured results, not hangs).
-  - Docs reflect current repo layout and tool surface.
+- Media (Basement Roku): c4_media_watch_launch_app(..., room_id=456, app="Netflix"|"Paramount+") returns ok=true and summary_text shows Watch active and CURRENT_APP_ID changing to the expected value.
+- Room off: room-off command returns accepted=true and the room Watch becomes inactive best-effort.
+- Thermostat safety: c4_thermostat_set_target_f chooses the correct setpoint (heat vs cool) based on mode and confirms when possible; no exceptions due to mode mismatch.
+- Reliability: no MCP tool call hangs; timeouts return structured results.
 
 ## Guardrails (Conventions & Constraints)
 
-- Python 3.11+ (validated on Python 3.14); keep type hints.
-- Explicit timeouts on all network/Director operations.
-- Keep the strict layering: `app.py` sync MCP only → adapter pass-through → gateway async I/O only.
-- Prefer command-by-name (`"OFF"`, `"ON"`, `"SET_LEVEL"`, `"RAMP_TO_LEVEL"`, `"LOCK"`, `"UNLOCK"`) over command IDs when possible.
-- Do not “confirm” actions based on stale Director variables; treat confirmation as best-effort.
-- Make minimal, surgical changes; preserve existing tool signatures and outputs.
+- Keep strict layering: app.py must not talk to Control4 directly.
+- All Control4 I/O must run on the gateway's single asyncio loop thread.
+- Do not change MCP tool names/signatures without updating docs and clients.
+- Write operations should be safe: prefer idempotent commands; when validating with real devices, use auto-restore patterns.
+- Roku: do not assume a single device id; LaunchApp must work from any Roku-related item id (protocol root / media_service / media_player / avswitch).
+- Windows ops: multiple app.py processes can cause stale tool registries; use c4_server_info to confirm which process is serving.
 
 ## Links / Paths for Deeper Docs
 
-- Project brain: [docs/project_overview.md](project_overview.md)
-- Architecture notes: [docs/architecture.md](architecture.md)
-- Additional context/specs: [docs/project_spec.md](project_spec.md), [docs/context_pack.md](context_pack.md)
+- project_overview.md
+- architecture.md
+- project_spec.md
+- ../tools/watch_lock_activity.py (lock-state tracing)
+- ../logs/ (recent traces)
 
 ## Next Prompt to Paste
 
 ```text
-Load context from docs/project_overview.md and focus only on the current working set (control4_gateway.py, control4_adapter.py, app.py, tools/watch_lock_activity.py).
-Goal: verify lights and locks end-to-end through MCP (not just direct gateway calls).
-Constraints: keep strict layering; do not change MCP tool signatures; prefer minimal changes; add explicit timeouts.
-Plan a small validation script or MCP call sequence, run it, and report results with accepted vs confirmed semantics.
+Load context from docs/project_overview.md and docs/context_pack.md.
+
+Goal: run an end-to-end validation of Basement Roku watch+launch and one thermostat write-test with auto-restore.
+
+Use room_id=456 and Roku-related device ids 2074/2075/2076/2077.
+
+Steps:
+1) Call c4_media_watch_launch_app(device_id=2074, room_id=456, app="Netflix") and report summary_text.
+2) Call c4_media_roku_list_apps(device_id=2075, search="Paramount") then launch Paramount+ via c4_media_watch_launch_app.
+3) Pick one thermostat, call c4_thermostat_get_state then c4_thermostat_set_target_f(+1F) with confirm, then restore.
+
+Constraints: keep strict layering; no signature changes; add explicit timeouts; report accepted vs confirmed clearly.
 ```
-  - Never hang or deadlock MCP requests
