@@ -429,6 +429,150 @@ class Control4Gateway:
         uri = f"/api/v1/items/{device_id}/commands"
         return await self._send_post_via_director(director, uri, command, params or {}, async_variable=False)
 
+    # ---------- room command helpers ----------
+
+    async def _room_send_command_async(
+        self, room_id: int, command: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        room_id = int(room_id)
+        command = str(command or "").strip().upper()
+        if not command:
+            return {"ok": False, "room_id": room_id, "error": "command is required"}
+
+        director = await self._director_async()
+        uri = f"/api/v1/rooms/{room_id}/commands"
+        result = await self._send_post_via_director(director, uri, command, params or {}, async_variable=False)
+        if isinstance(result, dict):
+            result["room_id"] = room_id
+        return result
+
+    async def _room_select_video_device_async(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
+        room_id = int(room_id)
+        device_id = int(device_id)
+        params = {"deviceid": device_id, "deselect": (1 if deselect else 0)}
+        return await self._room_send_command_async(room_id, "SELECT_VIDEO_DEVICE", params)
+
+    @staticmethod
+    def _find_ui_watch_node(payload: Any, room_id: int) -> dict[str, Any] | None:
+        if isinstance(payload, dict):
+            if payload.get("type") == "watch" and int(payload.get("room_id") or -1) == int(room_id):
+                return payload
+            for v in payload.values():
+                found = Control4Gateway._find_ui_watch_node(v, room_id)
+                if found is not None:
+                    return found
+        elif isinstance(payload, list):
+            for it in payload:
+                found = Control4Gateway._find_ui_watch_node(it, room_id)
+                if found is not None:
+                    return found
+        return None
+
+    async def _ui_watch_status_async(self, room_id: int) -> dict[str, Any] | None:
+        room_id = int(room_id)
+        http = await self._director_http_get("/api/v1/agents/ui_configuration")
+        if not http.get("ok"):
+            return None
+        payload = http.get("json")
+        node = self._find_ui_watch_node(payload, room_id)
+        if not isinstance(node, dict):
+            return None
+        active = bool(node.get("active"))
+        sources = None
+        raw_sources = node.get("sources")
+        if isinstance(raw_sources, dict) and isinstance(raw_sources.get("source"), list):
+            sources = [s for s in raw_sources.get("source") if isinstance(s, dict)]
+        return {"room_id": room_id, "active": active, "sources": sources}
+
+    async def _resolve_room_id_for_device_async(self, device_id: int) -> int | None:
+        device_id = int(device_id)
+        items = await self._get_all_items_async()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if int(it.get("id") or -1) == device_id:
+                rid = it.get("roomId")
+                try:
+                    return int(rid)
+                except Exception:
+                    return None
+        return None
+
+    async def _media_watch_launch_app_async(
+        self,
+        device_id: int,
+        app: str,
+        room_id: int | None = None,
+        pre_home: bool = True,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        app = str(app or "").strip()
+        if not app:
+            return {"ok": False, "device_id": device_id, "error": "app is required"}
+
+        resolved_room_id = int(room_id) if room_id is not None else (await self._resolve_room_id_for_device_async(device_id))
+        if resolved_room_id is None:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "room_id": room_id,
+                "error": "Could not resolve room_id for device; pass room_id explicitly",
+            }
+
+        before_watch = await self._ui_watch_status_async(resolved_room_id)
+
+        select_video = await self._room_select_video_device_async(resolved_room_id, device_id, deselect=False)
+        # Give the room's Watch macro time to settle; in practice this can take a couple seconds.
+        after_select_watch = None
+        settle_deadline = asyncio.get_running_loop().time() + 6.0
+        while asyncio.get_running_loop().time() < settle_deadline:
+            await asyncio.sleep(0.6)
+            after_select_watch = await self._ui_watch_status_async(resolved_room_id)
+            if isinstance(after_select_watch, dict) and after_select_watch.get("active") is True:
+                break
+
+        home = None
+        home_attempts: list[dict[str, Any]] | None = None
+        if bool(pre_home):
+            # Use media_send_command so callers can pass any Roku-related item id.
+            # Send HOME twice with a short settle; Roku can ignore the first press if it's mid-transition.
+            home_attempts = []
+            for _ in range(2):
+                home = await self._media_send_command_async(device_id, "HOME", {})
+                home_attempts.append(home)
+                await asyncio.sleep(0.8)
+
+        # Retry LaunchApp if the device is still transitioning after Watch/HOME.
+        launch = None
+        launch_attempts: list[dict[str, Any]] = []
+        for _ in range(3):
+            launch = await self._media_launch_app_async(device_id, app)
+            launch_attempts.append(launch)
+            if isinstance(launch, dict) and launch.get("ok") is True:
+                break
+            await asyncio.sleep(1.2)
+
+        after_launch_watch = await self._ui_watch_status_async(resolved_room_id)
+
+        ok = bool(select_video.get("ok")) and bool((launch or {}).get("ok"))
+
+        return {
+            "ok": ok,
+            "room_id": resolved_room_id,
+            "device_id": device_id,
+            "app": app,
+            "watch": {
+                "before": before_watch,
+                "after_select_video": after_select_watch,
+                "after_launch": after_launch_watch,
+            },
+            "select_video": select_video,
+            "home": home,
+            "home_attempts": home_attempts,
+            "launch": launch,
+            "launch_attempts": launch_attempts,
+        }
+
     @staticmethod
     def _select_vars_for_trace(
         variables: list[dict[str, Any]],
@@ -517,6 +661,24 @@ class Control4Gateway:
 
     def item_execute_command(self, device_id: int, command_id: int) -> dict[str, Any]:
         return self._loop_thread.run(self._item_execute_command_async(int(device_id), int(command_id)), timeout_s=12)
+
+    def room_send_command(self, room_id: int, command: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._room_send_command_async(int(room_id), str(command or ""), params or {}),
+            timeout_s=12,
+        )
+
+    def room_select_video_device(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._room_select_video_device_async(int(room_id), int(device_id), deselect=bool(deselect)),
+            timeout_s=12,
+        )
+
+    def media_watch_launch_app(self, device_id: int, app: str, room_id: int | None = None, pre_home: bool = True) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._media_watch_launch_app_async(int(device_id), str(app or ""), room_id=(int(room_id) if room_id is not None else None), pre_home=bool(pre_home)),
+            timeout_s=45,
+        )
 
     def item_send_command(self, device_id: int, command: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._loop_thread.run(
@@ -1542,6 +1704,703 @@ class Control4Gateway:
             }
 
         return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) * 2.0 + 25.0)
+
+    # ---- Media / AV ----
+
+    @staticmethod
+    def _media_state_from_vars(vars_by_name: dict[str, Any]) -> dict[str, Any]:
+        def pick(*names: str) -> Any:
+            for n in names:
+                if n in vars_by_name:
+                    return vars_by_name.get(n)
+            return None
+
+        power_state = pick("POWER_STATE", "POWER")
+        power_i = Control4Gateway._coerce_int(power_state)
+
+        return {
+            "power_state": power_i if power_i is not None else power_state,
+            "power_on": (power_i == 1) if power_i is not None else None,
+            "app_name": pick("APP_NAME"),
+            "status": pick("AppleTV Status", "STATUS"),
+            "transports_supported": pick("TRANSPORTS_SUPPORTED"),
+            "transports_buttons": pick("TRANSPORTS_BUTTONS"),
+        }
+
+    async def _media_get_state_async(self, device_id: int) -> dict[str, Any]:
+        device_id = int(device_id)
+        fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+        var_list: list[dict[str, Any]] = (
+            fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+        )
+        vars_by_name = self._vars_to_map(var_list)
+        state = self._media_state_from_vars(vars_by_name)
+        return {
+            "ok": bool(fetched.get("ok")) or True,
+            "device_id": device_id,
+            "source": fetched.get("source") or "director.getItemVariables",
+            "state": state,
+        }
+
+    def media_get_state(self, device_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._media_get_state_async(int(device_id)), timeout_s=12)
+
+    @staticmethod
+    def _media_now_playing_from_vars(vars_by_name: dict[str, Any]) -> dict[str, Any]:
+        def pick(*names: str) -> Any:
+            for n in names:
+                if n in vars_by_name:
+                    return vars_by_name.get(n)
+            return None
+
+        # Common-ish fields across drivers (best-effort only).
+        now_playing: dict[str, Any] = {
+            "title": pick("TITLE", "TRACK_TITLE", "MEDIA_TITLE", "NOW_PLAYING_TITLE"),
+            "artist": pick("ARTIST", "TRACK_ARTIST", "MEDIA_ARTIST", "NOW_PLAYING_ARTIST"),
+            "album": pick("ALBUM", "TRACK_ALBUM", "MEDIA_ALBUM", "NOW_PLAYING_ALBUM"),
+            "station": pick("STATION", "STATION_NAME", "CHANNEL", "CHANNEL_NAME"),
+            "source": pick("SOURCE", "CURRENT_SOURCE", "INPUT"),
+            "play_state": pick("PLAY_STATE", "TRANSPORT_STATE", "STATE"),
+            "power_state": pick("POWER_STATE", "POWER"),
+        }
+
+        # Control4 Digital Media often exposes queue-related structures.
+        queue_info = pick("QUEUE_INFO_V2", "QUEUE_INFO")
+        queue_status = pick("QUEUE_STATUS_V2", "QUEUE_STATUS")
+        if queue_info is not None:
+            now_playing["queue_info"] = queue_info
+        if queue_status is not None:
+            now_playing["queue_status"] = queue_status
+
+        # Strip empty/null entries to keep output clean.
+        return {k: v for k, v in now_playing.items() if v not in (None, "")}
+
+    async def _media_get_now_playing_async(self, device_id: int) -> dict[str, Any]:
+        device_id = int(device_id)
+        fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+        var_list: list[dict[str, Any]] = (
+            fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+        )
+        vars_by_name = self._vars_to_map(var_list)
+        now_playing = self._media_now_playing_from_vars(vars_by_name)
+
+        # Include a small list of "candidate" variables so users can quickly see what exists.
+        candidates: list[dict[str, Any]] = []
+        for name, value in vars_by_name.items():
+            n = str(name)
+            nl = n.lower()
+            if any(token in nl for token in ("title", "artist", "album", "track", "station", "channel", "queue", "song", "transport", "play")):
+                candidates.append({"varName": n, "value": value})
+
+        candidates.sort(key=lambda x: str(x.get("varName") or ""))
+
+        return {
+            "ok": bool(fetched.get("ok")) or True,
+            "device_id": device_id,
+            "source": fetched.get("source") or "director.getItemVariables",
+            "now_playing": now_playing,
+            "candidates": candidates[:60],
+        }
+
+    def media_get_now_playing(self, device_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._media_get_now_playing_async(int(device_id)), timeout_s=12)
+
+    @staticmethod
+    def _normalize_remote_press(press: str | None) -> str:
+        p = str(press or "Tap").strip().lower()
+        if p in ("tap", "short", "press"):
+            return "Tap"
+        if p in ("long", "long press", "hold"):
+            return "Long Press"
+        if p in ("down", "key down"):
+            return "Down"
+        if p in ("up", "key up"):
+            return "Up"
+        return "Tap"
+
+    @staticmethod
+    def _media_profile_from_item(item_name: str | None, commands: list[dict[str, Any]] | None) -> str:
+        n = str(item_name or "").lower()
+        if "apple tv" in n:
+            return "apple_tv"
+        if "roku" in n:
+            return "roku"
+
+        cmds = commands if isinstance(commands, list) else []
+        cmd_names = {str(c.get("command") or "").lower() for c in cmds if isinstance(c, dict)}
+        if "tvhome" in cmd_names or "playpause" in cmd_names:
+            return "apple_tv"
+        if "launchapp" in cmd_names:
+            return "roku"
+        return "generic"
+
+    @staticmethod
+    def _media_remote_mapping(profile: str) -> dict[str, str]:
+        # Map friendly names -> Director command name.
+        if profile == "roku":
+            return {
+                "up": "UP",
+                "down": "DOWN",
+                "left": "LEFT",
+                "right": "RIGHT",
+                "select": "SELECT",
+                "ok": "SELECT",
+                "enter": "SELECT",
+                "home": "HOME",
+                "back": "BACK",
+                "menu": "BACK",
+                "info": "INFO",
+                "replay": "REPLAY",
+                "instant_replay": "REPLAY",
+                "recall": "RECALL",
+                "prev": "RECALL",
+                "play": "PLAY",
+                "pause": "PAUSE",
+                "ff": "SCAN_FWD",
+                "scan_fwd": "SCAN_FWD",
+                "rew": "SCAN_REV",
+                "scan_rev": "SCAN_REV",
+            }
+
+        # Default: Apple TV-style (Gen 4/4K IP driver) expects a State param.
+        return {
+            "up": "up",
+            "down": "down",
+            "left": "left",
+            "right": "right",
+            "select": "select",
+            "ok": "select",
+            "menu": "menu",
+            "home": "tvhome",
+            "tvhome": "tvhome",
+            "playpause": "playpause",
+            "play_pause": "playpause",
+            "play": "playpause",
+            "pause": "playpause",
+            "volup": "volup",
+            "volume_up": "volup",
+            "voldown": "voldown",
+            "volume_down": "voldown",
+        }
+
+    async def _media_remote_async(self, device_id: int, button: str, press: str | None = None) -> dict[str, Any]:
+        device_id = int(device_id)
+        b = str(button or "").strip().lower()
+        if not b:
+            return {"ok": False, "device_id": device_id, "error": "button is required"}
+
+        fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+        var_list: list[dict[str, Any]] = (
+            fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+        )
+        item_name = None
+        if var_list and isinstance(var_list[0], dict):
+            item_name = var_list[0].get("name")
+
+        cmds_payload = await self._item_get_commands_async(device_id)
+        cmd_list = cmds_payload.get("commands") if isinstance(cmds_payload.get("commands"), list) else []
+        profile = self._media_profile_from_item(str(item_name) if item_name is not None else None, cmd_list)
+        mapping = self._media_remote_mapping(profile)
+
+        cmd = mapping.get(b)
+        if not cmd:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "profile": profile,
+                "error": f"Unsupported button '{button}'. Supported: {sorted(set(mapping.keys()))}",
+            }
+
+        normalized_press = self._normalize_remote_press(press)
+        params: dict[str, Any] | None
+        if profile == "apple_tv":
+            params = {"State": normalized_press}
+        else:
+            # Roku/other drivers typically ignore a press-state param; treat as a tap.
+            params = None
+
+        exec_result = await self._media_send_command_async(device_id, cmd, params)
+
+        return {
+            "ok": bool(exec_result.get("ok")),
+            "device_id": device_id,
+            "profile": profile,
+            "requested": {"button": str(button), "press": normalized_press, "command": cmd},
+            "accepted": bool(exec_result.get("ok")),
+            "execute": exec_result,
+        }
+
+    def media_remote(self, device_id: int, button: str, press: str | None = None) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._media_remote_async(int(device_id), str(button or ""), press),
+            timeout_s=12,
+        )
+
+    async def _media_remote_sequence_async(
+        self,
+        device_id: int,
+        buttons: list[str],
+        press: str | None = None,
+        delay_ms: int = 250,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        if not isinstance(buttons, list) or not buttons:
+            return {"ok": False, "device_id": device_id, "error": "buttons must be a non-empty list"}
+
+        results: list[dict[str, Any]] = []
+        for idx, btn in enumerate(buttons):
+            r = await self._media_remote_async(device_id, str(btn or ""), press)
+            results.append(r)
+            if not bool(r.get("ok")):
+                return {
+                    "ok": False,
+                    "device_id": device_id,
+                    "error": "remote sequence step failed",
+                    "failed_index": idx,
+                    "failed_step": r,
+                    "results": results,
+                }
+            await asyncio.sleep(max(0.0, float(delay_ms)) / 1000.0)
+
+        return {"ok": True, "device_id": device_id, "count": len(results), "results": results}
+
+    def media_remote_sequence(self, device_id: int, buttons: list[str], press: str | None = None, delay_ms: int = 250) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._media_remote_sequence_async(int(device_id), list(buttons), press, int(delay_ms)),
+            timeout_s=20,
+        )
+
+    async def _media_launch_app_async(self, device_id: int, app: str) -> dict[str, Any]:
+        device_id = int(device_id)
+        a = str(app or "").strip()
+        if not a:
+            return {"ok": False, "device_id": device_id, "error": "app is required"}
+
+        # For Roku, the same physical device can be represented by multiple items (protocol root,
+        # media_service, media_player, avswitch). Users may call any of these item IDs, but we want
+        # LaunchApp to be reliable regardless.
+        async def _get_item_by_id(items: list[dict[str, Any]], item_id: int) -> dict[str, Any] | None:
+            for row in items:
+                if isinstance(row, dict) and int(row.get("id") or -1) == int(item_id):
+                    return row
+            return None
+
+        async def _resolve_roku_targets(input_id: int) -> dict[str, Any]:
+            # Use the fast HTTP items listing for routing to avoid the slower multi-method
+            # pyControl4 enumeration path (which can accumulate several timeouts).
+            http = await self._director_http_get("/api/v1/items")
+            if http.get("ok"):
+                items = self._normalize_items_payload(http.get("json"))
+            else:
+                items = await self._get_all_items_async()
+            rec = await _get_item_by_id(items, int(input_id))
+            if not isinstance(rec, dict):
+                return {
+                    "input_device_id": int(input_id),
+                    "protocol_id": None,
+                    "primary_device_id": int(input_id),
+                    "targets": [int(input_id)],
+                }
+
+            protocol_filename = str(rec.get("protocolFilename") or "")
+            protocol_name = str(rec.get("protocolName") or "")
+
+            protocol_id = rec.get("protocolId")
+            try:
+                protocol_id_i = int(protocol_id)
+            except Exception:
+                protocol_id_i = int(input_id)
+
+            room_id = rec.get("roomId")
+            try:
+                room_id_i = int(room_id)
+            except Exception:
+                room_id_i = -1
+
+            group = [
+                r
+                for r in items
+                if isinstance(r, dict) and int(r.get("protocolId") or -1) == protocol_id_i
+            ]
+
+            # Prefer the media_player proxy for control.
+            media_players = [r for r in group if str(r.get("proxy") or "").lower() == "media_player"]
+            if room_id_i != -1:
+                media_players.sort(key=lambda r: (int(r.get("roomId") or -1) != room_id_i, int(r.get("proxyOrder") or 9999), int(r.get("id") or 0)))
+            else:
+                media_players.sort(key=lambda r: (int(r.get("proxyOrder") or 9999), int(r.get("id") or 0)))
+
+            primary_id = int(media_players[0].get("id")) if media_players else int(input_id)
+
+            # Build a stable target list; keep unique order.
+            targets: list[int] = []
+            for candidate in [
+                primary_id,
+                protocol_id_i,
+                # service + switcher can also accept LaunchApp in some driver setups
+                *[int(r.get("id")) for r in group if str(r.get("proxy") or "").lower() == "media_service"],
+                *[int(r.get("id")) for r in group if str(r.get("proxy") or "").lower() == "avswitch"],
+                int(input_id),
+            ]:
+                if candidate not in targets:
+                    targets.append(candidate)
+
+            return {
+                "input_device_id": int(input_id),
+                "protocol_id": protocol_id_i,
+                "primary_device_id": primary_id,
+                "room_id": room_id_i if room_id_i != -1 else None,
+                "protocolFilename": protocol_filename,
+                "protocolName": protocol_name,
+                "targets": targets,
+            }
+
+        async def _roku_current_app(protocol_id: int) -> dict[str, Any] | None:
+            # Prefer HTTP for polling; pyControl4 variable reads can be slow and stack timeouts.
+            http = await self._director_http_get(f"/api/v1/items/{int(protocol_id)}/variables")
+            if not http.get("ok"):
+                return None
+            payload = http.get("json")
+            var_list = payload.get("variables") if isinstance(payload, dict) else payload
+            if not isinstance(var_list, list):
+                return None
+            if not var_list:
+                return None
+            current_app = self._get_var_value(var_list, "CURRENT_APP")
+            current_app_id = self._get_var_value(var_list, "CURRENT_APP_ID")
+            try:
+                current_app_id_i = int(current_app_id)
+            except Exception:
+                current_app_id_i = None
+            return {
+                "CURRENT_APP": current_app,
+                "CURRENT_APP_ID": current_app_id,
+                "CURRENT_APP_ID_INT": current_app_id_i,
+            }
+
+        # Resolve Roku routing early so we can avoid slow profile inference when it's clearly Roku.
+        routing_hint = await _resolve_roku_targets(device_id)
+        is_roku_hint = "roku" in str(routing_hint.get("protocolFilename") or "").lower()
+
+        # Try to infer profile so we can apply Roku-specific behavior.
+        if is_roku_hint:
+            profile = "roku"
+        else:
+            fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+            var_list: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+            item_name = None
+            if var_list and isinstance(var_list[0], dict):
+                item_name = var_list[0].get("name")
+
+            cmds_payload = await self._item_get_commands_async(device_id)
+            cmd_list = cmds_payload.get("commands") if isinstance(cmds_payload.get("commands"), list) else []
+            profile = self._media_profile_from_item(str(item_name) if item_name is not None else None, cmd_list)
+
+        resolved: dict[str, Any] | None = None
+        app_param: Any = a
+
+        # If the app looks numeric (e.g., Roku channel id), pass as an int.
+        if a.isdigit():
+            app_param = int(a)
+            resolved = {"mode": "direct_id", "app": a, "roku_app_id": int(a)}
+
+        # Otherwise, for Roku, try to resolve app name -> UM_ROKU id from universal mini-app variables.
+        if resolved is None and profile == "roku":
+            apps_resp = await self._media_roku_list_apps_async(device_id, search=a)
+            apps = apps_resp.get("apps") if isinstance(apps_resp, dict) else None
+            if isinstance(apps, list) and apps:
+                target_l = a.lower()
+                # Prefer exact match, then contains match.
+                exact = [row for row in apps if isinstance(row, dict) and str(row.get("app_name") or "").lower() == target_l]
+                cand = exact[0] if exact else apps[0]
+
+                roku_app_id = cand.get("roku_app_id")
+                if isinstance(roku_app_id, int):
+                    app_param = roku_app_id
+                    resolved = {
+                        "mode": "resolved_name",
+                        "app": a,
+                        "resolved_app_name": cand.get("app_name"),
+                        "roku_app_id": roku_app_id,
+                        "source_item_id": cand.get("item_id"),
+                    }
+
+        # Roku drivers commonly support LaunchApp with param name 'App'.
+        expected_roku_app_id: int | None = None
+        if isinstance(app_param, int):
+            expected_roku_app_id = int(app_param)
+
+        attempts: list[dict[str, Any]] = []
+
+        # For Roku, broadcast LaunchApp across the protocol group until the Roku reports the expected app.
+        if profile == "roku":
+            routing = routing_hint
+            protocol_id = routing.get("protocol_id")
+            if isinstance(protocol_id, int):
+                before = await _roku_current_app(protocol_id)
+            else:
+                before = None
+
+            director = await self._director_async()
+
+            for target_id in routing.get("targets") if isinstance(routing.get("targets"), list) else [device_id]:
+                try:
+                    target_i = int(target_id)
+                except Exception:
+                    continue
+                uri = f"/api/v1/items/{target_i}/commands"
+                exec_result = await self._send_post_via_director(director, uri, "LaunchApp", {"App": app_param}, async_variable=False)
+                attempts.append({"target_device_id": target_i, "execute": exec_result})
+                if isinstance(protocol_id, int) and expected_roku_app_id is not None:
+                    await asyncio.sleep(0.6)
+                    snap = await _roku_current_app(protocol_id)
+                    attempts[-1]["roku_after"] = snap
+                    if isinstance(snap, dict) and snap.get("CURRENT_APP_ID_INT") == expected_roku_app_id:
+                        break
+
+            after = await (_roku_current_app(protocol_id) if isinstance(protocol_id, int) else asyncio.sleep(0) or None)
+
+            ok = False
+            if isinstance(after, dict) and expected_roku_app_id is not None:
+                ok = after.get("CURRENT_APP_ID_INT") == expected_roku_app_id
+            else:
+                ok = any(bool(a.get("execute", {}).get("ok")) for a in attempts)
+
+            out: dict[str, Any] = {
+                "ok": bool(ok),
+                "device_id": device_id,
+                "profile": profile,
+                "requested": {"app": a, "command": "LaunchApp"},
+                "accepted": bool(ok),
+                "routing": routing,
+                "roku": {"before": before, "after": after, "expected_app_id": expected_roku_app_id},
+                "attempts": attempts,
+            }
+        else:
+            exec_result = await self._media_send_command_async(device_id, "LaunchApp", {"App": app_param})
+            out = {
+                "ok": bool(exec_result.get("ok")),
+                "device_id": device_id,
+                "profile": profile,
+                "requested": {"app": a, "command": "LaunchApp"},
+                "accepted": bool(exec_result.get("ok")),
+                "execute": exec_result,
+            }
+        if resolved is not None:
+            out["resolved"] = resolved
+        return out
+
+    def media_launch_app(self, device_id: int, app: str) -> dict[str, Any]:
+        # Roku LaunchApp may broadcast across multiple proxy items and poll for CURRENT_APP_ID.
+        # Give it a bit more time than a single command.
+        return self._loop_thread.run(self._media_launch_app_async(int(device_id), str(app or "")), timeout_s=25)
+
+    async def _get_all_items_variable_values_async(self, var_names: list[str]) -> dict[str, Any]:
+        director = await self._director_async()
+        names = [str(n or "").strip() for n in (var_names or []) if str(n or "").strip()]
+        if not names:
+            return {"ok": False, "error": "var_names must be non-empty", "variables": []}
+
+        if hasattr(director, "getAllItemVariableValue"):
+            try:
+                res = await asyncio.wait_for(director.getAllItemVariableValue(names), timeout=self._director_timeout_s)
+                if isinstance(res, str):
+                    try:
+                        res = json.loads(res)
+                    except Exception:
+                        return {"ok": False, "source": "director.getAllItemVariableValue", "raw": res, "variables": []}
+                if isinstance(res, list):
+                    cleaned = [row for row in res if isinstance(row, dict)]
+                    return {"ok": True, "source": "director.getAllItemVariableValue", "variables": cleaned}
+                return {
+                    "ok": False,
+                    "source": "director.getAllItemVariableValue",
+                    "error": f"Unexpected response type: {type(res).__name__}",
+                    "raw": res,
+                    "variables": [],
+                }
+            except asyncio.TimeoutError:
+                return {"ok": False, "source": "director.getAllItemVariableValue", "error": "timeout", "variables": []}
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "source": "director.getAllItemVariableValue",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "variables": [],
+                }
+
+        q = ",".join(names)
+        http = await self._director_http_get(f"/api/v1/items/variables?varnames={q}")
+        if http.get("ok"):
+            payload = http.get("json")
+            if isinstance(payload, list):
+                cleaned = [row for row in payload if isinstance(row, dict)]
+                return {"ok": True, "source": "http:/api/v1/items/variables", "variables": cleaned}
+        return {"ok": False, "source": "http:/api/v1/items/variables", **http, "variables": []}
+
+    async def _media_roku_list_apps_async(self, device_id: int, search: str | None = None) -> dict[str, Any]:
+        device_id = int(device_id)
+        fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=4.0)
+        var_list: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+
+        room_name = None
+        if var_list and isinstance(var_list[0], dict):
+            room_name = var_list[0].get("roomName")
+        room_name_s = str(room_name or "").strip()
+        if not room_name_s:
+            return {"ok": False, "device_id": device_id, "error": "Could not determine roomName for device", "source": fetched.get("source")}
+
+        all_vars = await self._get_all_items_variable_values_async(["APP_NAME", "UM_ROKU"])
+        rows = all_vars.get("variables") if isinstance(all_vars.get("variables"), list) else []
+
+        grouped: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("roomName") or "").strip() != room_name_s:
+                continue
+            item_id = row.get("id")
+            if item_id is None:
+                continue
+            try:
+                iid = int(item_id)
+            except Exception:
+                continue
+
+            rec = grouped.setdefault(iid, {"item_id": iid, "roomName": room_name_s, "name": row.get("name")})
+            var_name = str(row.get("varName") or "").strip().upper()
+            if var_name == "APP_NAME":
+                rec["app_name"] = row.get("value")
+            elif var_name == "UM_ROKU":
+                v = row.get("value")
+                try:
+                    rec["roku_app_id"] = int(v)
+                except Exception:
+                    rec["roku_app_id"] = v
+
+        query = str(search or "").strip().lower()
+        apps: list[dict[str, Any]] = []
+        for rec in grouped.values():
+            if "roku_app_id" not in rec:
+                continue
+            app_name = str(rec.get("app_name") or "").strip()
+            if not app_name:
+                continue
+            if query and query not in app_name.lower():
+                continue
+            if not isinstance(rec.get("roku_app_id"), int):
+                continue
+            apps.append({"item_id": rec.get("item_id"), "app_name": app_name, "roku_app_id": rec.get("roku_app_id")})
+
+        apps.sort(key=lambda a: str(a.get("app_name") or "").lower())
+        return {
+            "ok": True,
+            "device_id": device_id,
+            "roomName": room_name_s,
+            "search": str(search or "") if search is not None else None,
+            "count": len(apps),
+            "apps": apps,
+            "source": all_vars.get("source") or "director.getAllItemVariableValue",
+        }
+
+    def media_roku_list_apps(self, device_id: int, search: str | None = None) -> dict[str, Any]:
+        return self._loop_thread.run(self._media_roku_list_apps_async(int(device_id), search), timeout_s=18)
+
+    async def _media_send_command_async(
+        self,
+        device_id: int,
+        command: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        cmd = str(command or "").strip()
+        if not cmd:
+            return {"ok": False, "device_id": device_id, "error": "command is required"}
+
+        # Special-case Roku LaunchApp: users may pass any of the Roku-related item IDs.
+        cmd_u = cmd.upper()
+        if cmd_u in {"LAUNCHAPP", "LAUNCH_APP"}:
+            p = params or {}
+            app_val = None
+            if isinstance(p, dict):
+                app_val = p.get("App") if "App" in p else p.get("APP")
+
+            # If we don't have an App param, fall back to raw send.
+            if app_val is not None:
+                # Determine whether this looks like a Roku protocol group.
+                http = await self._director_http_get("/api/v1/items")
+                if http.get("ok"):
+                    items = self._normalize_items_payload(http.get("json"))
+                else:
+                    items = await self._get_all_items_async()
+
+                rec = next((r for r in items if isinstance(r, dict) and int(r.get("id") or -1) == device_id), None)
+                proto_fn = str((rec or {}).get("protocolFilename") or "").lower()
+                if "roku" in proto_fn:
+                    # Resolve all items in this Roku protocol group and broadcast LaunchApp.
+                    protocol_id = None
+                    try:
+                        protocol_id = int((rec or {}).get("protocolId") or device_id)
+                    except Exception:
+                        protocol_id = None
+
+                    group = [
+                        r
+                        for r in items
+                        if isinstance(r, dict) and protocol_id is not None and int(r.get("protocolId") or -1) == int(protocol_id)
+                    ]
+
+                    targets: list[int] = []
+                    # Prefer media_player first.
+                    for r in group:
+                        if str(r.get("proxy") or "").lower() == "media_player":
+                            targets.append(int(r.get("id")))
+                    # Then protocol root + other proxies.
+                    if protocol_id is not None:
+                        targets.append(int(protocol_id))
+                    for r in group:
+                        pid = int(r.get("id"))
+                        if pid not in targets:
+                            targets.append(pid)
+                    if device_id not in targets:
+                        targets.append(int(device_id))
+
+                    # De-dupe while preserving order.
+                    uniq: list[int] = []
+                    for t in targets:
+                        if t not in uniq:
+                            uniq.append(t)
+                    targets = uniq
+
+                    director = await self._director_async()
+                    attempts: list[dict[str, Any]] = []
+                    any_ok = False
+                    for t in targets:
+                        uri = f"/api/v1/items/{int(t)}/commands"
+                        r = await self._send_post_via_director(director, uri, "LaunchApp", {"App": app_val}, async_variable=False)
+                        attempts.append({"target_device_id": int(t), "execute": r})
+                        any_ok = any_ok or bool(r.get("ok"))
+                    return {
+                        "ok": bool(any_ok),
+                        "device_id": int(device_id),
+                        "command": "LaunchApp",
+                        "routing": {
+                            "protocol_id": protocol_id,
+                            "targets": targets,
+                        },
+                        "attempts": attempts,
+                    }
+
+        director = await self._director_async()
+        uri = f"/api/v1/items/{device_id}/commands"
+        return await self._send_post_via_director(director, uri, cmd, params or {}, async_variable=False)
+
+    def media_send_command(self, device_id: int, command: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._media_send_command_async(int(device_id), str(command or ""), params),
+            timeout_s=12,
+        )
 
     async def _light_get_state_async(self, device_id: int) -> bool:
         fetched = await self._fetch_item_variables_list_async(int(device_id))

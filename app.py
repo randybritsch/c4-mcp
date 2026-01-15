@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import os
+import sys
 
 from flask import Flask, jsonify
 from werkzeug.exceptions import HTTPException
 from flask_mcp_server import Mcp, mount_mcp
 from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
+
+import flask_mcp_server
 
 from control4_adapter import (
     gateway as adapter_gateway,
@@ -27,6 +31,15 @@ from control4_adapter import (
     lock_get_state,
     lock_lock,
     lock_unlock,
+    media_get_state,
+    media_get_now_playing,
+    media_remote,
+    media_remote_sequence,
+    media_send_command,
+    media_launch_app,
+        media_watch_launch_app,
+        room_select_video_device,
+    media_roku_list_apps,
     thermostat_get_state,
     thermostat_set_cool_setpoint_f,
     thermostat_set_fan_mode,
@@ -95,6 +108,41 @@ def ping() -> dict:
     return {"ok": True}
 
 
+@Mcp.tool(
+    name="c4_server_info",
+    description=(
+        "Return process/runtime info for the running MCP server (PID, exe, cwd, argv) plus a tool-registry summary. "
+        "Useful for diagnosing multiple/stale app.py processes on Windows."
+    ),
+)
+def c4_server_info_tool() -> dict:
+    reg = getattr(flask_mcp_server, "default_registry", None)
+    tools_dict = None
+    if reg is not None:
+        for attr in ("tools", "_tools", "tool_map", "_tool_map", "_tools_by_name"):
+            v = getattr(reg, attr, None)
+            if isinstance(v, dict):
+                tools_dict = v
+                break
+
+    tool_names = sorted(list(tools_dict.keys())) if isinstance(tools_dict, dict) else []
+    return {
+        "ok": True,
+        "pid": os.getpid(),
+        "ppid": os.getppid() if hasattr(os, "getppid") else None,
+        "python_executable": sys.executable,
+        "argv": list(sys.argv),
+        "cwd": os.getcwd(),
+        "app_file": __file__,
+        "registry": {
+            "tool_count": len(tool_names),
+            "has_media_remote": "c4_media_remote" in tool_names,
+            "has_media_now_playing": "c4_media_now_playing" in tool_names,
+            "sample_tools": tool_names[:50],
+        },
+    }
+
+
 @Mcp.tool(name="c4_director_methods", description="List callable methods on the Director object (debug).")
 def c4_director_methods() -> dict:
     d = adapter_gateway._loop_thread.run(adapter_gateway._director_async(), timeout_s=10)
@@ -132,6 +180,17 @@ def c4_item_execute_command(device_id: str, command_id: int) -> dict:
 )
 def c4_item_send_command(device_id: str, command: str, params: dict | None = None) -> dict:
     result = item_send_command(int(device_id), str(command or ""), params)
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+@Mcp.tool(
+    name="c4_room_select_video_device",
+    description=(
+        "Select a room's active video device (i.e., trigger the Control4 Watch flow for a given HDMI/source device). "
+        "This is often required before launching Roku apps so the TV is on the correct input."
+    ),
+)
+def c4_room_select_video_device(room_id: str, device_id: str, deselect: bool = False) -> dict:
+    result = room_select_video_device(int(room_id), int(device_id), bool(deselect))
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
@@ -265,6 +324,155 @@ def c4_list_devices(category: str) -> dict:
 
     devices.sort(key=lambda d: ((d.get("roomName") or ""), (d.get("name") or "")))
     return {"ok": True, "category": category, "devices": devices}
+
+
+# ---- Media / AV ----
+
+@Mcp.tool(name="c4_media_get_state", description="Get current state for a Control4 media/AV device (best-effort).")
+def c4_media_get_state_tool(device_id: str) -> dict:
+    result = media_get_state(int(device_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_media_send_command",
+    description=(
+        "Send a named command to a Control4 media/AV device. "
+        "Use c4_item_commands(device_id) to discover supported command names and params."
+    ),
+)
+def c4_media_send_command_tool(device_id: str, command: str, params: dict | None = None) -> dict:
+    result = media_send_command(int(device_id), str(command or ""), params)
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_media_remote",
+    description=(
+        "Send a basic remote/navigation action to a media device (up/down/left/right/select/menu/home/playpause). "
+        "Uses the device's transport proxy commands (when available)."
+    ),
+)
+def c4_media_remote_tool(device_id: str, button: str, press: str = "Tap") -> dict:
+    result = media_remote(int(device_id), str(button or ""), str(press or "Tap"))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_media_remote_sequence",
+    description=(
+        "Send a sequence of remote actions to a media device (e.g., ['home','down','down','select']). "
+        "Useful for navigation macros."
+    ),
+)
+def c4_media_remote_sequence_tool(device_id: str, buttons: list[str], press: str = "Tap", delay_ms: int = 250) -> dict:
+    result = media_remote_sequence(int(device_id), list(buttons), str(press or "Tap"), int(delay_ms))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_media_now_playing",
+    description=(
+        "Best-effort 'now playing' for a media device. Returns normalized fields when present, plus candidate variables."
+    ),
+)
+def c4_media_now_playing_tool(device_id: str) -> dict:
+    result = media_get_now_playing(int(device_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_media_launch_app",
+    description=(
+        "Launch an app on a media device (primarily Roku). Uses the driver's LaunchApp command when available. "
+        "Example app: 'Netflix' or 'Home'."
+    ),
+)
+def c4_media_launch_app_tool(device_id: str, app: str) -> dict:
+    result = media_launch_app(int(device_id), str(app or ""))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+@Mcp.tool(
+    name="c4_media_watch_launch_app",
+    description=(
+        "High-level helper: select the room video source for the given media device (Watch/HDMI) and then launch an app. "
+        "This makes 'Open Paramount+ on the basement Roku' reliably visible by ensuring the TV is on the Roku input first."
+    ),
+)
+def c4_media_watch_launch_app(device_id: str, app: str, room_id: str | None = None, pre_home: bool = True) -> dict:
+    rid = int(room_id) if room_id is not None and str(room_id).strip() else None
+    result = media_watch_launch_app(int(device_id), str(app or ""), room_id=rid, pre_home=bool(pre_home))
+    if not isinstance(result, dict):
+        return {"ok": True, "result": result}
+
+    # Add a small, consistent summary for LLM/tool consumers.
+    watch = result.get("watch") if isinstance(result.get("watch"), dict) else {}
+    before_watch = watch.get("before") if isinstance(watch.get("before"), dict) else {}
+    after_select = watch.get("after_select_video") if isinstance(watch.get("after_select_video"), dict) else {}
+    after_launch = watch.get("after_launch") if isinstance(watch.get("after_launch"), dict) else {}
+
+    launch = result.get("launch") if isinstance(result.get("launch"), dict) else {}
+    profile = launch.get("profile")
+    resolved = launch.get("resolved") if isinstance(launch.get("resolved"), dict) else None
+    roku = launch.get("roku") if isinstance(launch.get("roku"), dict) else None
+
+    select_video_ok = bool((result.get("select_video") or {}).get("ok")) if isinstance(result.get("select_video"), dict) else False
+    launch_ok = bool(launch.get("ok"))
+
+    summary: dict = {
+        "ok": bool(result.get("ok")),
+        "select_video_ok": select_video_ok,
+        "watch_active_before": (before_watch.get("active") if isinstance(before_watch, dict) else None),
+        "watch_active_after_select": (after_select.get("active") if isinstance(after_select, dict) else None),
+        "watch_active_after_launch": (after_launch.get("active") if isinstance(after_launch, dict) else None),
+        "launch_ok": launch_ok,
+        "launch_profile": profile,
+        "requested_app": result.get("app"),
+    }
+
+    if resolved is not None:
+        summary["resolved"] = resolved
+
+    if isinstance(roku, dict):
+        before = roku.get("before") if isinstance(roku.get("before"), dict) else None
+        after = roku.get("after") if isinstance(roku.get("after"), dict) else None
+        summary["roku"] = {
+            "expected_app_id": roku.get("expected_app_id"),
+            "before_app": (before or {}).get("CURRENT_APP") if isinstance(before, dict) else None,
+            "before_app_id": (before or {}).get("CURRENT_APP_ID") if isinstance(before, dict) else None,
+            "after_app": (after or {}).get("CURRENT_APP") if isinstance(after, dict) else None,
+            "after_app_id": (after or {}).get("CURRENT_APP_ID") if isinstance(after, dict) else None,
+        }
+
+    # Human-readable one-liner to make results easy to scan.
+    try:
+        watch_before = summary.get("watch_active_before")
+        watch_after = summary.get("watch_active_after_select")
+        if isinstance(summary.get("roku"), dict):
+            r = summary["roku"]
+            result["summary_text"] = (
+                f"watch {watch_before}->{watch_after}; launch ok={launch_ok}; "
+                f"roku {r.get('before_app')}({r.get('before_app_id')}) -> {r.get('after_app')}({r.get('after_app_id')}), expected {r.get('expected_app_id')}"
+            )
+        else:
+            result["summary_text"] = f"watch {watch_before}->{watch_after}; launch ok={launch_ok}"
+    except Exception:
+        pass
+
+    result["summary"] = summary
+    return result
+
+
+@Mcp.tool(
+    name="c4_media_roku_list_apps",
+    description=(
+        "List Roku app options for the given Roku device by reading universal mini-app variables (APP_NAME/UM_ROKU) in the same room. "
+        "Use this to find the exact app name/id to pass to c4_media_launch_app."
+    ),
+)
+def c4_media_roku_list_apps_tool(device_id: str, search: str | None = None) -> dict:
+    result = media_roku_list_apps(int(device_id), (str(search) if search is not None else None))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
 # ---- Thermostats ----

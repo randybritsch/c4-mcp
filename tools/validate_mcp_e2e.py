@@ -140,6 +140,60 @@ def _auto_select_thermostat_id(base_url: str, timeout_s: float, headers: Dict[st
     return str(tid) if tid is not None else None
 
 
+def _auto_select_media_id(base_url: str, timeout_s: float, headers: Dict[str, str]) -> Optional[str]:
+    devices_payload = _unwrap_call_payload(
+        mcp_call(
+            base_url,
+            kind="tool",
+            name="c4_list_devices",
+            args={"category": "media"},
+            timeout_s=timeout_s,
+            headers=headers,
+        )
+    )
+    devices = devices_payload.get("devices") if isinstance(devices_payload, dict) else None
+    if not isinstance(devices, list) or not devices:
+        return None
+
+    # Prefer an Apple TV if present; otherwise fall back to first listed device.
+    preferred: Optional[dict[str, Any]] = None
+    for d in devices:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("name") or "")
+        if "apple tv" in name.lower():
+            preferred = d
+            break
+
+    chosen = preferred or (devices[0] if isinstance(devices[0], dict) else None)
+    mid = (chosen or {}).get("id") if isinstance(chosen, dict) else None
+    return str(mid) if mid is not None else None
+
+
+def _auto_select_roku_id(base_url: str, timeout_s: float, headers: Dict[str, str]) -> Optional[str]:
+    devices_payload = _unwrap_call_payload(
+        mcp_call(
+            base_url,
+            kind="tool",
+            name="c4_list_devices",
+            args={"category": "media"},
+            timeout_s=timeout_s,
+            headers=headers,
+        )
+    )
+    devices = devices_payload.get("devices") if isinstance(devices_payload, dict) else None
+    if not isinstance(devices, list) or not devices:
+        return None
+
+    for d in devices:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("name") or "")
+        if "roku" in name.lower() and d.get("id") is not None:
+            return str(d.get("id"))
+    return None
+
+
 def _validate_thermostat(
     base_url: str,
     thermostat_id: str,
@@ -356,6 +410,101 @@ def _validate_thermostat(
         _expect(r.get("accepted") is True, "c4_thermostat_set_cool_setpoint_f not accepted")
 
 
+def _validate_media(
+    base_url: str,
+    media_id: str,
+    do_writes: bool,
+    do_now_playing: bool,
+    remote_smoke: bool,
+    remote_button: str,
+    remote_press: str,
+    timeout_s: float,
+    headers: Dict[str, str],
+) -> None:
+    print(f"\n-- Media validation (device_id={media_id}) --")
+
+    state_payload = _unwrap_call_payload(
+        mcp_call(
+            base_url,
+            kind="tool",
+            name="c4_media_get_state",
+            args={"device_id": str(media_id)},
+            timeout_s=timeout_s,
+            headers=headers,
+        )
+    )
+    _print_json("c4_media_get_state", state_payload)
+    _expect(bool(state_payload.get("ok")) is True, "c4_media_get_state returned ok=false")
+    st = state_payload.get("state")
+    _expect(isinstance(st, dict), "media_get_state missing state dict")
+
+    if do_now_playing:
+        np_payload = _unwrap_call_payload(
+            mcp_call(
+                base_url,
+                kind="tool",
+                name="c4_media_now_playing",
+                args={"device_id": str(media_id)},
+                timeout_s=timeout_s,
+                headers=headers,
+            )
+        )
+        _print_json("c4_media_now_playing", np_payload)
+        _expect(bool(np_payload.get("ok")) is True, "c4_media_now_playing returned ok=false")
+
+    if do_writes and remote_smoke:
+        r = _unwrap_call_payload(
+            mcp_call(
+                base_url,
+                kind="tool",
+                name="c4_media_remote",
+                args={
+                    "device_id": str(media_id),
+                    "button": str(remote_button),
+                    "press": str(remote_press),
+                },
+                timeout_s=timeout_s,
+                headers=headers,
+            )
+        )
+        _print_json("c4_media_remote", r)
+        _expect(bool(r.get("ok")) is True, "c4_media_remote returned ok=false")
+
+
+def _validate_media_sequence(
+    base_url: str,
+    media_id: str,
+    do_writes: bool,
+    buttons: list[str],
+    press: str,
+    delay_ms: int,
+    timeout_s: float,
+    headers: Dict[str, str],
+) -> None:
+    if not do_writes:
+        return
+    if not buttons:
+        return
+
+    r = _unwrap_call_payload(
+        mcp_call(
+            base_url,
+            kind="tool",
+            name="c4_media_remote_sequence",
+            args={
+                "device_id": str(media_id),
+                "buttons": list(buttons),
+                "press": str(press),
+                "delay_ms": int(delay_ms),
+            },
+            timeout_s=timeout_s,
+            headers=headers,
+        )
+    )
+    _print_json("c4_media_remote_sequence", r)
+    _expect(bool(r.get("ok")) is True, "c4_media_remote_sequence returned ok=false")
+
+
 def _poll_light(
     base_url: str,
     headers: Dict[str, str],
@@ -434,6 +583,37 @@ def main() -> int:
         ),
     )
     p.add_argument("--lock-id", type=str, default=None, help="Lock device_id to validate")
+    p.add_argument("--media-id", type=str, default=None, help="Media/AV device_id to validate")
+    p.add_argument(
+        "--auto-media",
+        action="store_true",
+        help="Auto-select a media device from c4_list_devices(media) (prefers Apple TV). Ignored if --media-id is provided.",
+    )
+    p.add_argument(
+        "--auto-roku",
+        action="store_true",
+        help="Auto-select a Roku media device from c4_list_devices(media). Ignored if --media-id is provided.",
+    )
+    p.add_argument(
+        "--media-now-playing",
+        action="store_true",
+        help="Also call c4_media_now_playing during media validation (read-only).",
+    )
+    p.add_argument(
+        "--media-remote-smoke",
+        action="store_true",
+        help="With --do-writes, send a single c4_media_remote command as a smoke test.",
+    )
+    p.add_argument("--media-remote-button", type=str, default="menu", help="Button for --media-remote-smoke (default: menu)")
+    p.add_argument("--media-remote-press", type=str, default="Tap", help="Press for --media-remote-smoke (Tap|Long Press|Down|Up)")
+    p.add_argument(
+        "--media-sequence",
+        type=str,
+        default=None,
+        help=(
+            "With --do-writes, send a comma-separated sequence of buttons via c4_media_remote_sequence (e.g. 'home,down,down,select')."
+        ),
+    )
     p.add_argument("--thermostat-id", type=str, default=None, help="Thermostat device_id to validate")
     p.add_argument(
         "--thermostat-target-f",
@@ -572,6 +752,16 @@ def main() -> int:
     )
     _print_json("c4_list_devices(thermostat)", devices_thermostat)
 
+    devices_media = mcp_call(
+        args.base_url,
+        kind="tool",
+        name="c4_list_devices",
+        args={"category": "media"},
+        timeout_s=float(args.timeout),
+        headers=headers,
+    )
+    _print_json("c4_list_devices(media)", devices_media)
+
     # ---- Lights ----
     if selected_light_id:
         lid = str(selected_light_id)
@@ -700,6 +890,49 @@ def main() -> int:
             target_f=(float(args.thermostat_target_f) if args.thermostat_target_f is not None else None),
             restore=bool(args.thermostat_restore),
             restore_modes=bool(args.thermostat_restore_modes),
+            timeout_s=float(args.timeout),
+            headers=headers,
+        )
+
+    # ---- Media ----
+    selected_media_id: str | None = str(args.media_id) if args.media_id else None
+    if not selected_media_id and args.auto_roku:
+        selected_media_id = _auto_select_roku_id(args.base_url, timeout_s=float(args.timeout), headers=headers)
+        if selected_media_id:
+            print(f"Auto-selected roku media_id={selected_media_id}")
+        else:
+            print("WARN: --auto-roku requested but no Roku devices returned by c4_list_devices")
+
+    if not selected_media_id and args.auto_media:
+        selected_media_id = _auto_select_media_id(args.base_url, timeout_s=float(args.timeout), headers=headers)
+        if selected_media_id:
+            print(f"Auto-selected media_id={selected_media_id}")
+        else:
+            print("WARN: --auto-media requested but no media devices returned by c4_list_devices")
+
+    if selected_media_id:
+        _validate_media(
+            args.base_url,
+            selected_media_id,
+            do_writes=bool(args.do_writes),
+            do_now_playing=bool(args.media_now_playing),
+            remote_smoke=bool(args.media_remote_smoke),
+            remote_button=str(args.media_remote_button),
+            remote_press=str(args.media_remote_press),
+            timeout_s=float(args.timeout),
+            headers=headers,
+        )
+
+        seq = []
+        if args.media_sequence:
+            seq = [s.strip() for s in str(args.media_sequence).split(",") if s.strip()]
+        _validate_media_sequence(
+            args.base_url,
+            selected_media_id,
+            do_writes=bool(args.do_writes),
+            buttons=seq,
+            press=str(args.media_remote_press),
+            delay_ms=200,
             timeout_s=float(args.timeout),
             headers=headers,
         )

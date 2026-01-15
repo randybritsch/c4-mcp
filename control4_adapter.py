@@ -50,6 +50,14 @@ def item_send_command(device_id: int, command: str, params: Optional[Dict[str, A
     return gateway.item_send_command(int(device_id), str(command or ""), params)
 
 
+def room_send_command(room_id: int, command: str, params: Optional[Dict[str, Any]] = None) -> Json:
+    return gateway.room_send_command(int(room_id), str(command or ""), params)  # type: ignore[misc]
+
+
+def room_select_video_device(room_id: int, device_id: int, deselect: bool = False) -> Json:
+    return gateway.room_select_video_device(int(room_id), int(device_id), bool(deselect))  # type: ignore[misc]
+
+
 def debug_trace_command(
     device_id: int,
     command: str,
@@ -147,3 +155,37 @@ def thermostat_set_target_f(
         confirm_timeout_s=float(confirm_timeout_s),
         deadband_f=(float(deadband_f) if deadband_f is not None else None),
     )  # type: ignore[misc]
+
+
+# --------- Media / AV ---------
+
+def media_get_state(device_id: int) -> Json:
+    return gateway.media_get_state(int(device_id))  # type: ignore[misc]
+
+
+def media_send_command(device_id: int, command: str, params: Optional[Dict[str, Any]] = None) -> Json:
+    return gateway.media_send_command(int(device_id), str(command or ""), params)  # type: ignore[misc]
+
+
+def media_remote(device_id: int, button: str, press: str | None = None) -> Json:
+    return gateway.media_remote(int(device_id), str(button or ""), press)  # type: ignore[misc]
+
+
+def media_get_now_playing(device_id: int) -> Json:
+    return gateway.media_get_now_playing(int(device_id))  # type: ignore[misc]
+
+
+def media_remote_sequence(device_id: int, buttons: list[str], press: str | None = None, delay_ms: int = 250) -> Json:
+    return gateway.media_remote_sequence(int(device_id), list(buttons), press, int(delay_ms))  # type: ignore[misc]
+
+
+def media_launch_app(device_id: int, app: str) -> Json:
+    return gateway.media_launch_app(int(device_id), str(app or ""))  # type: ignore[misc]
+
+
+def media_watch_launch_app(device_id: int, app: str, room_id: int | None = None, pre_home: bool = True) -> Json:
+    return gateway.media_watch_launch_app(int(device_id), str(app or ""), room_id=(int(room_id) if room_id is not None else None), pre_home=bool(pre_home))  # type: ignore[misc]
+
+
+def media_roku_list_apps(device_id: int, search: str | None = None) -> Json:
+    return gateway.media_roku_list_apps(int(device_id), (str(search) if search is not None else None))  # type: ignore[misc]
