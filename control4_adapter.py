@@ -210,6 +210,17 @@ def room_select_video_device(room_id: int, device_id: int, deselect: bool = Fals
     return gateway.room_select_video_device(int(room_id), int(device_id), bool(deselect))  # type: ignore[misc]
 
 
+def room_select_audio_device(room_id: int, device_id: int, deselect: bool = False) -> Json:
+    return gateway.room_select_audio_device(int(room_id), int(device_id), bool(deselect))  # type: ignore[misc]
+
+
+def room_listen(room_id: int, device_id: int, confirm_timeout_s: float = 10.0) -> Json:
+    return gateway.room_listen(int(room_id), int(device_id), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
+
+
+def room_listen_status(room_id: int) -> dict[str, Any]:
+    return gateway.room_listen_status(room_id=int(room_id))
+
 def room_off(room_id: int, confirm_timeout_s: float = 10.0) -> Json:
     return gateway.room_off(int(room_id), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
 

@@ -83,6 +83,9 @@ from control4_adapter import (
     thermostat_set_hold_mode,
     thermostat_set_hvac_mode,
     thermostat_set_target_f,
+    room_select_audio_device,
+    room_listen,
+    room_listen_status,
 )
 
 # ---------- App / Gateway ----------
@@ -993,6 +996,44 @@ def c4_tv_watch_tool(room_id: str, source_device_id: str, deselect: bool = False
 )
 def c4_tv_off_tool(room_id: str, confirm_timeout_s: float = 10.0) -> dict:
     result = room_off(int(room_id), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Audio (Room-based) ----
+
+@Mcp.tool(
+    name="c4_room_select_audio_device",
+    description=(
+        "Select a room's audio source (SELECT_AUDIO_DEVICE). "
+        "Use c4_room_listen_status to discover valid source_device_id values for that room."
+    ),
+)
+def c4_room_select_audio_device_tool(room_id: str, source_device_id: str, deselect: bool = False) -> dict:
+    result = room_select_audio_device(int(room_id), int(source_device_id), bool(deselect))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_listen",
+    description=(
+        "Start a room 'Listen' session by selecting an audio source (SELECT_AUDIO_DEVICE) and confirming activation best-effort. "
+        "Use c4_room_listen_status to find available sources; this is the audio equivalent of c4_tv_watch."
+    ),
+)
+def c4_room_listen_tool(room_id: str, source_device_id: str, confirm_timeout_s: float = 10.0) -> dict:
+    result = room_listen(int(room_id), int(source_device_id), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_listen_status",
+    description=(
+        "Read-only: return the room's current Listen status and available Listen sources (best-effort), "
+        "from UI configuration. Use this to find valid source device ids for c4_room_listen."
+    ),
+)
+def c4_room_listen_status_tool(room_id: str) -> dict:
+    result = room_listen_status(int(room_id))
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 

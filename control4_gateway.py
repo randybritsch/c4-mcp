@@ -648,6 +648,12 @@ class Control4Gateway:
         params = {"deviceid": device_id, "deselect": (1 if deselect else 0)}
         return await self._room_send_command_async(room_id, "SELECT_VIDEO_DEVICE", params)
 
+    async def _room_select_audio_device_async(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
+        room_id = int(room_id)
+        device_id = int(device_id)
+        params = {"deviceid": device_id, "deselect": (1 if deselect else 0)}
+        return await self._room_send_command_async(room_id, "SELECT_AUDIO_DEVICE", params)
+
     @staticmethod
     def _find_ui_watch_node(payload: Any, room_id: int) -> dict[str, Any] | None:
         if isinstance(payload, dict):
@@ -664,6 +670,22 @@ class Control4Gateway:
                     return found
         return None
 
+    @staticmethod
+    def _find_ui_listen_node(payload: Any, room_id: int) -> dict[str, Any] | None:
+        if isinstance(payload, dict):
+            if payload.get("type") == "listen" and int(payload.get("room_id") or -1) == int(room_id):
+                return payload
+            for v in payload.values():
+                found = Control4Gateway._find_ui_listen_node(v, room_id)
+                if found is not None:
+                    return found
+        elif isinstance(payload, list):
+            for it in payload:
+                found = Control4Gateway._find_ui_listen_node(it, room_id)
+                if found is not None:
+                    return found
+        return None
+
     async def _ui_watch_status_async(self, room_id: int) -> dict[str, Any] | None:
         room_id = int(room_id)
         http = await self._director_http_get("/api/v1/agents/ui_configuration")
@@ -671,6 +693,22 @@ class Control4Gateway:
             return None
         payload = http.get("json")
         node = self._find_ui_watch_node(payload, room_id)
+        if not isinstance(node, dict):
+            return None
+        active = bool(node.get("active"))
+        sources = None
+        raw_sources = node.get("sources")
+        if isinstance(raw_sources, dict) and isinstance(raw_sources.get("source"), list):
+            sources = [s for s in raw_sources.get("source") if isinstance(s, dict)]
+        return {"room_id": room_id, "active": active, "sources": sources}
+
+    async def _ui_listen_status_async(self, room_id: int) -> dict[str, Any] | None:
+        room_id = int(room_id)
+        http = await self._director_http_get("/api/v1/agents/ui_configuration")
+        if not http.get("ok"):
+            return None
+        payload = http.get("json")
+        node = self._find_ui_listen_node(payload, room_id)
         if not isinstance(node, dict):
             return None
         active = bool(node.get("active"))
@@ -945,6 +983,65 @@ class Control4Gateway:
         return self._loop_thread.run(
             self._room_select_video_device_async(int(room_id), int(device_id), deselect=bool(deselect)),
             timeout_s=12,
+        )
+
+    def room_select_audio_device(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._room_select_audio_device_async(int(room_id), int(device_id), deselect=bool(deselect)),
+            timeout_s=12,
+        )
+
+    def room_listen_status(self, room_id: int) -> dict[str, Any]:
+        status = self._loop_thread.run(self._ui_listen_status_async(int(room_id)), timeout_s=12)
+        if not isinstance(status, dict):
+            return {"ok": False, "room_id": int(room_id), "error": "Listen UI status not available"}
+        return {"ok": True, "room_id": int(room_id), "listen": status}
+
+    async def _room_listen_async(self, room_id: int, device_id: int, confirm_timeout_s: float = 10.0) -> dict[str, Any]:
+        room_id = int(room_id)
+        device_id = int(device_id)
+
+        before_listen = await self._ui_listen_status_async(room_id)
+        execute = await self._room_select_audio_device_async(room_id, device_id, deselect=False)
+        accepted = bool(execute.get("ok"))
+        if not accepted:
+            return {
+                "ok": False,
+                "room_id": room_id,
+                "device_id": device_id,
+                "accepted": False,
+                "confirmed": False,
+                "listen": {"before": before_listen, "after": before_listen},
+                "execute": execute,
+            }
+
+        # Best-effort: confirm the room is actively listening.
+        deadline = asyncio.get_running_loop().time() + float(confirm_timeout_s)
+        last_listen = before_listen
+        confirmed = False
+
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.6)
+            last_listen = await self._ui_listen_status_async(room_id)
+            if isinstance(last_listen, dict) and last_listen.get("active") is True:
+                confirmed = True
+                break
+
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "device_id": device_id,
+            "accepted": True,
+            "confirmed": bool(confirmed),
+            "listen": {"before": before_listen, "after": last_listen},
+            "execute": execute,
+            "confirm_timeout_s": float(confirm_timeout_s),
+        }
+
+    def room_listen(self, room_id: int, device_id: int, confirm_timeout_s: float = 10.0) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._room_listen_async(int(room_id), int(device_id), confirm_timeout_s=float(confirm_timeout_s)),
+            timeout_s=float(confirm_timeout_s) + 18.0,
         )
 
     async def _room_off_async(self, room_id: int, confirm_timeout_s: float = 10.0) -> dict[str, Any]:
