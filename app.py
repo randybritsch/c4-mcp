@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import os
 import sys
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 from flask_mcp_server import Mcp, mount_mcp
 from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
@@ -16,13 +16,34 @@ import flask_mcp_server
 
 from control4_adapter import (
     gateway as adapter_gateway,
+    announcement_execute,
+    announcement_execute_by_name,
+    announcement_list,
+    announcement_list_commands,
+    capabilities_report,
+    control_keypad_list,
+    control_keypad_send_command,
+    contact_get_state,
+    doorstation_set_external_chime,
+    doorstation_set_led,
+    doorstation_set_raw_setting,
     debug_trace_command,
+    fan_get_state,
+    fan_list,
+    fan_set_power,
+    fan_set_speed,
     get_all_items,
+    intercom_list,
+    intercom_touchscreen_screensaver,
+    intercom_touchscreen_set_feature,
     item_execute_command,
     item_get_bindings,
     item_get_commands,
     item_get_variables,
     item_send_command,
+    keypad_button_action,
+    keypad_get_buttons,
+    keypad_list,
     light_get_level,
     light_get_state,
     light_ramp,
@@ -31,6 +52,21 @@ from control4_adapter import (
     lock_get_state,
     lock_lock,
     lock_unlock,
+    macro_execute,
+    macro_execute_by_name,
+    macro_list,
+    macro_list_commands,
+    scheduler_get,
+    scheduler_list,
+    scheduler_list_commands,
+    scheduler_set_enabled,
+    motion_get_state,
+    motion_list,
+    room_off,
+    room_list_commands,
+    room_remote,
+    room_send_command,
+    uibutton_activate,
     media_get_state,
     media_get_now_playing,
     media_remote,
@@ -195,6 +231,42 @@ def c4_room_select_video_device(room_id: str, device_id: str, deselect: bool = F
 
 
 @Mcp.tool(
+    name="c4_room_off",
+    description=(
+        "Turn off all Audio/Video in a room (ROOM_OFF) and best-effort confirm Watch becomes inactive. "
+        "Returns accepted/confirmed semantics."
+    ),
+)
+def c4_room_off_tool(room_id: str, confirm_timeout_s: float = 10.0) -> dict:
+    result = room_off(int(room_id), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_list_commands",
+    description=(
+        "List available room-level commands (GET /rooms/{room_id}/commands). "
+        "This is the most universal way to control AV/TV, audio, and navigation in Control4 rooms."
+    ),
+)
+def c4_room_list_commands_tool(room_id: str, search: str | None = None) -> dict:
+    result = room_list_commands(int(room_id), (str(search) if search is not None else None))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_send_command",
+    description=(
+        "Send a named room-level command to a room (POST /rooms/{room_id}/commands). "
+        "Use c4_room_list_commands to discover valid command strings and required params."
+    ),
+)
+def c4_room_send_command_tool(room_id: str, command: str, params: dict | None = None) -> dict:
+    result = room_send_command(int(room_id), str(command or ""), params)
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
     name="c4_debug_trace_command",
     description=(
         "Force-send a named Director command and poll for variable/state changes (debug). "
@@ -253,6 +325,528 @@ def c4_list_controls() -> dict:
             for k in sorted(counts.keys(), key=lambda x: (-(counts[x] or 0), str(x)))
         ],
     }
+
+
+@Mcp.tool(
+    name="c4_capabilities_report",
+    description=(
+        "Summarize your Control4 inventory by control/proxy/driver filename/room. "
+        "Useful for figuring out what else is available to automate next."
+    ),
+)
+def c4_capabilities_report_tool(top_n: int = 20, include_examples: bool = False, max_examples_per_bucket: int = 3) -> dict:
+    result = capabilities_report(int(top_n), bool(include_examples), int(max_examples_per_bucket))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- UI Buttons / Scenes (best-effort) ----
+
+
+@Mcp.tool(
+    name="c4_uibutton_list",
+    description=(
+        "List UI Button (uibutton) devices. These often represent Navigator shortcuts (mini-apps) "
+        "and are a good proxy for 'scenes' or automations that users can trigger."
+    ),
+)
+def c4_uibutton_list_tool() -> dict:
+    items = get_all_items()
+    rooms_by_id = {
+        str(i.get("id")): i.get("name")
+        for i in items
+        if isinstance(i, dict) and i.get("typeName") == "room"
+    }
+
+    buttons = []
+    for i in items:
+        if not isinstance(i, dict) or i.get("typeName") != "device":
+            continue
+        if str(i.get("proxy") or "").lower() != "uibutton":
+            continue
+        room_id = i.get("roomId") or i.get("parentId")
+        resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(room_id)) if room_id is not None else None)
+        buttons.append(
+            {
+                "device_id": str(i.get("id")),
+                "name": i.get("name"),
+                "room_id": str(room_id) if room_id is not None else None,
+                "room_name": resolved_room_name,
+            }
+        )
+
+    buttons.sort(key=lambda d: ((d.get("room_name") or ""), (d.get("name") or "")))
+    return {"ok": True, "count": len(buttons), "uibuttons": buttons}
+
+
+@Mcp.tool(
+    name="c4_uibutton_activate",
+    description=(
+        "Activate a UI Button device. By default this sends the best-known activation command (usually 'Select'). "
+        "Use dry_run=true to see what would be sent."
+    ),
+)
+def c4_uibutton_activate_tool(device_id: str, command: str | None = None, dry_run: bool = False) -> dict:
+    result = uibutton_activate(int(device_id), (str(command) if command is not None else None), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# Convenience aliases (many users think of these as scenes)
+
+
+@Mcp.tool(name="c4_scene_list", description="Alias of c4_uibutton_list.")
+def c4_scene_list_tool() -> dict:
+    return c4_uibutton_list_tool()
+
+
+@Mcp.tool(name="c4_scene_activate", description="Alias of c4_uibutton_activate.")
+def c4_scene_activate_tool(device_id: str, command: str | None = None, dry_run: bool = False) -> dict:
+    return c4_uibutton_activate_tool(device_id=device_id, command=command, dry_run=bool(dry_run))
+
+
+# ---- Contacts / Sensors (best-effort) ----
+
+
+@Mcp.tool(
+    name="c4_contact_list",
+    description=(
+        "List contact/sensor-style devices. Currently focuses on Card Access wireless contact/motion drivers "
+        "(control='cardaccess_wirelesscontact')."
+    ),
+)
+def c4_contact_list_tool() -> dict:
+    items = get_all_items()
+    rooms_by_id = {
+        str(i.get("id")): i.get("name")
+        for i in items
+        if isinstance(i, dict) and i.get("typeName") == "room"
+    }
+
+    devices = []
+    for i in items:
+        if not isinstance(i, dict) or i.get("typeName") != "device":
+            continue
+        if str(i.get("control") or "").lower() != "cardaccess_wirelesscontact":
+            continue
+        room_id = i.get("roomId") or i.get("parentId")
+        resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(room_id)) if room_id is not None else None)
+        devices.append(
+            {
+                "device_id": str(i.get("id")),
+                "name": i.get("name"),
+                "room_id": str(room_id) if room_id is not None else None,
+                "room_name": resolved_room_name,
+            }
+        )
+
+    devices.sort(key=lambda d: ((d.get("room_name") or ""), (d.get("name") or "")))
+    return {"ok": True, "count": len(devices), "contacts": devices}
+
+
+@Mcp.tool(
+    name="c4_contact_get_state",
+    description=(
+        "Get best-effort state for a contact/motion sensor device. Returns raw variables plus parsed fields "
+        "(battery_level, temperature, etc.)."
+    ),
+)
+def c4_contact_get_state_tool(device_id: str, timeout_s: float = 6.0) -> dict:
+    result = contact_get_state(int(device_id), float(timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Motion sensors (best-effort) ----
+
+
+@Mcp.tool(
+    name="c4_motion_list",
+    description=(
+        "List motion sensor devices (best-effort). Currently includes contactsingle_motionsensor and wireless PIR proxies."
+    ),
+)
+def c4_motion_list_tool() -> dict:
+    result = motion_list()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_motion_get_state",
+    description=(
+        "Get best-effort motion state for a motion sensor device. Returns raw variables plus parsed fields and motion_detected."
+    ),
+)
+def c4_motion_get_state_tool(device_id: str, timeout_s: float = 6.0) -> dict:
+    result = motion_get_state(int(device_id), float(timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Intercom (best-effort) ----
+
+
+@Mcp.tool(
+    name="c4_intercom_list",
+    description=(
+        "List intercom-capable devices (best-effort; proxy contains 'intercom'). "
+        "Includes touchscreens and door stations where present."
+    ),
+)
+def c4_intercom_list_tool() -> dict:
+    result = intercom_list()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_intercom_touchscreen_set_feature",
+    description=(
+        "Enable/disable a touchscreen intercom feature. feature must be one of: autobrightness, proximity, alexa. "
+        "Uses the device command strings exposed by c4_item_commands."
+    ),
+)
+def c4_intercom_touchscreen_set_feature_tool(device_id: str, feature: str, enabled: bool, dry_run: bool = False) -> dict:
+    result = intercom_touchscreen_set_feature(int(device_id), str(feature or ""), bool(enabled), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_intercom_touchscreen_screensaver",
+    description=(
+        "Control a touchscreen screensaver: optionally set mode, set start_time_s, and/or action enter/exit. "
+        "You may combine multiple operations in one call."
+    ),
+)
+def c4_intercom_touchscreen_screensaver_tool(
+    device_id: str,
+    action: str | None = None,
+    mode: str | None = None,
+    start_time_s: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    result = intercom_touchscreen_screensaver(
+        int(device_id),
+        (str(action) if action is not None else None),
+        (str(mode) if mode is not None else None),
+        (int(start_time_s) if start_time_s is not None else None),
+        bool(dry_run),
+    )
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_doorstation_set_led",
+    description=("Enable/disable the LED indicator on a Control4 door station (intercom proxy)."),
+)
+def c4_doorstation_set_led_tool(device_id: str, enabled: bool, dry_run: bool = False) -> dict:
+    result = doorstation_set_led(int(device_id), bool(enabled), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_doorstation_set_external_chime",
+    description=("Enable/disable the external chime on a Control4 door station (intercom proxy)."),
+)
+def c4_doorstation_set_external_chime_tool(device_id: str, enabled: bool, dry_run: bool = False) -> dict:
+    result = doorstation_set_external_chime(int(device_id), bool(enabled), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_doorstation_set_raw_setting",
+    description=(
+        "Set a raw key/value setting on a Control4 door station via the 'Set Raw Settings' command. "
+        "This is driver-specific; use cautiously."
+    ),
+)
+def c4_doorstation_set_raw_setting_tool(device_id: str, key: str, value: str, dry_run: bool = False) -> dict:
+    result = doorstation_set_raw_setting(int(device_id), str(key or ""), str(value or ""), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Macros (Agent) ----
+
+
+@Mcp.tool(
+    name="c4_macro_list",
+    description=("List macros configured in Control4 (agents/macros)."),
+)
+def c4_macro_list_tool() -> dict:
+    result = macro_list()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_macro_list_commands",
+    description=("List available macros agent commands (discovery/debug)."),
+)
+def c4_macro_list_commands_tool() -> dict:
+    result = macro_list_commands()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_macro_execute",
+    description=("Execute a configured Control4 macro by id. Supports dry_run."),
+)
+def c4_macro_execute_tool(macro_id: int, dry_run: bool = False) -> dict:
+    result = macro_execute(int(macro_id), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_macro_execute_by_name",
+    description=(
+        "Execute a configured Control4 macro by exact name (case-insensitive exact match). "
+        "If the name is missing/ambiguous, returns suggestions and does not execute. Supports dry_run."
+    ),
+)
+def c4_macro_execute_by_name_tool(name: str, dry_run: bool = False) -> dict:
+    result = macro_execute_by_name(str(name or ""), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Scheduler (Agent) ----
+
+
+@Mcp.tool(
+    name="c4_scheduler_list",
+    description=("List scheduled events configured in Control4 (agents/scheduler)."),
+)
+def c4_scheduler_list_tool(search: str | None = None) -> dict:
+    result = scheduler_list((str(search) if search is not None else None))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_scheduler_get",
+    description=("Get details for a scheduler event by event_id (agents/scheduler/{event_id})."),
+)
+def c4_scheduler_get_tool(event_id: int) -> dict:
+    result = scheduler_get(int(event_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_scheduler_list_commands",
+    description=("List available scheduler agent commands (discovery/debug)."),
+)
+def c4_scheduler_list_commands_tool() -> dict:
+    result = scheduler_list_commands()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_scheduler_set_enabled",
+    description=(
+        "Enable/disable a scheduler event by event_id. Supports dry_run. "
+        "Returns accepted/confirmed based on a best-effort reread."
+    ),
+)
+def c4_scheduler_set_enabled_tool(event_id: int, enabled: bool, dry_run: bool = False) -> dict:
+    result = scheduler_set_enabled(int(event_id), bool(enabled), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Announcements (Agent) ----
+
+
+@Mcp.tool(
+    name="c4_announcement_list",
+    description=("List announcements configured in Control4 (agents/announcements)."),
+)
+def c4_announcement_list_tool() -> dict:
+    result = announcement_list()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_announcement_list_commands",
+    description=("List available announcements agent commands (discovery/debug)."),
+)
+def c4_announcement_list_commands_tool() -> dict:
+    result = announcement_list_commands()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_announcement_execute",
+    description=("Execute a configured Control4 announcement by id. Supports dry_run."),
+)
+def c4_announcement_execute_tool(announcement_id: int, dry_run: bool = False) -> dict:
+    result = announcement_execute(int(announcement_id), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_announcement_execute_by_name",
+    description=(
+        "Execute a configured Control4 announcement by exact name (case-insensitive exact match). "
+        "If the name is missing/ambiguous, returns suggestions and does not execute. Supports dry_run."
+    ),
+)
+def c4_announcement_execute_by_name_tool(name: str, dry_run: bool = False) -> dict:
+    result = announcement_execute_by_name(str(name or ""), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Keypads (best-effort) ----
+
+
+@Mcp.tool(
+    name="c4_keypad_list",
+    description=(
+        "List physical keypad_proxy devices (keypads/dimmers with programmable buttons). "
+        "Use c4_keypad_buttons and c4_keypad_button_action for button-based interaction."
+    ),
+)
+def c4_keypad_list_tool() -> dict:
+    result = keypad_list()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_keypad_buttons",
+    description=(
+        "List button IDs and names for a keypad_proxy device (best-effort; derived from KEYPAD_BUTTON_* command metadata)."
+    ),
+)
+def c4_keypad_buttons_tool(device_id: str) -> dict:
+    result = keypad_get_buttons(int(device_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_keypad_button_action",
+    description=(
+        "Perform a keypad button action on a keypad_proxy device. "
+        "action='tap' sends press+release; action can also be 'press' or 'release'."
+    ),
+)
+def c4_keypad_button_action_tool(
+    device_id: str,
+    button_id: int,
+    action: str = "tap",
+    tap_ms: int = 200,
+    dry_run: bool = False,
+) -> dict:
+    result = keypad_button_action(int(device_id), int(button_id), str(action or ""), int(tap_ms), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_control_keypad_list",
+    description=(
+        "List room_control_keypad devices (programmed 'control buttons' that can trigger presets/lights/room-off, etc.)."
+    ),
+)
+def c4_control_keypad_list_tool() -> dict:
+    result = control_keypad_list()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_control_keypad_send_command",
+    description=(
+        "Trigger a command on a room_control_keypad device by command name (exact string from c4_item_commands or the list)."
+    ),
+)
+def c4_control_keypad_send_command_tool(device_id: str, command: str, dry_run: bool = False) -> dict:
+    result = control_keypad_send_command(int(device_id), str(command or ""), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Fans ----
+
+
+@Mcp.tool(name="c4_fan_list", description="List fan devices (proxy='fan').")
+def c4_fan_list_tool() -> dict:
+    result = fan_list()
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(name="c4_fan_get_state", description="Get current fan power/speed (best-effort).")
+def c4_fan_get_state_tool(device_id: str) -> dict:
+    result = fan_get_state(int(device_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_fan_set_speed",
+    description=(
+        "Set fan speed. speed may be 0-4 or a name: off/low/medium/medium high/high. Returns accepted/confirmed."
+    ),
+)
+def c4_fan_set_speed_tool(device_id: str, speed: str | int, confirm_timeout_s: float = 4.0, dry_run: bool = False) -> dict:
+    result = fan_set_speed(int(device_id), speed, float(confirm_timeout_s), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_fan_set_power",
+    description=("Set fan power: power must be one of on/off/toggle. Returns accepted/confirmed."),
+)
+def c4_fan_set_power_tool(device_id: str, power: str, confirm_timeout_s: float = 4.0, dry_run: bool = False) -> dict:
+    result = fan_set_power(int(device_id), str(power or ""), float(confirm_timeout_s), bool(dry_run))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+# ---- Outlets (as lights) ----
+
+
+@Mcp.tool(
+    name="c4_outlet_list",
+    description=(
+        "List outlet-controlled loads (control='outlet_light', proxy='light_v2'). "
+        "These are typically the controllable outlets for outlet switch modules."
+    ),
+)
+def c4_outlet_list_tool() -> dict:
+    items = get_all_items()
+    rooms_by_id = {
+        str(i.get("id")): i.get("name")
+        for i in items
+        if isinstance(i, dict) and i.get("typeName") == "room"
+    }
+
+    outlets = []
+    for i in items:
+        if not isinstance(i, dict) or i.get("typeName") != "device":
+            continue
+        if str(i.get("control") or "").lower() != "outlet_light":
+            continue
+        room_id = i.get("roomId") or i.get("parentId")
+        resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(room_id)) if room_id is not None else None)
+        outlets.append(
+            {
+                "device_id": str(i.get("id")),
+                "name": i.get("name"),
+                "room_id": str(room_id) if room_id is not None else None,
+                "room_name": resolved_room_name,
+            }
+        )
+
+    outlets.sort(key=lambda d: ((d.get("room_name") or ""), (d.get("name") or "")))
+    return {"ok": True, "count": len(outlets), "outlets": outlets}
+
+
+@Mcp.tool(name="c4_outlet_get_state", description="Get current outlet state (as a light).")
+def c4_outlet_get_state_tool(device_id: str) -> dict:
+    state = light_get_state(int(device_id))
+    level = light_get_level(int(device_id))
+    out = {"ok": True, "device_id": str(device_id), "state": bool(state)}
+    if isinstance(level, int):
+        out["level"] = level
+    return out
+
+
+@Mcp.tool(
+    name="c4_outlet_set_power",
+    description=("Turn an outlet load on/off (implemented via light level 0/100)."),
+)
+def c4_outlet_set_power_tool(device_id: str, on: bool, level_on: int = 100) -> dict:
+    level_on = int(level_on)
+    if level_on < 1 or level_on > 100:
+        return {"ok": False, "error": "level_on must be 1-100"}
+    level = level_on if bool(on) else 0
+    state = light_set_level(int(device_id), int(level))
+    return {"ok": True, "device_id": str(device_id), "on": bool(on), "level": int(level), "state": bool(state)}
 
 
 @Mcp.tool(name="c4_list_devices", description="List Control4 devices by category (lights, locks, thermostat, media).")
@@ -324,6 +918,82 @@ def c4_list_devices(category: str) -> dict:
 
     devices.sort(key=lambda d: ((d.get("roomName") or ""), (d.get("name") or "")))
     return {"ok": True, "category": category, "devices": devices}
+
+
+# ---- TV / Room-level control ----
+
+
+@Mcp.tool(
+    name="c4_tv_list",
+    description=(
+        "List TV devices in Control4 (control='tv'). Returns tv_device_id plus room_id for universal room-based control."
+    ),
+)
+def c4_tv_list_tool() -> dict:
+    items = get_all_items()
+    rooms_by_id = {
+        str(i.get("id")): i.get("name")
+        for i in items
+        if isinstance(i, dict) and i.get("typeName") == "room"
+    }
+
+    tvs = []
+    for i in items:
+        if not isinstance(i, dict):
+            continue
+        if i.get("typeName") != "device":
+            continue
+        if str(i.get("control") or "").lower() != "tv":
+            continue
+
+        room_id = i.get("roomId") or i.get("parentId")
+        resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(room_id)) if room_id is not None else None)
+        tvs.append(
+            {
+                "tv_device_id": str(i.get("id")),
+                "name": i.get("name"),
+                "room_id": str(room_id) if room_id is not None else None,
+                "room_name": resolved_room_name,
+            }
+        )
+
+    tvs.sort(key=lambda t: ((t.get("room_name") or ""), (t.get("name") or "")))
+    return {"ok": True, "count": len(tvs), "tvs": tvs}
+
+
+@Mcp.tool(
+    name="c4_tv_remote",
+    description=(
+        "Send a universal room-level remote command for the TV in that room (UP/DOWN/ENTER/BACK/MENU/INFO/EXIT, volume, channel, etc). "
+        "This is room-based so it works with any TV driver in Control4."
+    ),
+)
+def c4_tv_remote_tool(room_id: str, button: str, press: str | None = None) -> dict:
+    result = room_remote(int(room_id), str(button or ""), press)
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_tv_watch",
+    description=(
+        "Start/ensure a Watch session in a room by selecting a video device (source) for that room. "
+        "This is the reliable way to 'turn on the TV' in Control4."
+    ),
+)
+def c4_tv_watch_tool(room_id: str, source_device_id: str, deselect: bool = False) -> dict:
+    result = room_select_video_device(int(room_id), int(source_device_id), bool(deselect))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_tv_off",
+    description=(
+        "Turn off the room's Audio/Video session (ROOM_OFF). Best-effort confirms Watch becomes inactive."
+    ),
+)
+def c4_tv_off_tool(room_id: str, confirm_timeout_s: float = 10.0) -> dict:
+    result = room_off(int(room_id), float(confirm_timeout_s))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
 # ---- Media / AV ----
@@ -618,6 +1288,106 @@ def c4_lock_lock_tool(device_id: str) -> dict:
 
 # ✅ In 0.6.1: mount without passing a registry object or Mcp() instance
 mount_mcp(app, url_prefix="/mcp", middlewares=[mw_auth, mw_ratelimit, mw_cors])
+
+
+def _patch_mcp_registry_name_collisions() -> None:
+    """Avoid keyword collisions in flask-mcp-server's registry call helpers.
+
+    flask-mcp-server's integrated HTTP handler calls:
+      reg.call_tool(name, caller_roles=roles, **args)
+
+    If a tool itself has an argument named 'name' (e.g., execute_by_name tools), Python raises:
+      TypeError: call_tool() got multiple values for argument 'name'
+
+    Fix: monkey-patch the *instance methods* on the default registry so they do not
+    use a parameter named 'name' (or 'caller_roles') in their signature, then perform
+    the same work internally.
+    """
+
+    reg = getattr(flask_mcp_server, "default_registry", None)
+    if reg is None:
+        return
+
+    if getattr(reg, "_c4_name_collision_patch", False):
+        return
+
+    import types
+
+    def call_tool_patched(self, tool_name: str, **kwargs):
+        caller_roles = kwargs.pop("caller_roles", None)
+
+        if tool_name not in self.tools:
+            raise KeyError(f"Tool '{tool_name}' not found")
+
+        item = self.tools[tool_name]
+        if not self._permits(item.get("roles", []), caller_roles or []):
+            raise PermissionError("Access forbidden: insufficient roles")
+
+        ttl = item.get("ttl")
+        if ttl:
+            cache_key = self._cache_key("tool:" + tool_name, kwargs)
+            cached_result = self.cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+
+            result = item["callable"](**kwargs)
+            self.cache.set(cache_key, result, ttl)
+            return result
+
+        return item["callable"](**kwargs)
+
+    def get_resource_patched(self, resource_name: str, **kwargs):
+        caller_roles = kwargs.pop("caller_roles", None)
+
+        if resource_name not in self.resources:
+            raise KeyError(f"Resource '{resource_name}' not found")
+
+        item = self.resources[resource_name]
+        if not self._permits(item.get("roles", []), caller_roles or []):
+            raise PermissionError("Access forbidden: insufficient roles")
+
+        ttl = item.get("ttl")
+        if ttl:
+            cache_key = self._cache_key("resource:" + resource_name, kwargs)
+            cached_result = self.cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+
+            result = item["getter"](**kwargs)
+            self.cache.set(cache_key, result, ttl)
+            return result
+
+        return item["getter"](**kwargs)
+
+    def get_prompt_patched(self, prompt_name: str, **kwargs):
+        caller_roles = kwargs.pop("caller_roles", None)
+
+        if prompt_name not in self.prompts:
+            raise KeyError(f"Prompt '{prompt_name}' not found")
+
+        item = self.prompts[prompt_name]
+        if not self._permits(item.get("roles", []), caller_roles or []):
+            raise PermissionError("Access forbidden: insufficient roles")
+
+        return item["provider"](**kwargs)
+
+    def complete_patched(self, completion_name: str, **kwargs):
+        # caller_roles accepted for compatibility; currently not enforced by upstream.
+        kwargs.pop("caller_roles", None)
+
+        if completion_name not in self.completions:
+            raise KeyError(f"Completion provider '{completion_name}' not found")
+
+        return self.completions[completion_name](**kwargs)
+
+    reg.call_tool = types.MethodType(call_tool_patched, reg)
+    reg.get_resource = types.MethodType(get_resource_patched, reg)
+    reg.get_prompt = types.MethodType(get_prompt_patched, reg)
+    reg.complete = types.MethodType(complete_patched, reg)
+    reg._c4_name_collision_patch = True
+
+
+_patch_mcp_registry_name_collisions()
 
 
 if __name__ == "__main__":

@@ -25,7 +25,19 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 ## Interfaces / Contracts That Must Not Break
 
 - Discovery/debug: ping, c4_server_info, c4_list_rooms, c4_list_devices, c4_item_variables, c4_item_commands, c4_item_bindings, c4_item_send_command, c4_debug_trace_command
-- Rooms/media: c4_room_select_video_device, c4_media_watch_launch_app, c4_media_launch_app, c4_media_roku_list_apps, c4_media_remote, c4_media_remote_sequence, c4_media_now_playing, c4_media_get_state
+- Discovery/power: c4_capabilities_report
+- Rooms/media: c4_room_list_commands, c4_room_send_command, c4_room_select_video_device, c4_media_watch_launch_app, c4_media_launch_app, c4_media_roku_list_apps, c4_media_remote, c4_media_remote_sequence, c4_media_now_playing, c4_media_get_state
+- Scenes/UI Buttons: c4_uibutton_list, c4_uibutton_activate, c4_scene_list, c4_scene_activate
+- Contacts/sensors: c4_contact_list, c4_contact_get_state
+- Motion sensors: c4_motion_list, c4_motion_get_state
+- Keypads: c4_keypad_list, c4_keypad_buttons, c4_keypad_button_action, c4_control_keypad_list, c4_control_keypad_send_command
+- Fans: c4_fan_list, c4_fan_get_state, c4_fan_set_speed, c4_fan_set_power
+- Outlets: c4_outlet_list, c4_outlet_get_state, c4_outlet_set_power
+- Intercom: c4_intercom_list, c4_intercom_touchscreen_set_feature, c4_intercom_touchscreen_screensaver, c4_doorstation_set_led, c4_doorstation_set_external_chime, c4_doorstation_set_raw_setting
+- Macros: c4_macro_list, c4_macro_list_commands, c4_macro_execute, c4_macro_execute_by_name
+- Scheduler: c4_scheduler_list, c4_scheduler_get, c4_scheduler_list_commands, c4_scheduler_set_enabled
+- Announcements: c4_announcement_list, c4_announcement_list_commands, c4_announcement_execute, c4_announcement_execute_by_name
+- TV (room-based): c4_tv_list, c4_tv_remote, c4_tv_watch, c4_tv_off
 - Thermostats: c4_thermostat_get_state, c4_thermostat_set_hvac_mode, c4_thermostat_set_fan_mode, c4_thermostat_set_hold_mode, c4_thermostat_set_target_f, c4_thermostat_set_heat_setpoint_f, c4_thermostat_set_cool_setpoint_f
 - Lights: c4_light_get_state, c4_light_get_level, c4_light_set_level, c4_light_ramp
 - Locks: c4_lock_get_state, c4_lock_unlock, c4_lock_lock (must keep accepted/confirmed semantics)
@@ -36,6 +48,7 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 - Room off: room-off command returns accepted=true and the room Watch becomes inactive best-effort.
 - Thermostat safety: c4_thermostat_set_target_f chooses the correct setpoint (heat vs cool) based on mode and confirms when possible; no exceptions due to mode mismatch.
 - Reliability: no MCP tool call hangs; timeouts return structured results.
+- Scheduler writes: c4_scheduler_set_enabled is best-effort; always check confirmed (some Director builds return 400 "Timeout Modifying Scheduled Event" or 200 no-op responses).
 
 ## Guardrails (Conventions & Constraints)
 
@@ -44,6 +57,7 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 - Do not change MCP tool names/signatures without updating docs and clients.
 - Write operations should be safe: prefer idempotent commands; when validating with real devices, use auto-restore patterns.
 - Roku: do not assume a single device id; LaunchApp must work from any Roku-related item id (protocol root / media_service / media_player / avswitch).
+- TVs: prefer room-level commands for universal control across TV drivers (c4_tv_remote uses /rooms/{room_id}/commands).
 - Windows ops: multiple app.py processes can cause stale tool registries; use c4_server_info to confirm which process is serving.
 
 ## Links / Paths for Deeper Docs

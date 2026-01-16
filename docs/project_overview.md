@@ -12,7 +12,7 @@ Below is a **complete, ready-to-commit `PROJECT_OVERVIEW.md`**, filled in for yo
 
 ## 1. Executive summary
 
-The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, and media/AV) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`).
+The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, media/AV, plus macros/scheduler/announcements) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`).
 
 ---
 
@@ -206,6 +206,21 @@ Control4 Director
 * `c4_lock_unlock`
 * `c4_lock_lock`
 
+**Macros / Scheduler / Announcements**
+
+* `c4_macro_list`
+* `c4_macro_list_commands`
+* `c4_macro_execute`
+* `c4_macro_execute_by_name`
+* `c4_scheduler_list`
+* `c4_scheduler_get`
+* `c4_scheduler_list_commands`
+* `c4_scheduler_set_enabled` (best-effort; always check confirmed)
+* `c4_announcement_list`
+* `c4_announcement_list_commands`
+* `c4_announcement_execute`
+* `c4_announcement_execute_by_name`
+
 ### Authentication
 
 * MCP auth handled by `flask-mcp-server` middleware
@@ -238,6 +253,12 @@ Control4 Director
 
 * **Best-effort state estimate when stale**
   → The gateway tracks recent lock intent and returns an estimate when confirmation via variables is unreliable.
+
+* **Scheduler writes are best-effort; confirm via reread**
+  → Some Director builds return 400 “Timeout Modifying Scheduled Event” or 200 no-op responses; tools must report accepted vs confirmed.
+
+* **MCP dispatch guards against arg-name collisions**
+  → Tools may accept an argument named `name`; MCP registry call plumbing is patched to avoid `TypeError: got multiple values for argument 'name'`.
 
 ---
 
@@ -285,6 +306,8 @@ Control4 Director
 ### End-to-end
 
 * MCP client → Flask → Adapter → Gateway → Director
+* Scripted validator: `tools/validate_mcp_e2e.py` (read-only by default; write tests gated by flags)
+* Scheduler toggle validator: `tools/validate_scheduler_toggle.py` (defaults to dry-run; supports toggle+restore)
 
 ### Coverage goals
 
@@ -335,7 +358,9 @@ Control4 Director
 
 * Cloud lock drivers may ignore or delay commands
 * Director state/variables may remain stale even when the device physically actuates (locks observed)
+* Scheduler enable/disable writes can be unreliable (400 server-side timeouts or 200 no-op); treat as best-effort and always check confirmed
 * Media/app actions can be accepted but not visible if the room is not actively “watching” the correct input
+* Multiple/stale `app.py` processes on Windows can present an incorrect tool registry (use `c4_server_info` to confirm PID/tool_count)
 * pyControl4 API differences across versions
 * Limited documentation from Control4
 

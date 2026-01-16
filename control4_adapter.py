@@ -54,8 +54,168 @@ def room_send_command(room_id: int, command: str, params: Optional[Dict[str, Any
     return gateway.room_send_command(int(room_id), str(command or ""), params)  # type: ignore[misc]
 
 
+def room_list_commands(room_id: int, search: str | None = None) -> Json:
+    return gateway.room_list_commands(int(room_id), (str(search) if search is not None else None))  # type: ignore[misc]
+
+
+def capabilities_report(top_n: int = 20, include_examples: bool = False, max_examples_per_bucket: int = 3) -> Json:
+    return gateway.capabilities_report(int(top_n), bool(include_examples), int(max_examples_per_bucket))  # type: ignore[misc]
+
+
+def uibutton_activate(device_id: int, command: str | None = None, dry_run: bool = False) -> Json:
+    return gateway.uibutton_activate(int(device_id), (str(command) if command is not None else None), bool(dry_run))  # type: ignore[misc]
+
+
+def contact_get_state(device_id: int, timeout_s: float = 6.0) -> Json:
+    return gateway.contact_get_state(int(device_id), timeout_s=float(timeout_s))  # type: ignore[misc]
+
+
+def keypad_list() -> Json:
+    return gateway.keypad_list()  # type: ignore[misc]
+
+
+def keypad_get_buttons(device_id: int) -> Json:
+    return gateway.keypad_get_buttons(int(device_id))  # type: ignore[misc]
+
+
+def keypad_button_action(device_id: int, button_id: int, action: str = "tap", tap_ms: int = 200, dry_run: bool = False) -> Json:
+    return gateway.keypad_button_action(int(device_id), int(button_id), str(action or ""), int(tap_ms), bool(dry_run))  # type: ignore[misc]
+
+
+def control_keypad_list() -> Json:
+    return gateway.control_keypad_list()  # type: ignore[misc]
+
+
+def control_keypad_send_command(device_id: int, command: str, dry_run: bool = False) -> Json:
+    return gateway.control_keypad_send_command(int(device_id), str(command or ""), bool(dry_run))  # type: ignore[misc]
+
+
+def fan_list() -> Json:
+    return gateway.fan_list()  # type: ignore[misc]
+
+
+def fan_get_state(device_id: int) -> Json:
+    return gateway.fan_get_state(int(device_id))  # type: ignore[misc]
+
+
+def fan_set_speed(device_id: int, speed: Any, confirm_timeout_s: float = 4.0, dry_run: bool = False) -> Json:
+    return gateway.fan_set_speed(int(device_id), speed, confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))  # type: ignore[misc]
+
+
+def fan_set_power(device_id: int, power: str, confirm_timeout_s: float = 4.0, dry_run: bool = False) -> Json:
+    return gateway.fan_set_power(int(device_id), str(power or ""), confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))  # type: ignore[misc]
+
+
+def motion_list() -> Json:
+    return gateway.motion_list()  # type: ignore[misc]
+
+
+def motion_get_state(device_id: int, timeout_s: float = 6.0) -> Json:
+    return gateway.motion_get_state(int(device_id), timeout_s=float(timeout_s))  # type: ignore[misc]
+
+
+# --------- Intercom (best-effort) ---------
+
+def intercom_list() -> Json:
+    return gateway.intercom_list()  # type: ignore[misc]
+
+
+def intercom_touchscreen_set_feature(device_id: int, feature: str, enabled: bool, dry_run: bool = False) -> Json:
+    return gateway.intercom_touchscreen_set_feature(int(device_id), str(feature or ""), bool(enabled), bool(dry_run))  # type: ignore[misc]
+
+
+def intercom_touchscreen_screensaver(
+    device_id: int,
+    action: str | None = None,
+    mode: str | None = None,
+    start_time_s: int | None = None,
+    dry_run: bool = False,
+) -> Json:
+    return gateway.intercom_touchscreen_screensaver(
+        int(device_id),
+        (str(action) if action is not None else None),
+        (str(mode) if mode is not None else None),
+        (int(start_time_s) if start_time_s is not None else None),
+        bool(dry_run),
+    )  # type: ignore[misc]
+
+
+def doorstation_set_led(device_id: int, enabled: bool, dry_run: bool = False) -> Json:
+    return gateway.intercom_doorstation_set_led(int(device_id), bool(enabled), bool(dry_run))  # type: ignore[misc]
+
+
+def doorstation_set_external_chime(device_id: int, enabled: bool, dry_run: bool = False) -> Json:
+    return gateway.intercom_doorstation_set_external_chime(int(device_id), bool(enabled), bool(dry_run))  # type: ignore[misc]
+
+
+def doorstation_set_raw_setting(device_id: int, key: str, value: str, dry_run: bool = False) -> Json:
+    return gateway.intercom_doorstation_set_raw_setting(int(device_id), str(key or ""), str(value or ""), bool(dry_run))  # type: ignore[misc]
+
+
+# --------- Macros (Agent) ---------
+
+def macro_list() -> Json:
+    return gateway.macro_list()  # type: ignore[misc]
+
+
+def macro_list_commands() -> Json:
+    return gateway.macro_list_commands()  # type: ignore[misc]
+
+
+def macro_execute(macro_id: int, dry_run: bool = False) -> Json:
+    return gateway.macro_execute(int(macro_id), bool(dry_run))  # type: ignore[misc]
+
+
+def macro_execute_by_name(name: str, dry_run: bool = False) -> Json:
+    return gateway.macro_execute_by_name(str(name or ""), bool(dry_run))  # type: ignore[misc]
+
+
+# --------- Scheduler (Agent) ---------
+
+def scheduler_list(search: str | None = None) -> Json:
+    return gateway.scheduler_list((str(search) if search is not None else None))  # type: ignore[misc]
+
+
+def scheduler_get(event_id: int) -> Json:
+    return gateway.scheduler_get(int(event_id))  # type: ignore[misc]
+
+
+def scheduler_list_commands() -> Json:
+    return gateway.scheduler_list_commands()  # type: ignore[misc]
+
+
+def scheduler_set_enabled(event_id: int, enabled: bool, dry_run: bool = False) -> Json:
+    return gateway.scheduler_set_enabled(int(event_id), bool(enabled), bool(dry_run))  # type: ignore[misc]
+
+
+# --------- Announcements ---------
+
+def announcement_list() -> Json:
+    return gateway.announcement_list()  # type: ignore[misc]
+
+
+def announcement_list_commands() -> Json:
+    return gateway.announcement_list_commands()  # type: ignore[misc]
+
+
+def announcement_execute(announcement_id: int, dry_run: bool = False) -> Json:
+    return gateway.announcement_execute(int(announcement_id), bool(dry_run))  # type: ignore[misc]
+
+
+def announcement_execute_by_name(name: str, dry_run: bool = False) -> Json:
+    return gateway.announcement_execute_by_name(str(name or ""), bool(dry_run))  # type: ignore[misc]
+
+
 def room_select_video_device(room_id: int, device_id: int, deselect: bool = False) -> Json:
     return gateway.room_select_video_device(int(room_id), int(device_id), bool(deselect))  # type: ignore[misc]
+
+
+def room_off(room_id: int, confirm_timeout_s: float = 10.0) -> Json:
+    return gateway.room_off(int(room_id), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
+
+
+def room_remote(room_id: int, button: str, press: str | None = None) -> Json:
+    return gateway.room_remote(int(room_id), str(button or ""), press)  # type: ignore[misc]
 
 
 def debug_trace_command(

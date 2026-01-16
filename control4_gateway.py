@@ -271,6 +271,83 @@ class Control4Gateway:
 
         return last or {"ok": False, "status": 0, "url": "", "json": None, "text": "", "error": "No base URL"}
 
+    async def _director_http_post_https_only(self, path: str, payload: dict | None = None, timeout_s: float | None = None) -> dict[str, Any]:
+        """POST to Director using HTTPS base only.
+
+        Some endpoints behave poorly when we fall back to HTTP. Scheduler writes in particular can be slow,
+        so we allow an explicit timeout override.
+        """
+
+        token = await self._ensure_director_token_async()
+        headers = {"Authorization": f"Bearer {token}"}
+        timeout = aiohttp.ClientTimeout(total=(float(timeout_s) if timeout_s is not None else self._http_timeout_s))
+
+        base = self._director_base_urls()[0]
+        url = urljoin(base, path.lstrip("/"))
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.post(url, headers=headers, json=(payload or {}), ssl=False) as r:
+                    text = await r.text()
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:
+                        data = None
+                    return {"ok": r.status < 300, "status": r.status, "url": url, "json": data, "text": text}
+        except Exception as e:
+            return {
+                "ok": False,
+                "status": 0,
+                "url": url,
+                "json": None,
+                "text": "",
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+
+    async def _director_http_request_https_only(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Perform an authenticated HTTPS-only JSON request.
+
+        We intentionally avoid HTTP fallback here because certain Director endpoints (notably scheduler writes)
+        behave inconsistently when accessed over HTTP.
+        """
+
+        verb = str(method or "").strip().upper()
+        if verb not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            return {"ok": False, "status": 0, "url": "", "json": None, "text": "", "error": f"Unsupported method: {verb}"}
+
+        token = await self._ensure_director_token_async()
+        headers = {"Authorization": f"Bearer {token}"}
+        timeout = aiohttp.ClientTimeout(total=(float(timeout_s) if timeout_s is not None else self._http_timeout_s))
+
+        base = self._director_base_urls()[0]
+        url = urljoin(base, path.lstrip("/"))
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.request(verb, url, headers=headers, json=(payload or {}), ssl=False) as r:
+                    text = await r.text()
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:
+                        data = None
+                    return {"ok": r.status < 300, "status": r.status, "url": url, "json": data, "text": text}
+        except Exception as e:
+            return {
+                "ok": False,
+                "status": 0,
+                "url": url,
+                "json": None,
+                "text": "",
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+
     # ---------- pyControl4 sendPostRequest helper (signature-safe) ----------
 
     async def _send_post_via_director(
@@ -429,6 +506,45 @@ class Control4Gateway:
         uri = f"/api/v1/items/{device_id}/commands"
         return await self._send_post_via_director(director, uri, command, params or {}, async_variable=False)
 
+    async def _item_send_command_preserve_async(
+        self, device_id: int, command: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Send an item command without uppercasing.
+
+        Some Control4 endpoints expose human-readable command names (e.g. door station commands)
+        where preserving case/spaces is safer.
+        """
+
+        device_id = int(device_id)
+        command_s = str(command or "").strip()
+        if not command_s:
+            return {"ok": False, "device_id": device_id, "error": "command is required"}
+
+        director = await self._director_async()
+        uri = f"/api/v1/items/{device_id}/commands"
+        return await self._send_post_via_director(director, uri, command_s, params or {}, async_variable=False)
+
+    async def _agent_send_command_async(
+        self, agent: str, command: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        agent_s = str(agent or "").strip().strip("/")
+        command_s = str(command or "").strip()
+        if not agent_s:
+            return {"ok": False, "error": "agent is required"}
+        if not command_s:
+            return {"ok": False, "agent": agent_s, "error": "command is required"}
+
+        director = await self._director_async()
+        uri = f"/api/v1/agents/{agent_s}/commands"
+        primary = await self._send_post_via_director(director, uri, command_s, params or {}, async_variable=False)
+        if primary.get("ok"):
+            return primary
+
+        # Fallback to direct HTTP if pyControl4 chokes on the response body.
+        body = {"async": False, "command": command_s, "tParams": (params or {})}
+        http = await self._director_http_post(uri, body)
+        return {"ok": bool(http.get("ok")), "uri": uri, "command": command_s, "http": http}
+
     # ---------- room command helpers ----------
 
     async def _room_send_command_async(
@@ -445,6 +561,46 @@ class Control4Gateway:
         if isinstance(result, dict):
             result["room_id"] = room_id
         return result
+
+    async def _room_list_commands_async(self, room_id: int, search: str | None = None) -> dict[str, Any]:
+        room_id = int(room_id)
+        needle = str(search or "").strip().lower()
+
+        http = await self._director_http_get(f"/api/v1/rooms/{room_id}/commands")
+        if not http.get("ok"):
+            return {
+                "ok": False,
+                "room_id": room_id,
+                "search": (str(search) if search is not None else None),
+                "error": "failed to fetch room commands",
+                "http": http,
+                "commands": [],
+            }
+
+        payload = http.get("json")
+        cmds = payload if isinstance(payload, list) else (payload.get("commands") if isinstance(payload, dict) else None)
+        if not isinstance(cmds, list):
+            cmds = []
+
+        normalized = [c for c in cmds if isinstance(c, dict)]
+        if needle:
+            def _hay(row: dict[str, Any]) -> str:
+                return " ".join([
+                    str(row.get("command") or ""),
+                    str(row.get("label") or ""),
+                    str(row.get("display") or ""),
+                ]).lower()
+
+            normalized = [c for c in normalized if needle in _hay(c)]
+
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "search": (str(search) if search is not None else None),
+            "count": len(normalized),
+            "commands": normalized,
+            "source": "director.http.get",
+        }
 
     async def _room_select_video_device_async(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
         room_id = int(room_id)
@@ -519,9 +675,79 @@ class Control4Gateway:
                 "error": "Could not resolve room_id for device; pass room_id explicitly",
             }
 
+        async def _resolve_watch_source_device_id(input_device_id: int, resolved_room_id: int) -> int:
+            """Resolve the best device_id to pass to SELECT_VIDEO_DEVICE.
+
+            For Roku, callers may pass any of the protocol group item ids (media_service/media_player/avswitch).
+            Watch selection typically needs the AVSwitch (app switcher) or media_player item, not the media_service.
+            """
+            input_device_id = int(input_device_id)
+            resolved_room_id = int(resolved_room_id)
+
+            http = await self._director_http_get("/api/v1/items")
+            items = self._normalize_items_payload(http.get("json")) if http.get("ok") else await self._get_all_items_async()
+            rec = next(
+                (
+                    r
+                    for r in items
+                    if isinstance(r, dict) and int(r.get("id") or -1) == input_device_id
+                ),
+                None,
+            )
+            if not isinstance(rec, dict):
+                return input_device_id
+
+            protocol_filename = str(rec.get("protocolFilename") or "")
+            protocol_id = rec.get("protocolId")
+            try:
+                protocol_id_i = int(protocol_id)
+            except Exception:
+                protocol_id_i = input_device_id
+
+            is_roku = "roku" in protocol_filename.lower() or "roku" in str(rec.get("filename") or "").lower()
+            if not is_roku:
+                return input_device_id
+
+            group = [
+                r
+                for r in items
+                if isinstance(r, dict) and int(r.get("protocolId") or -1) == protocol_id_i
+            ]
+
+            def in_room(row: dict[str, Any]) -> bool:
+                try:
+                    return int(row.get("roomId") or -1) == resolved_room_id
+                except Exception:
+                    return False
+
+            def id_of(rows: list[dict[str, Any]]) -> int | None:
+                for row in rows:
+                    try:
+                        return int(row.get("id") or 0)
+                    except Exception:
+                        continue
+                return None
+
+            # Prefer AVSwitch (Roku App Switcher) in this room.
+            avswitch = [r for r in group if str(r.get("proxy") or "").lower() == "avswitch" and in_room(r)]
+            picked = id_of(avswitch)
+            if picked is not None:
+                return picked
+
+            # Next prefer media_player in this room.
+            media_player = [r for r in group if str(r.get("proxy") or "").lower() == "media_player" and in_room(r)]
+            picked = id_of(media_player)
+            if picked is not None:
+                return picked
+
+            # Fall back to protocol root if present; otherwise the input id.
+            return int(protocol_id_i) if protocol_id_i else input_device_id
+
         before_watch = await self._ui_watch_status_async(resolved_room_id)
 
-        select_video = await self._room_select_video_device_async(resolved_room_id, device_id, deselect=False)
+        watch_source_device_id = await _resolve_watch_source_device_id(device_id, resolved_room_id)
+
+        select_video = await self._room_select_video_device_async(resolved_room_id, watch_source_device_id, deselect=False)
         # Give the room's Watch macro time to settle; in practice this can take a couple seconds.
         after_select_watch = None
         settle_deadline = asyncio.get_running_loop().time() + 6.0
@@ -560,6 +786,7 @@ class Control4Gateway:
             "ok": ok,
             "room_id": resolved_room_id,
             "device_id": device_id,
+            "watch_source_device_id": watch_source_device_id,
             "app": app,
             "watch": {
                 "before": before_watch,
@@ -668,9 +895,152 @@ class Control4Gateway:
             timeout_s=12,
         )
 
+    def room_list_commands(self, room_id: int, search: str | None = None) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._room_list_commands_async(int(room_id), (str(search) if search is not None else None)),
+            timeout_s=15,
+        )
+
     def room_select_video_device(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
         return self._loop_thread.run(
             self._room_select_video_device_async(int(room_id), int(device_id), deselect=bool(deselect)),
+            timeout_s=12,
+        )
+
+    async def _room_off_async(self, room_id: int, confirm_timeout_s: float = 10.0) -> dict[str, Any]:
+        room_id = int(room_id)
+        before_watch = await self._ui_watch_status_async(room_id)
+
+        execute = await self._room_send_command_async(room_id, "ROOM_OFF", {})
+        accepted = bool(execute.get("ok"))
+        if not accepted:
+            return {
+                "ok": False,
+                "room_id": room_id,
+                "accepted": False,
+                "confirmed": False,
+                "watch": {"before": before_watch, "after": before_watch},
+                "execute": execute,
+            }
+
+        # Best-effort: confirm the room is no longer actively watching.
+        deadline = asyncio.get_running_loop().time() + float(confirm_timeout_s)
+        last_watch = before_watch
+        confirmed = False
+
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.6)
+            last_watch = await self._ui_watch_status_async(room_id)
+            if isinstance(last_watch, dict) and last_watch.get("active") is False:
+                confirmed = True
+                break
+
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "accepted": True,
+            "confirmed": bool(confirmed),
+            "watch": {"before": before_watch, "after": last_watch},
+            "execute": execute,
+            "confirm_timeout_s": float(confirm_timeout_s),
+        }
+
+    def room_off(self, room_id: int, confirm_timeout_s: float = 10.0) -> dict[str, Any]:
+        # Room off can take a moment to reflect in UI configuration; give it some extra headroom.
+        return self._loop_thread.run(
+            self._room_off_async(int(room_id), confirm_timeout_s=float(confirm_timeout_s)),
+            timeout_s=float(confirm_timeout_s) + 18.0,
+        )
+
+    @staticmethod
+    def _room_remote_mapping() -> dict[str, str]:
+        # Friendly names -> room command.
+        # Prefer room commands because they work regardless of the underlying TV/receiver driver.
+        return {
+            "up": "UP",
+            "down": "DOWN",
+            "left": "LEFT",
+            "right": "RIGHT",
+            "select": "ENTER",
+            "ok": "ENTER",
+            "enter": "ENTER",
+            "back": "BACK",
+            "menu": "MENU",
+            "info": "INFO",
+            "exit": "EXIT",
+            "guide": "GUIDE",
+            "play": "PLAY",
+            "pause": "PAUSE",
+            "ff": "SCAN_FWD",
+            "scan_fwd": "SCAN_FWD",
+            "rew": "SCAN_REV",
+            "scan_rev": "SCAN_REV",
+            "recall": "RECALL",
+            "prev": "RECALL",
+            "page_up": "PAGE_UP",
+            "page_down": "PAGE_DOWN",
+            "volup": "PULSE_VOL_UP",
+            "volume_up": "PULSE_VOL_UP",
+            "voldown": "PULSE_VOL_DOWN",
+            "volume_down": "PULSE_VOL_DOWN",
+            "mute": "MUTE_TOGGLE",
+            "mute_toggle": "MUTE_TOGGLE",
+            "ch_up": "PULSE_CH_UP",
+            "channel_up": "PULSE_CH_UP",
+            "ch_down": "PULSE_CH_DOWN",
+            "channel_down": "PULSE_CH_DOWN",
+            "power_off": "ROOM_OFF",
+            "off": "ROOM_OFF",
+            "room_off": "ROOM_OFF",
+        }
+
+    async def _room_remote_async(self, room_id: int, button: str, press: str | None = None) -> dict[str, Any]:
+        room_id = int(room_id)
+        b = str(button or "").strip().lower()
+        if not b:
+            return {"ok": False, "room_id": room_id, "error": "button is required"}
+
+        normalized_press = self._normalize_remote_press(press)
+        mapping = self._room_remote_mapping()
+        base_cmd = mapping.get(b)
+        if not base_cmd:
+            return {
+                "ok": False,
+                "room_id": room_id,
+                "error": f"Unsupported button '{button}'. Supported: {sorted(set(mapping.keys()))}",
+            }
+
+        # Support press semantics for commands that have start/stop variants.
+        cmd = base_cmd
+        if base_cmd in {"PULSE_VOL_UP", "PULSE_VOL_DOWN", "PAGE_UP", "PAGE_DOWN", "PULSE_CH_UP", "PULSE_CH_DOWN"}:
+            variants = {
+                "PULSE_VOL_UP": ("PULSE_VOL_UP", "START_VOL_UP", "STOP_VOL_UP"),
+                "PULSE_VOL_DOWN": ("PULSE_VOL_DOWN", "START_VOL_DOWN", "STOP_VOL_DOWN"),
+                "PAGE_UP": ("PAGE_UP", "START_PAGE_UP", "STOP_PAGE_UP"),
+                "PAGE_DOWN": ("PAGE_DOWN", "START_PAGE_DOWN", "STOP_PAGE_DOWN"),
+                "PULSE_CH_UP": ("PULSE_CH_UP", "START_CH_UP", "STOP_CH_UP"),
+                "PULSE_CH_DOWN": ("PULSE_CH_DOWN", "START_CH_DOWN", "STOP_CH_DOWN"),
+            }
+            pulse, start, stop = variants[base_cmd]
+            if normalized_press == "Down":
+                cmd = start
+            elif normalized_press == "Up":
+                cmd = stop
+            else:
+                cmd = pulse
+
+        exec_result = await self._room_send_command_async(room_id, cmd, {})
+        return {
+            "ok": bool(exec_result.get("ok")),
+            "room_id": room_id,
+            "requested": {"button": str(button), "press": normalized_press, "command": cmd},
+            "accepted": bool(exec_result.get("ok")),
+            "execute": exec_result,
+        }
+
+    def room_remote(self, room_id: int, button: str, press: str | None = None) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._room_remote_async(int(room_id), str(button or ""), press),
             timeout_s=12,
         )
 
@@ -678,6 +1048,84 @@ class Control4Gateway:
         return self._loop_thread.run(
             self._media_watch_launch_app_async(int(device_id), str(app or ""), room_id=(int(room_id) if room_id is not None else None), pre_home=bool(pre_home)),
             timeout_s=45,
+        )
+
+    async def _capabilities_report_async(self, top_n: int = 20, include_examples: bool = False, max_examples_per_bucket: int = 3) -> dict[str, Any]:
+        try:
+            top_n_i = max(1, min(int(top_n), 200))
+        except Exception:
+            top_n_i = 20
+
+        include_examples_b = bool(include_examples)
+        try:
+            max_examples_i = max(0, min(int(max_examples_per_bucket), 10))
+        except Exception:
+            max_examples_i = 3
+
+        http = await self._director_http_get("/api/v1/items")
+        items = self._normalize_items_payload(http.get("json")) if http.get("ok") else await self._get_all_items_async()
+
+        def _bucket(v: Any) -> str:
+            s = str(v or "").strip()
+            return s if s else "(none)"
+
+        controls: dict[str, int] = {}
+        proxies: dict[str, int] = {}
+        protocol_files: dict[str, int] = {}
+        rooms: dict[str, int] = {}
+
+        examples: dict[str, list[dict[str, Any]]] = {}
+
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            control = _bucket(r.get("control"))
+            proxy = _bucket(r.get("proxy"))
+            proto = _bucket(r.get("protocolFilename"))
+            room = _bucket(r.get("roomName"))
+
+            controls[control] = controls.get(control, 0) + 1
+            proxies[proxy] = proxies.get(proxy, 0) + 1
+            protocol_files[proto] = protocol_files.get(proto, 0) + 1
+            rooms[room] = rooms.get(room, 0) + 1
+
+            if include_examples_b and max_examples_i > 0:
+                key = f"control:{control}"
+                lst = examples.setdefault(key, [])
+                if len(lst) < max_examples_i:
+                    lst.append({
+                        "id": r.get("id"),
+                        "name": r.get("name"),
+                        "roomId": r.get("roomId"),
+                        "roomName": r.get("roomName"),
+                        "proxy": r.get("proxy"),
+                        "protocolFilename": r.get("protocolFilename"),
+                    })
+
+        def _top(d: dict[str, int]) -> list[dict[str, Any]]:
+            return [
+                {"key": k, "count": c}
+                for k, c in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n_i]
+            ]
+
+        out: dict[str, Any] = {
+            "ok": True,
+            "items_total": len([r for r in items if isinstance(r, dict)]),
+            "top_n": top_n_i,
+            "controls_top": _top(controls),
+            "proxies_top": _top(proxies),
+            "protocol_filenames_top": _top(protocol_files),
+            "rooms_top": _top(rooms),
+            "source": "director.http.get" if http.get("ok") else "director.getAllItems",
+        }
+        if include_examples_b and examples:
+            out["examples"] = examples
+        return out
+
+    def capabilities_report(self, top_n: int = 20, include_examples: bool = False, max_examples_per_bucket: int = 3) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._capabilities_report_async(int(top_n), bool(include_examples), int(max_examples_per_bucket)),
+            timeout_s=25,
         )
 
     def item_send_command(self, device_id: int, command: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -949,6 +1397,1112 @@ class Control4Gateway:
             if isinstance(row, dict):
                 cleaned.append(row)
         return {"ok": True, "device_id": device_id, "source": "director.getItemVariables", "variables": cleaned}
+
+    # ---------- UI Buttons / Scenes (best-effort) ----------
+
+    @staticmethod
+    def _pick_best_command(cmds: list[dict[str, Any]], preferred: list[str]) -> str | None:
+        if not cmds:
+            return None
+
+        available: list[str] = []
+        for row in cmds:
+            if not isinstance(row, dict):
+                continue
+            c = str(row.get("command") or "").strip()
+            if c:
+                available.append(c)
+
+        if not available:
+            return None
+
+        pref = [str(p).strip() for p in preferred if str(p).strip()]
+        lower_map = {a.lower(): a for a in available}
+        for p in pref:
+            hit = lower_map.get(p.lower())
+            if hit:
+                return hit
+        return available[0]
+
+    async def _uibutton_activate_async(
+        self,
+        device_id: int,
+        command: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        cmd_override = str(command or "").strip()
+
+        cmds_payload = await self._item_get_commands_async(device_id)
+        cmds = cmds_payload.get("commands") if isinstance(cmds_payload.get("commands"), list) else []
+        cmds_norm = [c for c in cmds if isinstance(c, dict)]
+
+        preferred = [
+            "Select",
+            "PRESS",
+            "ACTIVATE",
+            "TRIGGER",
+            "ON",
+            "GetState",
+        ]
+
+        resolved = cmd_override or self._pick_best_command(cmds_norm, preferred)
+        if not resolved:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "error": "No commands available for this UI button",
+                "commands": cmds_norm,
+            }
+
+        if bool(dry_run):
+            return {
+                "ok": True,
+                "device_id": device_id,
+                "dry_run": True,
+                "resolved_command": resolved,
+                "available_commands": [
+                    str(c.get("command"))
+                    for c in cmds_norm
+                    if isinstance(c, dict) and c.get("command") is not None
+                ],
+            }
+
+        exec_result = await self._item_send_command_async(device_id, resolved, {})
+        return {
+            "ok": bool(exec_result.get("ok")),
+            "device_id": device_id,
+            "command": resolved,
+            "accepted": bool(exec_result.get("ok")),
+            "execute": exec_result,
+        }
+
+    def uibutton_activate(self, device_id: int, command: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._uibutton_activate_async(int(device_id), (str(command) if command is not None else None), bool(dry_run)),
+            timeout_s=12,
+        )
+
+    # ---------- Sensors (best-effort parsing) ----------
+
+    @staticmethod
+    def _vars_to_map(variables: list[dict[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for row in variables:
+            if not isinstance(row, dict):
+                continue
+            k = str(row.get("varName") or "").strip()
+            if not k:
+                continue
+            out[k.upper()] = row.get("value")
+        return out
+
+    @staticmethod
+    def _coerce_bool(v: Any) -> bool | None:
+        if v in (True, False):
+            return bool(v)
+        try:
+            if isinstance(v, str) and v.strip().isdigit():
+                v = int(v.strip())
+            if isinstance(v, (int, float)):
+                return bool(int(v))
+        except Exception:
+            return None
+        return None
+
+    async def _contact_get_state_async(self, device_id: int, timeout_s: float = 6.0) -> dict[str, Any]:
+        device_id = int(device_id)
+        fetched = await self._fetch_item_variables_list_async(device_id, timeout_s=float(timeout_s))
+        var_list: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+
+        # Build a case-insensitive map for sensors.
+        # NOTE: control4_gateway.py also has a thermostat-specific _vars_to_map later in the file
+        # that preserves original varName casing. To avoid subtle conflicts, sensor parsing uses
+        # its own uppercase-normalized view.
+        vmap_u: dict[str, Any] = {}
+        for row in var_list:
+            if not isinstance(row, dict):
+                continue
+            k = str(row.get("varName") or "").strip()
+            if not k:
+                continue
+            vmap_u[k.upper()] = row.get("value")
+
+        battery_level = vmap_u.get("BATTERY_LEVEL")
+        battery_voltage = vmap_u.get("BATTERY_VOLTAGE")
+        temperature = vmap_u.get("TEMPERATURE")
+        light_level = vmap_u.get("LIGHT_LEVEL")
+        night_mode = vmap_u.get("NIGHT_MODE")
+
+        # Best-effort state extraction across common drivers.
+        # NOTE: vmap keys are normalized to UPPERCASE via _vars_to_map.
+        candidates = [
+            ("contact", "CONTACT"),
+            ("contact", "CONTACT_STATE"),
+            ("contact", "CONTACTSTATE"),
+            ("contact", "OPEN"),
+            ("contact", "CLOSED"),
+            ("contact", "IS_OPEN"),
+            ("motion", "MOTION"),
+            ("motion", "MOTION_STATE"),
+            ("motion", "OCCUPANCY"),
+            ("generic", "STATE"),
+        ]
+        state = None
+        state_kind = None
+        state_var = None
+
+        for kind, key in candidates:
+            if key not in vmap_u:
+                continue
+            state_var = key
+            state_kind = kind
+            val = vmap_u.get(key)
+            b = self._coerce_bool(val)
+            state = b if b is not None else val
+            break
+
+        return {
+            "ok": bool(fetched.get("ok")),
+            "device_id": device_id,
+            "variables": var_list,
+            "battery_level": battery_level,
+            "battery_voltage": battery_voltage,
+            "temperature": temperature,
+            "light_level": light_level,
+            "night_mode": night_mode,
+            "state": state,
+            "state_kind": state_kind,
+            "state_var": state_var,
+            "source": fetched.get("source"),
+        }
+
+    # ---------- Keypads (best-effort) ----------
+
+    def keypad_list(self) -> dict[str, Any]:
+        items = self.get_all_items()
+        keypads: list[dict[str, Any]] = []
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+            if str(i.get("proxy") or "").lower() != "keypad_proxy":
+                continue
+            keypads.append(
+                {
+                    "device_id": int(i.get("id")),
+                    "name": i.get("name"),
+                    "room_id": i.get("roomId") or i.get("parentId"),
+                    "room_name": i.get("roomName"),
+                    "control": i.get("control"),
+                    "proxy": i.get("proxy"),
+                    "protocolFilename": i.get("protocolFilename"),
+                }
+            )
+        keypads.sort(key=lambda d: (str(d.get("room_name") or ""), str(d.get("name") or "")))
+        return {"ok": True, "count": len(keypads), "keypads": keypads}
+
+    async def _keypad_get_buttons_async(self, device_id: int) -> dict[str, Any]:
+        device_id = int(device_id)
+        cmds_resp = await self._item_get_commands_async(device_id)
+        if not cmds_resp.get("ok"):
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "error": "Could not load commands",
+                "details": cmds_resp,
+            }
+
+        buttons_by_id: dict[int, str] = {}
+        for cmd in (cmds_resp.get("commands") or []):
+            if not isinstance(cmd, dict):
+                continue
+            for p in (cmd.get("params") or []):
+                if not isinstance(p, dict):
+                    continue
+                if str(p.get("name") or "").strip().upper() != "BUTTON_ID":
+                    continue
+                values = p.get("values")
+                if not isinstance(values, list):
+                    continue
+                for row in values:
+                    if not isinstance(row, dict):
+                        continue
+                    bid = row.get("id")
+                    if isinstance(bid, bool) or not isinstance(bid, (int, float, str)):
+                        continue
+                    try:
+                        bid_i = int(bid)
+                    except Exception:
+                        continue
+                    name = row.get("name")
+                    if name is None:
+                        name = row.get("display")
+                    if name is None:
+                        name = str(bid_i)
+                    buttons_by_id[bid_i] = str(name)
+
+        buttons = [{"button_id": k, "name": buttons_by_id[k]} for k in sorted(buttons_by_id.keys())]
+        return {
+            "ok": True,
+            "device_id": device_id,
+            "buttons": buttons,
+            "button_count": len(buttons),
+            "source": cmds_resp.get("source"),
+        }
+
+    def keypad_get_buttons(self, device_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._keypad_get_buttons_async(int(device_id)), timeout_s=12)
+
+    async def _keypad_button_action_async(
+        self,
+        device_id: int,
+        button_id: int,
+        action: str,
+        tap_ms: int,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        button_id = int(button_id)
+        action_n = str(action or "").strip().lower()
+        tap_ms = int(tap_ms)
+        if tap_ms < 0:
+            tap_ms = 0
+
+        def _action_to_int(a: str) -> int | None:
+            if a in {"press", "down", "pressed"}:
+                return 1
+            if a in {"release", "up", "released"}:
+                return 0
+            return None
+
+        executes: list[dict[str, Any]] = []
+        if action_n == "tap":
+            if bool(dry_run):
+                return {
+                    "ok": True,
+                    "device_id": device_id,
+                    "button_id": button_id,
+                    "action": "tap",
+                    "tap_ms": tap_ms,
+                    "dry_run": True,
+                    "planned": [
+                        {"action": "press", "command": "KEYPAD_BUTTON_ACTION", "params": {"BUTTON_ID": button_id, "ACTION": 1}},
+                        {"action": "release", "command": "KEYPAD_BUTTON_ACTION", "params": {"BUTTON_ID": button_id, "ACTION": 0}},
+                    ],
+                }
+            press = await self._item_send_command_async(device_id, "KEYPAD_BUTTON_ACTION", {"BUTTON_ID": button_id, "ACTION": 1})
+            executes.append({"action": "press", "execute": press})
+            await asyncio.sleep(max(0.05, tap_ms / 1000.0) if tap_ms else 0.05)
+            release = await self._item_send_command_async(device_id, "KEYPAD_BUTTON_ACTION", {"BUTTON_ID": button_id, "ACTION": 0})
+            executes.append({"action": "release", "execute": release})
+            ok = all(bool(x.get("execute", {}).get("ok")) for x in executes)
+            return {
+                "ok": ok,
+                "device_id": device_id,
+                "button_id": button_id,
+                "action": "tap",
+                "tap_ms": tap_ms,
+                "accepted": ok,
+                "executes": executes,
+            }
+
+        a_int = _action_to_int(action_n)
+        if a_int is None:
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "button_id": button_id,
+                "error": "action must be one of: tap, press, release",
+            }
+
+        if bool(dry_run):
+            return {
+                "ok": True,
+                "device_id": device_id,
+                "button_id": button_id,
+                "action": action_n,
+                "dry_run": True,
+                "planned": {"command": "KEYPAD_BUTTON_ACTION", "params": {"BUTTON_ID": button_id, "ACTION": a_int}},
+            }
+
+        res = await self._item_send_command_async(device_id, "KEYPAD_BUTTON_ACTION", {"BUTTON_ID": button_id, "ACTION": a_int})
+        return {
+            "ok": bool(res.get("ok")),
+            "device_id": device_id,
+            "button_id": button_id,
+            "action": action_n,
+            "accepted": bool(res.get("ok")),
+            "execute": res,
+        }
+
+    def keypad_button_action(
+        self,
+        device_id: int,
+        button_id: int,
+        action: str = "tap",
+        tap_ms: int = 200,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._keypad_button_action_async(
+                int(device_id),
+                int(button_id),
+                str(action or ""),
+                int(tap_ms),
+                bool(dry_run),
+            ),
+            timeout_s=12,
+        )
+
+    # ---------- Room Control Keypads (programmed triggers) ----------
+
+    def control_keypad_list(self) -> dict[str, Any]:
+        items = self.get_all_items()
+        devs: list[dict[str, Any]] = []
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+            if str(i.get("proxy") or "").lower() != "room_control_keypad":
+                continue
+            devs.append(
+                {
+                    "device_id": int(i.get("id")),
+                    "name": i.get("name"),
+                    "room_id": i.get("roomId") or i.get("parentId"),
+                    "room_name": i.get("roomName"),
+                    "control": i.get("control"),
+                    "proxy": i.get("proxy"),
+                    "protocolFilename": i.get("protocolFilename"),
+                }
+            )
+        devs.sort(key=lambda d: (str(d.get("room_name") or ""), str(d.get("name") or "")))
+        return {"ok": True, "count": len(devs), "control_keypads": devs}
+
+    def control_keypad_send_command(self, device_id: int, command: str, dry_run: bool = False) -> dict[str, Any]:
+        if bool(dry_run):
+            return {
+                "ok": True,
+                "device_id": int(device_id),
+                "command": str(command or ""),
+                "dry_run": True,
+            }
+        return self.item_send_command(int(device_id), str(command or ""), None)
+
+    # ---------- Fans ----------
+
+    def fan_list(self) -> dict[str, Any]:
+        items = self.get_all_items()
+        fans: list[dict[str, Any]] = []
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+            if str(i.get("proxy") or "").lower() != "fan":
+                continue
+            fans.append(
+                {
+                    "device_id": int(i.get("id")),
+                    "name": i.get("name"),
+                    "room_id": i.get("roomId") or i.get("parentId"),
+                    "room_name": i.get("roomName"),
+                    "control": i.get("control"),
+                    "proxy": i.get("proxy"),
+                    "protocolFilename": i.get("protocolFilename"),
+                }
+            )
+        fans.sort(key=lambda d: (str(d.get("room_name") or ""), str(d.get("name") or "")))
+        return {"ok": True, "count": len(fans), "fans": fans}
+
+    async def _fan_get_state_async(self, device_id: int) -> dict[str, Any]:
+        device_id = int(device_id)
+        fetched = await self._fetch_item_variables_list_async(device_id)
+        var_list: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+        vmap = self._vars_to_map(var_list)
+
+        is_on = self._coerce_bool(vmap.get("IS_ON"))
+        current_speed = vmap.get("CURRENT_SPEED")
+        fan_speed = vmap.get("FAN_SPEED")
+
+        def _as_int(v: Any) -> int | None:
+            if isinstance(v, bool) or v is None:
+                return None
+            try:
+                return int(str(v).strip())
+            except Exception:
+                return None
+
+        speed = _as_int(current_speed)
+        if speed is None:
+            speed = _as_int(fan_speed)
+
+        return {
+            "ok": bool(fetched.get("ok")),
+            "device_id": device_id,
+            "is_on": is_on,
+            "speed": speed,
+            "variables": var_list,
+            "source": fetched.get("source"),
+        }
+
+    def fan_get_state(self, device_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._fan_get_state_async(int(device_id)), timeout_s=12)
+
+    @staticmethod
+    def _fan_speed_to_int(speed: Any) -> int | None:
+        if speed is None:
+            return None
+        if isinstance(speed, bool):
+            return None
+        if isinstance(speed, (int, float)):
+            return int(speed)
+        s = str(speed).strip().lower()
+        if s in {"0", "off", "stop"}:
+            return 0
+        if s in {"1", "low"}:
+            return 1
+        if s in {"2", "med", "medium"}:
+            return 2
+        if s in {"3", "medhigh", "mediumhigh", "medium high"}:
+            return 3
+        if s in {"4", "high"}:
+            return 4
+        if s.isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return None
+        return None
+
+    def fan_set_speed(self, device_id: int, speed: Any, confirm_timeout_s: float = 4.0, dry_run: bool = False) -> dict[str, Any]:
+        device_id = int(device_id)
+        speed_i = self._fan_speed_to_int(speed)
+        if speed_i is None or speed_i < 0 or speed_i > 4:
+            return {"ok": False, "device_id": device_id, "error": "speed must be 0-4 or one of: off, low, medium, medium high, high"}
+
+        async def _run():
+            before = await self._fan_get_state_async(device_id)
+            if bool(dry_run):
+                return {
+                    "ok": True,
+                    "device_id": device_id,
+                    "speed": speed_i,
+                    "dry_run": True,
+                    "planned": {"command": "SET_SPEED", "params": {"SPEED": speed_i}},
+                    "before": before,
+                }
+            exec_result = await self._item_send_command_async(device_id, "SET_SPEED", {"SPEED": speed_i})
+            accepted = bool(exec_result.get("ok"))
+
+            confirmed = False
+            after = None
+            deadline = time.time() + float(confirm_timeout_s)
+            while time.time() < deadline:
+                after = await self._fan_get_state_async(device_id)
+                if after.get("speed") == speed_i:
+                    confirmed = True
+                    break
+                await asyncio.sleep(0.25)
+
+            return {
+                "ok": accepted,
+                "device_id": device_id,
+                "speed": speed_i,
+                "accepted": accepted,
+                "confirmed": confirmed,
+                "before": before,
+                "after": after,
+                "execute": exec_result,
+            }
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 12.0)
+
+    def fan_set_power(self, device_id: int, power: str, confirm_timeout_s: float = 4.0, dry_run: bool = False) -> dict[str, Any]:
+        device_id = int(device_id)
+        p = str(power or "").strip().lower()
+        if p not in {"on", "off", "toggle"}:
+            return {"ok": False, "device_id": device_id, "error": "power must be one of: on, off, toggle"}
+        cmd = {"on": "ON", "off": "OFF", "toggle": "TOGGLE"}[p]
+
+        async def _run():
+            before = await self._fan_get_state_async(device_id)
+            if bool(dry_run):
+                return {
+                    "ok": True,
+                    "device_id": device_id,
+                    "power": p,
+                    "dry_run": True,
+                    "planned": {"command": cmd, "params": {}},
+                    "before": before,
+                }
+            exec_result = await self._item_send_command_async(device_id, cmd, {})
+            accepted = bool(exec_result.get("ok"))
+
+            confirmed = False
+            after = None
+            deadline = time.time() + float(confirm_timeout_s)
+            while time.time() < deadline:
+                after = await self._fan_get_state_async(device_id)
+                if p == "on" and after.get("is_on") is True:
+                    confirmed = True
+                    break
+                if p == "off" and after.get("is_on") is False:
+                    confirmed = True
+                    break
+                if p == "toggle" and after.get("is_on") in (True, False) and after.get("is_on") != before.get("is_on"):
+                    confirmed = True
+                    break
+                await asyncio.sleep(0.25)
+
+            return {
+                "ok": accepted,
+                "device_id": device_id,
+                "power": p,
+                "accepted": accepted,
+                "confirmed": confirmed,
+                "before": before,
+                "after": after,
+                "execute": exec_result,
+            }
+
+        return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 12.0)
+
+    # ---------- Motion sensors (best-effort; mostly ContactState-based) ----------
+
+    def motion_list(self) -> dict[str, Any]:
+        items = self.get_all_items()
+        out: list[dict[str, Any]] = []
+        wanted = {"contactsingle_motionsensor", "cardaccess_wirelesspir", "control4_wirelesspir"}
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+            proxy = str(i.get("proxy") or "").lower()
+            if proxy not in wanted:
+                continue
+            out.append(
+                {
+                    "device_id": int(i.get("id")),
+                    "name": i.get("name"),
+                    "room_id": i.get("roomId") or i.get("parentId"),
+                    "room_name": i.get("roomName"),
+                    "control": i.get("control"),
+                    "proxy": i.get("proxy"),
+                    "protocolFilename": i.get("protocolFilename"),
+                }
+            )
+        out.sort(key=lambda d: (str(d.get("room_name") or ""), str(d.get("name") or "")))
+        return {"ok": True, "count": len(out), "motions": out}
+
+    def motion_get_state(self, device_id: int, timeout_s: float = 6.0) -> dict[str, Any]:
+        base = self.contact_get_state(int(device_id), timeout_s=float(timeout_s))
+        state = base.get("state")
+        kind = base.get("state_kind")
+        motion = None
+        if kind in {"motion", "contact"} and state in (True, False):
+            motion = bool(state)
+        base["motion_detected"] = motion
+        return base
+
+    # ---------- Intercom (best-effort) ----------
+
+    def intercom_list(self) -> dict[str, Any]:
+        items = self.get_all_items()
+        out: list[dict[str, Any]] = []
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+            if "intercom" not in str(i.get("proxy") or "").lower():
+                continue
+            out.append(
+                {
+                    "device_id": int(i.get("id")),
+                    "name": i.get("name"),
+                    "room_id": i.get("roomId") or i.get("parentId"),
+                    "room_name": i.get("roomName"),
+                    "control": i.get("control"),
+                    "proxy": i.get("proxy"),
+                    "protocolFilename": i.get("protocolFilename"),
+                }
+            )
+        out.sort(key=lambda d: (str(d.get("room_name") or ""), str(d.get("name") or "")))
+        return {"ok": True, "count": len(out), "intercoms": out}
+
+    def intercom_touchscreen_set_feature(
+        self,
+        device_id: int,
+        feature: str,
+        enabled: bool,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        feat = str(feature or "").strip().lower()
+        if feat not in {"autobrightness", "proximity", "alexa"}:
+            return {"ok": False, "device_id": device_id, "error": "feature must be one of: autobrightness, proximity, alexa"}
+
+        prefix = {
+            "autobrightness": "SET_AUTOBRIGHTNESS_ENABLED",
+            "proximity": "SET_PROXIMITY_SENSOR_ENABLED",
+            "alexa": "SET_ALEXA_ENABLED",
+        }[feat]
+        cmd = f"{prefix}:{'True' if bool(enabled) else 'False'}"
+
+        async def _run():
+            if bool(dry_run):
+                return {"ok": True, "device_id": device_id, "feature": feat, "enabled": bool(enabled), "dry_run": True, "planned": {"command": cmd, "params": {}}}
+            r = await self._item_send_command_async(device_id, cmd, {})
+            return {"ok": bool(r.get("ok")), "device_id": device_id, "feature": feat, "enabled": bool(enabled), "execute": r}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def intercom_touchscreen_screensaver(
+        self,
+        device_id: int,
+        action: str | None = None,
+        mode: str | None = None,
+        start_time_s: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        act = str(action or "").strip().lower() if action is not None else ""
+        if act and act not in {"enter", "exit"}:
+            return {"ok": False, "device_id": device_id, "error": "action must be enter/exit (or omitted)"}
+
+        planned: list[dict[str, Any]] = []
+        if mode is not None:
+            mode_s = str(mode or "").strip()
+            if not mode_s:
+                return {"ok": False, "device_id": device_id, "error": "mode was provided but empty"}
+            planned.append({"command": "SET_SCREENSAVER_MODE", "params": {"MODE": mode_s}})
+        if start_time_s is not None:
+            try:
+                t = int(start_time_s)
+            except Exception:
+                return {"ok": False, "device_id": device_id, "error": "start_time_s must be an integer"}
+            planned.append({"command": "SET_SCREENSAVER_START_TIME", "params": {"TIME": str(t)}})
+        if act:
+            planned.append({"command": "SCREENSAVER_ENTER" if act == "enter" else "SCREENSAVER_EXIT", "params": {}})
+        if not planned:
+            return {"ok": False, "device_id": device_id, "error": "No screensaver operation specified"}
+
+        async def _run():
+            if bool(dry_run):
+                return {"ok": True, "device_id": device_id, "dry_run": True, "planned": planned}
+
+            attempts: list[dict[str, Any]] = []
+            ok = True
+            for step in planned:
+                r = await self._item_send_command_async(device_id, str(step.get("command") or ""), step.get("params") or {})
+                attempts.append({"step": step, "execute": r})
+                if not r.get("ok"):
+                    ok = False
+                    break
+            return {"ok": ok, "device_id": device_id, "attempts": attempts}
+
+        return self._loop_thread.run(_run(), timeout_s=18)
+
+    def intercom_doorstation_set_led(self, device_id: int, enabled: bool, dry_run: bool = False) -> dict[str, Any]:
+        device_id = int(device_id)
+        cmd = "Enable LED Indicator" if bool(enabled) else "Disable LED Indicator"
+
+        async def _run():
+            if bool(dry_run):
+                return {"ok": True, "device_id": device_id, "led_enabled": bool(enabled), "dry_run": True, "planned": {"command": cmd, "params": {}}}
+            r = await self._item_send_command_preserve_async(device_id, cmd, {})
+            return {"ok": bool(r.get("ok")), "device_id": device_id, "led_enabled": bool(enabled), "execute": r}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def intercom_doorstation_set_external_chime(self, device_id: int, enabled: bool, dry_run: bool = False) -> dict[str, Any]:
+        device_id = int(device_id)
+        cmd = "Enable External Chime" if bool(enabled) else "Disable External Chime"
+
+        async def _run():
+            if bool(dry_run):
+                return {"ok": True, "device_id": device_id, "external_chime_enabled": bool(enabled), "dry_run": True, "planned": {"command": cmd, "params": {}}}
+            r = await self._item_send_command_preserve_async(device_id, cmd, {})
+            return {"ok": bool(r.get("ok")), "device_id": device_id, "external_chime_enabled": bool(enabled), "execute": r}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def intercom_doorstation_set_raw_setting(self, device_id: int, key: str, value: str, dry_run: bool = False) -> dict[str, Any]:
+        device_id = int(device_id)
+        key_s = str(key or "").strip()
+        value_s = str(value or "").strip()
+        if not key_s:
+            return {"ok": False, "device_id": device_id, "error": "key is required"}
+
+        cmd = "Set Raw Settings"
+        params = {"Key": key_s, "Value": value_s}
+
+        async def _run():
+            if bool(dry_run):
+                return {"ok": True, "device_id": device_id, "dry_run": True, "planned": {"command": cmd, "params": params}}
+            r = await self._item_send_command_preserve_async(device_id, cmd, params)
+            return {"ok": bool(r.get("ok")), "device_id": device_id, "execute": r}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    # ---------- Macros agent ----------
+
+    def macro_list(self) -> dict[str, Any]:
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/macros")
+            payload = http.get("json")
+            macros = payload if isinstance(payload, list) else []
+            macros_norm = [m for m in macros if isinstance(m, dict)]
+            macros_norm.sort(key=lambda m: (str(m.get("name") or ""), int(m.get("id") or 0)))
+            return {"ok": bool(http.get("ok")), "count": len(macros_norm), "macros": macros_norm, "http": http}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def macro_list_commands(self) -> dict[str, Any]:
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/macros/commands")
+            payload = http.get("json")
+            cmds = payload if isinstance(payload, list) else (payload.get("commands") if isinstance(payload, dict) else [])
+            cmds_norm = [c for c in (cmds or []) if isinstance(c, dict)]
+            return {"ok": bool(http.get("ok")), "count": len(cmds_norm), "commands": cmds_norm, "http": http}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def macro_execute(self, macro_id: int, dry_run: bool = False) -> dict[str, Any]:
+        mid = int(macro_id)
+
+        async def _run():
+            planned = {"agent": "macros", "command": "EXECUTE_MACRO", "params": {"id": mid}}
+            if bool(dry_run):
+                return {"ok": True, "macro_id": mid, "dry_run": True, "planned": planned}
+            r = await self._agent_send_command_async("macros", "EXECUTE_MACRO", {"id": mid})
+            return {"ok": bool(r.get("ok")), "macro_id": mid, "execute": r}
+
+        return self._loop_thread.run(_run(), timeout_s=18)
+
+    def macro_execute_by_name(self, name: str, dry_run: bool = False) -> dict[str, Any]:
+        """Execute a macro by its configured name.
+
+        Safety behavior:
+        - Match is case-insensitive exact equality after trimming.
+        - If 0 matches or >1 matches, do not execute.
+        """
+
+        needle = str(name or "").strip()
+        if not needle:
+            return {"ok": False, "error": "name is required"}
+
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/macros")
+            payload = http.get("json")
+            macros = payload if isinstance(payload, list) else []
+            macros_norm = [m for m in macros if isinstance(m, dict)]
+
+            needle_l = needle.lower()
+            exact = [m for m in macros_norm if str(m.get("name") or "").strip().lower() == needle_l]
+
+            if len(exact) == 0:
+                contains = [
+                    {"id": m.get("id"), "name": m.get("name")}
+                    for m in macros_norm
+                    if needle_l in str(m.get("name") or "").strip().lower()
+                ]
+                contains = contains[:10]
+                return {
+                    "ok": False,
+                    "name": needle,
+                    "error": "No macro matched name (exact match required)",
+                    "suggestions": contains,
+                    "http": http,
+                }
+
+            if len(exact) > 1:
+                return {
+                    "ok": False,
+                    "name": needle,
+                    "error": "Macro name is ambiguous (multiple exact matches)",
+                    "matches": [{"id": m.get("id"), "name": m.get("name")} for m in exact],
+                    "http": http,
+                }
+
+            mid = int(exact[0].get("id") or 0)
+            if mid <= 0:
+                return {"ok": False, "name": needle, "error": "Matched macro had invalid id", "match": exact[0]}
+
+            planned = {"agent": "macros", "command": "EXECUTE_MACRO", "params": {"id": mid}}
+            if bool(dry_run):
+                return {"ok": True, "name": needle, "macro_id": mid, "dry_run": True, "planned": planned}
+
+            r = await self._agent_send_command_async("macros", "EXECUTE_MACRO", {"id": mid})
+            return {"ok": bool(r.get("ok")), "name": needle, "macro_id": mid, "execute": r}
+
+        return self._loop_thread.run(_run(), timeout_s=18)
+
+    # ---------- Scheduler agent ----------
+
+    def scheduler_list(self, search: str | None = None) -> dict[str, Any]:
+        needle = str(search or "").strip().lower()
+
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/scheduler")
+            payload = http.get("json")
+            events = payload if isinstance(payload, list) else []
+            events_norm = [e for e in events if isinstance(e, dict)]
+
+            if needle:
+                def _hay(row: dict[str, Any]) -> str:
+                    return " ".join(
+                        [
+                            str(row.get("display") or ""),
+                            str(row.get("category") or ""),
+                            str(row.get("eventId") or ""),
+                        ]
+                    ).lower()
+
+                events_norm = [e for e in events_norm if needle in _hay(e)]
+
+            events_norm.sort(key=lambda e: (str(e.get("display") or ""), int(e.get("eventId") or 0)))
+            return {
+                "ok": bool(http.get("ok")),
+                "count": len(events_norm),
+                "search": (str(search) if search is not None else None),
+                "events": events_norm,
+                "http": http,
+            }
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def scheduler_get(self, event_id: int) -> dict[str, Any]:
+        eid = int(event_id)
+        if eid <= 0:
+            return {"ok": False, "error": "event_id must be a positive integer"}
+
+        async def _run():
+            http = await self._director_http_get(f"/api/v1/agents/scheduler/{eid}")
+            payload = http.get("json")
+            event = payload if isinstance(payload, dict) else None
+            return {"ok": bool(http.get("ok")), "event_id": eid, "event": event, "http": http}
+
+        return self._loop_thread.run(_run(), timeout_s=18)
+
+    def scheduler_list_commands(self) -> dict[str, Any]:
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/scheduler/commands")
+            payload = http.get("json")
+            cmds = payload if isinstance(payload, list) else (payload.get("commands") if isinstance(payload, dict) else [])
+            cmds_norm = [c for c in (cmds or []) if isinstance(c, dict)]
+            return {"ok": bool(http.get("ok")), "count": len(cmds_norm), "commands": cmds_norm, "http": http}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def scheduler_set_enabled(self, event_id: int, enabled: bool, dry_run: bool = False) -> dict[str, Any]:
+        eid = int(event_id)
+        if eid <= 0:
+            return {"ok": False, "error": "event_id must be a positive integer"}
+
+        desired = bool(enabled)
+
+        async def _run():
+            before_http = await self._director_http_get(f"/api/v1/agents/scheduler/{eid}")
+            before = before_http.get("json") if isinstance(before_http.get("json"), dict) else None
+
+            # Some Director builds appear to be finicky about scheduler writes: certain payload shapes return
+            # server-side errors like "Timeout Modifying Scheduled Event". We try a small matrix of
+            # method/path/payload options and always confirm by rereading.
+
+            enabled_int = int(desired)
+
+            # Minimal payloads (what we'd expect to work)
+            payload_min = {"eventid": eid, "enabled": enabled_int}
+
+            # Full event payload (best-effort) - some builds accept this even when minimal updates fail.
+            payload_full: dict[str, Any]
+            if isinstance(before, dict):
+                payload_full = dict(before)
+                payload_full["enabled"] = bool(desired)
+            else:
+                payload_full = dict(payload_min)
+
+            planned_attempts = [
+                # Preferred: try id-specific endpoints first.
+                {"method": "PUT", "path": f"/api/v1/agents/scheduler/{eid}", "payload": payload_min},
+                {"method": "PUT", "path": f"/api/v1/agents/scheduler/events/{eid}", "payload": payload_min},
+                {"method": "POST", "path": f"/api/v1/agents/scheduler/{eid}", "payload": payload_min},
+                {"method": "POST", "path": f"/api/v1/agents/scheduler/events/{eid}", "payload": payload_min},
+                {"method": "POST", "path": "/api/v1/agents/scheduler/events", "payload": payload_min},
+                # Fallback: try full payload variants.
+                {"method": "POST", "path": f"/api/v1/agents/scheduler/{eid}", "payload": payload_full},
+                {"method": "POST", "path": "/api/v1/agents/scheduler/events", "payload": payload_full},
+            ]
+
+            if bool(dry_run):
+                return {
+                    "ok": True,
+                    "event_id": eid,
+                    "enabled": desired,
+                    "dry_run": True,
+                    "planned": planned_attempts,
+                    "before": before,
+                    "before_http": before_http,
+                }
+
+            attempts: list[dict[str, Any]] = []
+            accepted = False
+            last: dict[str, Any] | None = None
+            after_http: dict[str, Any] | None = None
+            after: dict[str, Any] | None = None
+            confirmed = False
+
+            for plan in planned_attempts:
+                method = str(plan.get("method") or "POST")
+                path = str(plan.get("path") or "")
+                payload = plan.get("payload") if isinstance(plan.get("payload"), dict) else {}
+
+                # Scheduler writes can be slow; allow a slightly longer client timeout. Note this does not
+                # fix server-side timeouts returned as 400 errors.
+                r = await self._director_http_request_https_only(method, path, payload, timeout_s=20.0)
+                attempts.append({"method": method, "path": path, "payload": payload, "http": r})
+                last = r
+
+                if r.get("ok"):
+                    accepted = True
+
+                    # Re-read after each successful attempt; some endpoints return 200 but do nothing.
+                    after_http = await self._director_http_get(f"/api/v1/agents/scheduler/{eid}")
+                    after = after_http.get("json") if isinstance(after_http.get("json"), dict) else None
+                    after_enabled = after.get("enabled") if isinstance(after, dict) else None
+                    confirmed = (after_enabled is True and desired is True) or (after_enabled is False and desired is False)
+                    if confirmed:
+                        break
+
+            if after_http is None:
+                after_http = await self._director_http_get(f"/api/v1/agents/scheduler/{eid}")
+                after = after_http.get("json") if isinstance(after_http.get("json"), dict) else None
+
+            return {
+                "ok": bool(accepted),
+                "event_id": eid,
+                "enabled": desired,
+                "accepted": bool(accepted),
+                "confirmed": bool(confirmed),
+                "warning": (
+                    "Write attempt returned success but enabled state did not change (check attempts + confirmed)"
+                    if bool(accepted) and not bool(confirmed)
+                    else None
+                ),
+                "before": before,
+                "after": after,
+                "attempts": attempts,
+                "last": last,
+            }
+
+        return self._loop_thread.run(_run(), timeout_s=35)
+
+    # ---------- Announcements agent ----------
+
+    def announcement_list(self) -> dict[str, Any]:
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/announcements")
+            payload = http.get("json")
+            ann = payload if isinstance(payload, list) else []
+            ann_norm = [a for a in ann if isinstance(a, dict)]
+            ann_norm.sort(key=lambda a: (str(a.get("name") or ""), int(a.get("id") or 0)))
+            return {"ok": bool(http.get("ok")), "count": len(ann_norm), "announcements": ann_norm, "http": http}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def announcement_list_commands(self) -> dict[str, Any]:
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/announcements/commands")
+            payload = http.get("json")
+            cmds = payload if isinstance(payload, list) else (payload.get("commands") if isinstance(payload, dict) else [])
+            cmds_norm = [c for c in (cmds or []) if isinstance(c, dict)]
+            return {"ok": bool(http.get("ok")), "count": len(cmds_norm), "commands": cmds_norm, "http": http}
+
+        return self._loop_thread.run(_run(), timeout_s=12)
+
+    def announcement_execute(self, announcement_id: int, dry_run: bool = False) -> dict[str, Any]:
+        aid = int(announcement_id)
+
+        async def _run():
+            planned = {"agent": "announcements", "command": "execute_announcement", "params": {"id": aid}}
+            if bool(dry_run):
+                return {"ok": True, "announcement_id": aid, "dry_run": True, "planned": planned}
+            r = await self._agent_send_command_async("announcements", "execute_announcement", {"id": aid})
+            return {"ok": bool(r.get("ok")), "announcement_id": aid, "execute": r}
+
+        return self._loop_thread.run(_run(), timeout_s=18)
+
+    def announcement_execute_by_name(self, name: str, dry_run: bool = False) -> dict[str, Any]:
+        """Execute an announcement by its configured name.
+
+        Safety behavior:
+        - Match is case-insensitive exact equality after trimming.
+        - If 0 matches or >1 matches, do not execute.
+        """
+
+        needle = str(name or "").strip()
+        if not needle:
+            return {"ok": False, "error": "name is required"}
+
+        async def _run():
+            http = await self._director_http_get("/api/v1/agents/announcements")
+            payload = http.get("json")
+            ann = payload if isinstance(payload, list) else []
+            ann_norm = [a for a in ann if isinstance(a, dict)]
+
+            needle_l = needle.lower()
+            exact = [a for a in ann_norm if str(a.get("name") or "").strip().lower() == needle_l]
+
+            if len(exact) == 0:
+                # Provide suggestions but do not attempt fuzzy execution.
+                contains = [
+                    {"id": a.get("id"), "name": a.get("name")}
+                    for a in ann_norm
+                    if needle_l in str(a.get("name") or "").strip().lower()
+                ]
+                contains = contains[:10]
+                return {
+                    "ok": False,
+                    "name": needle,
+                    "error": "No announcement matched name (exact match required)",
+                    "suggestions": contains,
+                    "http": http,
+                }
+
+            if len(exact) > 1:
+                return {
+                    "ok": False,
+                    "name": needle,
+                    "error": "Announcement name is ambiguous (multiple exact matches)",
+                    "matches": [{"id": a.get("id"), "name": a.get("name")} for a in exact],
+                    "http": http,
+                }
+
+            aid = int(exact[0].get("id") or 0)
+            if aid <= 0:
+                return {"ok": False, "name": needle, "error": "Matched announcement had invalid id", "match": exact[0]}
+
+            planned = {"agent": "announcements", "command": "execute_announcement", "params": {"id": aid}}
+            if bool(dry_run):
+                return {
+                    "ok": True,
+                    "name": needle,
+                    "announcement_id": aid,
+                    "dry_run": True,
+                    "planned": planned,
+                }
+
+            r = await self._agent_send_command_async("announcements", "execute_announcement", {"id": aid})
+            return {
+                "ok": bool(r.get("ok")),
+                "name": needle,
+                "announcement_id": aid,
+                "execute": r,
+            }
+
+        return self._loop_thread.run(_run(), timeout_s=18)
+
+    def contact_get_state(self, device_id: int, timeout_s: float = 6.0) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._contact_get_state_async(int(device_id), timeout_s=float(timeout_s)),
+            timeout_s=float(timeout_s) + 10.0,
+        )
 
     @staticmethod
     def _get_var_value(variables: list[dict[str, Any]], name: str) -> Any:
@@ -2032,6 +3586,13 @@ class Control4Gateway:
 
             primary_id = int(media_players[0].get("id")) if media_players else int(input_id)
 
+            # Prefer a stable variable source for CURRENT_APP(_ID) polling.
+            # Some proxies (notably legacy/placeholder media_service entries) may not reliably update
+            # these variables even when LaunchApp succeeds.
+            state_candidates = [r for r in group if str(r.get("proxy") or "").lower() == "media_service" and "roku" in str(r.get("protocolFilename") or "").lower()]
+            state_candidates.sort(key=lambda r: (int(r.get("proxyOrder") or 9999), int(r.get("id") or 0)))
+            state_device_id = int(state_candidates[0].get("id")) if state_candidates else int(primary_id)
+
             # Build a stable target list; keep unique order.
             targets: list[int] = []
             for candidate in [
@@ -2049,6 +3610,7 @@ class Control4Gateway:
                 "input_device_id": int(input_id),
                 "protocol_id": protocol_id_i,
                 "primary_device_id": primary_id,
+                "state_device_id": state_device_id,
                 "room_id": room_id_i if room_id_i != -1 else None,
                 "protocolFilename": protocol_filename,
                 "protocolName": protocol_name,
@@ -2135,9 +3697,11 @@ class Control4Gateway:
         # For Roku, broadcast LaunchApp across the protocol group until the Roku reports the expected app.
         if profile == "roku":
             routing = routing_hint
-            protocol_id = routing.get("protocol_id")
-            if isinstance(protocol_id, int):
-                before = await _roku_current_app(protocol_id)
+            poll_id = routing.get("state_device_id")
+            if not isinstance(poll_id, int):
+                poll_id = routing.get("protocol_id")
+            if isinstance(poll_id, int):
+                before = await _roku_current_app(poll_id)
             else:
                 before = None
 
@@ -2151,14 +3715,14 @@ class Control4Gateway:
                 uri = f"/api/v1/items/{target_i}/commands"
                 exec_result = await self._send_post_via_director(director, uri, "LaunchApp", {"App": app_param}, async_variable=False)
                 attempts.append({"target_device_id": target_i, "execute": exec_result})
-                if isinstance(protocol_id, int) and expected_roku_app_id is not None:
+                if isinstance(poll_id, int) and expected_roku_app_id is not None:
                     await asyncio.sleep(0.6)
-                    snap = await _roku_current_app(protocol_id)
+                    snap = await _roku_current_app(poll_id)
                     attempts[-1]["roku_after"] = snap
                     if isinstance(snap, dict) and snap.get("CURRENT_APP_ID_INT") == expected_roku_app_id:
                         break
 
-            after = await (_roku_current_app(protocol_id) if isinstance(protocol_id, int) else asyncio.sleep(0) or None)
+            after = await (_roku_current_app(poll_id) if isinstance(poll_id, int) else asyncio.sleep(0) or None)
 
             ok = False
             if isinstance(after, dict) and expected_roku_app_id is not None:
