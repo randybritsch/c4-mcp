@@ -779,6 +779,49 @@ class Control4Gateway:
             "source": "director.http.get",
         }
 
+    async def _room_list_video_devices_async(self, room_id: int) -> dict[str, Any]:
+        room_id = int(room_id)
+        http = await self._director_http_get(f"/api/v1/locations/rooms/{room_id}/video_devices")
+        if not http.get("ok"):
+            return {
+                "ok": False,
+                "room_id": room_id,
+                "error": "failed to fetch room video devices",
+                "http": http,
+                "devices": [],
+            }
+
+        payload = http.get("json")
+        devices: list[Any] = []
+        if isinstance(payload, list):
+            devices = payload
+        elif isinstance(payload, dict):
+            # Observed shape: {"visible": [...], "hidden": [...]}
+            if isinstance(payload.get("visible"), list) or isinstance(payload.get("hidden"), list):
+                visible = payload.get("visible") if isinstance(payload.get("visible"), list) else []
+                hidden = payload.get("hidden") if isinstance(payload.get("hidden"), list) else []
+                devices = [*visible, *hidden]
+            else:
+                maybe = payload.get("devices")
+                if isinstance(maybe, list):
+                    devices = maybe
+
+        normalized = [d for d in devices if isinstance(d, dict)]
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "count": len(normalized),
+            "devices": normalized,
+            "source": "director.http.get",
+        }
+
+    async def _room_watch_status_async(self, room_id: int) -> dict[str, Any]:
+        room_id = int(room_id)
+        watch = await self._ui_watch_status_async(room_id)
+        if not isinstance(watch, dict):
+            return {"ok": False, "room_id": room_id, "error": "watch status not available"}
+        return {"ok": True, "room_id": room_id, "watch": watch}
+
     async def _room_select_video_device_async(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
         room_id = int(room_id)
         device_id = int(device_id)
@@ -1115,6 +1158,12 @@ class Control4Gateway:
             self._room_list_commands_async(int(room_id), (str(search) if search is not None else None)),
             timeout_s=15,
         )
+
+    def room_list_video_devices(self, room_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._room_list_video_devices_async(int(room_id)), timeout_s=15)
+
+    def room_watch_status(self, room_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._room_watch_status_async(int(room_id)), timeout_s=12)
 
     def room_select_video_device(self, room_id: int, device_id: int, deselect: bool = False) -> dict[str, Any]:
         return self._loop_thread.run(

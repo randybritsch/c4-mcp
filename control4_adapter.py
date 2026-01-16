@@ -123,6 +123,14 @@ def room_list_commands(room_id: int, search: str | None = None) -> Json:
     return gateway.room_list_commands(int(room_id), (str(search) if search is not None else None))  # type: ignore[misc]
 
 
+def room_list_video_devices(room_id: int) -> Json:
+    return gateway.room_list_video_devices(int(room_id))  # type: ignore[misc]
+
+
+def room_watch_status(room_id: int) -> Json:
+    return gateway.room_watch_status(int(room_id))  # type: ignore[misc]
+
+
 def capabilities_report(top_n: int = 20, include_examples: bool = False, max_examples_per_bucket: int = 3) -> Json:
     return gateway.capabilities_report(int(top_n), bool(include_examples), int(max_examples_per_bucket))  # type: ignore[misc]
 

@@ -32,7 +32,7 @@ Expose Control4 home automation as stable local MCP tools, optimized for fast â€
 	- Confirmation is best-effort and time-bounded, but now uses multiple signals (brightness + `LIGHT_STATE` when present) and returns richer diagnostics in `execute`: `confirm_reason`, `observed_state`, `confirm_trace`, and optional `confirm_fallback`.
 - **Scenes (fast path)**: `c4_scene_set_state_by_name` (SetState On/Off + best-effort confirm).
 - **Media**: `c4_media_watch_launch_app`, `c4_media_watch_launch_app_by_name`, `c4_media_remote(_sequence)`, `c4_media_roku_list_apps`.
-- **Locks/thermostats**: `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`; `c4_thermostat_get_state`, `c4_thermostat_set_target_f`.
+- **Locks/thermostats**: `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`, `c4_lock_set_by_name`; `c4_thermostat_get_state`, `c4_thermostat_set_target_f`.
 - **Debug/inspection**: `c4_item_variables`, `c4_item_commands`, `c4_item_bindings`, `c4_debug_trace_command`.
 
 ## **6) Coding conventions (must-follow rules)**

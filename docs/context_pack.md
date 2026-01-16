@@ -54,6 +54,10 @@ Keep tool names and signatures stable; add new tools instead of changing old one
 - `c4_macro_execute_by_name`
 - `c4_scheduler_set_enabled` (best-effort; always re-read to confirm)
 
+**Locks**
+
+- `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`, `c4_lock_set_by_name`
+
 **Media (Roku watch+launch)**
 
 - `c4_room_select_video_device`, `c4_media_watch_launch_app`, `c4_media_watch_launch_app_by_name`, `c4_media_roku_list_apps`

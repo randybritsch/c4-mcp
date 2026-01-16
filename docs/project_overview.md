@@ -216,6 +216,7 @@ Control4 Director
 * `c4_lock_get_state`
 * `c4_lock_unlock`
 * `c4_lock_lock`
+* `c4_lock_set_by_name(lock_name, state, room_name|room_id, ...)` (resolve + lock/unlock)
 
 **Macros / Scheduler / Announcements**
 

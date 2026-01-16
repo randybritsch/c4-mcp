@@ -194,6 +194,35 @@ def _auto_select_roku_id(base_url: str, timeout_s: float, headers: Dict[str, str
     return None
 
 
+def _auto_select_lock_name(base_url: str, timeout_s: float, headers: Dict[str, str]) -> Optional[str]:
+    devices_payload = _unwrap_call_payload(
+        mcp_call(
+            base_url,
+            kind="tool",
+            name="c4_list_devices",
+            args={"category": "locks"},
+            timeout_s=timeout_s,
+            headers=headers,
+        )
+    )
+    devices = devices_payload.get("devices") if isinstance(devices_payload, dict) else None
+    if not isinstance(devices, list) or not devices:
+        return None
+
+    # Prefer a 'real' lock proxy if present; otherwise fall back to the first.
+    preferred: Optional[dict[str, Any]] = None
+    for d in devices:
+        if not isinstance(d, dict):
+            continue
+        if str(d.get("control") or "").lower() == "lock":
+            preferred = d
+            break
+
+    chosen = preferred or (devices[0] if isinstance(devices[0], dict) else None)
+    name = (chosen or {}).get("name") if isinstance(chosen, dict) else None
+    return str(name) if name else None
+
+
 def _validate_thermostat(
     base_url: str,
     thermostat_id: str,
@@ -583,6 +612,12 @@ def main() -> int:
         ),
     )
     p.add_argument("--lock-id", type=str, default=None, help="Lock device_id to validate")
+    p.add_argument("--lock-name", type=str, default=None, help="Lock name to validate via c4_lock_set_by_name")
+    p.add_argument(
+        "--auto-lock",
+        action="store_true",
+        help="Auto-select a lock name from c4_list_devices(locks) for by-name validation",
+    )
     p.add_argument("--media-id", type=str, default=None, help="Media/AV device_id to validate")
     p.add_argument(
         "--auto-media",
@@ -899,6 +934,33 @@ def main() -> int:
                 print(f"WARN: failed to restore light {lid}: {e}")
 
     # ---- Locks ----
+    selected_lock_name: str | None = str(args.lock_name) if args.lock_name else None
+    if not selected_lock_name and args.auto_lock:
+        selected_lock_name = _auto_select_lock_name(args.base_url, timeout_s=float(args.timeout), headers=headers)
+        if selected_lock_name:
+            print(f"Auto-selected lock_name={selected_lock_name}")
+        else:
+            print("WARN: --auto-lock requested but no locks returned by c4_list_devices")
+
+    if selected_lock_name:
+        print(f"\n-- Lock by-name validation (lock_name={selected_lock_name}) --")
+        by_name = _unwrap_call_payload(
+            mcp_call(
+                args.base_url,
+                "tool",
+                "c4_lock_set_by_name",
+                {"lock_name": selected_lock_name, "state": "lock", "dry_run": True, "include_candidates": True},
+                float(args.timeout),
+                headers,
+            )
+        )
+        _print_json("c4_lock_set_by_name (dry_run)", by_name)
+        _expect(bool(by_name.get("ok")), "c4_lock_set_by_name did not return ok")
+        _expect(by_name.get("dry_run") is True, "c4_lock_set_by_name did not honor dry_run=true")
+        planned = by_name.get("planned")
+        _expect(isinstance(planned, dict), "c4_lock_set_by_name missing planned")
+        _expect(bool(planned.get("device_id")), "c4_lock_set_by_name planned missing device_id")
+
     if args.lock_id:
         kid = str(args.lock_id)
         st = _unwrap_call_payload(

@@ -76,6 +76,7 @@ from control4_adapter import (
     resolve_room_and_device,
     room_off,
     room_list_commands,
+    room_list_video_devices,
     room_remote,
     room_send_command,
     uibutton_activate,
@@ -87,6 +88,7 @@ from control4_adapter import (
     media_launch_app,
         media_watch_launch_app,
         room_select_video_device,
+        room_watch_status,
     media_roku_list_apps,
     thermostat_get_state,
     thermostat_set_cool_setpoint_f,
@@ -196,6 +198,7 @@ _WRITE_TOOL_NAMES = {
     # Locks
     "c4_lock_lock",
     "c4_lock_unlock",
+    "c4_lock_set_by_name",
     # Thermostat
     "c4_thermostat_set_target_f",
     "c4_thermostat_set_heat_setpoint_f",
@@ -563,6 +566,30 @@ def c4_room_off_tool(room_id: str, confirm_timeout_s: float = 10.0) -> dict:
 )
 def c4_room_list_commands_tool(room_id: str, search: str | None = None) -> dict:
     result = room_list_commands(int(room_id), (str(search) if search is not None else None))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_list_video_devices",
+    description=(
+        "List the selectable video devices (sources) for a room (GET /locations/rooms/{room_id}/video_devices). "
+        "Use these device ids with c4_tv_watch or c4_room_select_video_device."
+    ),
+)
+def c4_room_list_video_devices_tool(room_id: str) -> dict:
+    result = room_list_video_devices(int(room_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_watch_status",
+    description=(
+        "Get best-effort Watch UI status for a room via UI configuration agent. "
+        "Returns active flag and the current configured sources when available."
+    ),
+)
+def c4_room_watch_status_tool(room_id: str) -> dict:
+    result = room_watch_status(int(room_id))
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
@@ -2229,6 +2256,15 @@ def c4_room_lights_set_tool(
 
 # ---- Locks ----
 
+
+def _parse_lock_desired_locked(state: str | None) -> bool | None:
+    s = str(state or "").strip().lower()
+    if s in {"lock", "locked", "on", "true", "1", "yes"}:
+        return True
+    if s in {"unlock", "unlocked", "off", "false", "0", "no"}:
+        return False
+    return None
+
 @Mcp.tool(name="c4_lock_get_state", description="Get current lock state (locked/unlocked) for a Control4 lock.")
 def c4_lock_get_state_tool(device_id: str) -> dict:
     try:
@@ -2269,6 +2305,141 @@ def c4_lock_lock_tool(device_id: str) -> dict:
         return {"ok": False, "device_id": int(device_id), "error": "tool timeout (20s)"}
     except Exception as e:
         return {"ok": False, "device_id": int(device_id), "error": repr(e)}
+
+
+@Mcp.tool(
+    name="c4_lock_set_by_name",
+    description=(
+        "Fast-path: resolve a lock by name (optionally scoped by room) and lock/unlock in one call. "
+        "Returns accepted/confirmed semantics and includes resolution details."
+    ),
+)
+def c4_lock_set_by_name_tool(
+    lock_name: str,
+    state: str,
+    room_name: str | None = None,
+    room_id: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    desired_locked = _parse_lock_desired_locked(state)
+    if desired_locked is None:
+        return {"ok": False, "error": "state must be lock/unlock (locked/unlocked)", "state": state}
+
+    resolved_room_id: int | None = None
+    resolved_room_name: str | None = None
+    rr: dict | None = None
+
+    if room_id is not None and str(room_id).strip():
+        try:
+            resolved_room_id = int(room_id)
+        except Exception:
+            resolved_room_id = None
+    elif room_name is not None and str(room_name).strip():
+        rr = resolve_room(
+            str(room_name),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+        resolved_room_name = str(rr.get("name")) if rr.get("name") is not None else None
+
+    rd = resolve_device(
+        str(lock_name or ""),
+        category="locks",
+        room_id=resolved_room_id,
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
+    if not isinstance(rd, dict) or not rd.get("ok"):
+        return {"ok": False, "error": "could not resolve lock", "details": rd}
+
+    device_id = rd.get("device_id")
+    if device_id is None:
+        return {"ok": False, "error": "resolve_device returned no device_id", "details": rd}
+
+    if resolved_room_id is None and rd.get("room_id") is not None:
+        try:
+            resolved_room_id = int(rd.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+    if resolved_room_name is None and rd.get("room_name") is not None:
+        resolved_room_name = str(rd.get("room_name"))
+
+    planned = {
+        "device_id": str(device_id),
+        "lock_name": str(lock_name),
+        "desired_locked": bool(desired_locked),
+        "state": "locked" if desired_locked else "unlocked",
+        "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+    }
+
+    if bool(dry_run):
+        return {
+            "ok": True,
+            "dry_run": True,
+            "planned": planned,
+            "resolve": rd,
+            "resolve_room": rr,
+            "room_id": planned["room_id"],
+            "room_name": resolved_room_name,
+        }
+
+    try:
+        if desired_locked:
+            fut = _lock_pool.submit(lock_lock, int(device_id))
+            result = fut.result(timeout=20)
+        else:
+            fut = _lock_pool.submit(lock_unlock, int(device_id))
+            result = fut.result(timeout=20)
+
+        if isinstance(result, dict):
+            out = _augment_lock_result(result, desired_locked=bool(desired_locked))
+            out["lock_name"] = str(lock_name)
+            out["resolve"] = rd
+            if rr is not None:
+                out["resolve_room"] = rr
+            out["room_id"] = planned["room_id"]
+            out["room_name"] = resolved_room_name
+            return out
+
+        return {
+            "ok": True,
+            "result": result,
+            "planned": planned,
+            "resolve": rd,
+            "resolve_room": rr,
+            "room_id": planned["room_id"],
+            "room_name": resolved_room_name,
+        }
+    except FutureTimeout:
+        return {
+            "ok": False,
+            "device_id": int(device_id),
+            "error": "tool timeout (20s)",
+            "planned": planned,
+            "resolve": rd,
+            "resolve_room": rr,
+            "room_id": planned["room_id"],
+            "room_name": resolved_room_name,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "device_id": int(device_id),
+            "error": repr(e),
+            "planned": planned,
+            "resolve": rd,
+            "resolve_room": rr,
+            "room_id": planned["room_id"],
+            "room_name": resolved_room_name,
+        }
 
 
 # ✅ In 0.6.1: mount without passing a registry object or Mcp() instance
