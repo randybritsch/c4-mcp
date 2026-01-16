@@ -592,6 +592,97 @@ class Control4Gateway:
 
         return primary
 
+    @staticmethod
+    def _variables_get_value(vars_list: Any, name: str) -> str | None:
+        if not isinstance(vars_list, list):
+            return None
+        target = str(name or "").strip().lower()
+        if not target:
+            return None
+        for row in vars_list:
+            if not isinstance(row, dict):
+                continue
+            n = str(row.get("name") or "").strip().lower()
+            if n != target:
+                continue
+            v = row.get("value")
+            if v is None:
+                return None
+            return str(v)
+        return None
+
+    async def _item_set_state_async(
+        self,
+        device_id: int,
+        state: str,
+        confirm_timeout_s: float = 2.0,
+        poll_interval_s: float = 0.2,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        state_s = str(state or "").strip().lower()
+        if state_s not in {"on", "off"}:
+            return {"ok": False, "device_id": device_id, "error": "state must be 'on' or 'off'"}
+
+        desired = "On" if state_s == "on" else "Off"
+
+        attempts: list[dict[str, Any]] = []
+        for params in ({"State": desired}, {"STATE": desired}):
+            r = await self._item_send_command_async(device_id, "SetState", params)
+            attempts.append({"command": "SetState", "params": params, "result": r})
+            if r.get("ok"):
+                break
+
+        accepted = bool(attempts and isinstance(attempts[-1].get("result"), dict) and attempts[-1]["result"].get("ok"))
+        execute = (attempts[-1].get("result") if attempts else None)
+
+        # Confirmation is best-effort and may not be supported by all drivers.
+        confirm_timeout = max(0.0, float(confirm_timeout_s))
+        if confirm_timeout <= 0:
+            return {
+                "ok": bool(accepted),
+                "device_id": device_id,
+                "desired": desired,
+                "accepted": bool(accepted),
+                "confirmed": False,
+                "confirm_timeout_s": confirm_timeout,
+                "execute": execute,
+                "attempts": attempts,
+            }
+
+        start = asyncio.get_running_loop().time()
+        last_seen: str | None = None
+        while (asyncio.get_running_loop().time() - start) <= confirm_timeout:
+            vars_resp = await self._item_get_variables_async(device_id)
+            if isinstance(vars_resp, dict) and vars_resp.get("ok"):
+                vars_list = vars_resp.get("variables")
+                last_seen = self._variables_get_value(vars_list, "STATE")
+                if last_seen is not None and str(last_seen).strip().lower() == desired.lower():
+                    return {
+                        "ok": True,
+                        "device_id": device_id,
+                        "desired": desired,
+                        "accepted": bool(accepted),
+                        "confirmed": True,
+                        "confirm_timeout_s": confirm_timeout,
+                        "observed": last_seen,
+                        "execute": execute,
+                        "attempts": attempts,
+                    }
+
+            await asyncio.sleep(max(0.1, float(poll_interval_s)))
+
+        return {
+            "ok": bool(accepted),
+            "device_id": device_id,
+            "desired": desired,
+            "accepted": bool(accepted),
+            "confirmed": False,
+            "confirm_timeout_s": confirm_timeout,
+            "observed": last_seen,
+            "execute": execute,
+            "attempts": attempts,
+        }
+
     async def _item_send_command_preserve_async(
         self, device_id: int, command: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -1315,6 +1406,25 @@ class Control4Gateway:
         return self._loop_thread.run(
             self._item_send_command_async(int(device_id), str(command or ""), params),
             timeout_s=12,
+        )
+
+    def item_set_state(
+        self,
+        device_id: int,
+        state: str,
+        confirm_timeout_s: float = 2.0,
+        poll_interval_s: float = 0.2,
+    ) -> dict[str, Any]:
+        # Allow a little extra headroom beyond confirm timeout.
+        timeout_s = 12.0 + max(0.0, float(confirm_timeout_s))
+        return self._loop_thread.run(
+            self._item_set_state_async(
+                int(device_id),
+                str(state or ""),
+                confirm_timeout_s=float(confirm_timeout_s),
+                poll_interval_s=float(poll_interval_s),
+            ),
+            timeout_s=timeout_s,
         )
 
     def debug_trace_command(

@@ -48,6 +48,7 @@ from control4_adapter import (
     item_get_commands,
     item_get_variables,
     item_send_command,
+    item_set_state,
     keypad_button_action,
     keypad_get_buttons,
     keypad_list,
@@ -208,6 +209,7 @@ _WRITE_TOOL_NAMES = {
     "c4_uibutton_activate",
     "c4_scene_activate",
     "c4_scene_activate_by_name",
+    "c4_scene_set_state_by_name",
     # Media
     "c4_media_send_command",
     "c4_media_remote",
@@ -774,6 +776,91 @@ def c4_scene_activate_by_name_tool(
     return {
         "ok": bool(exec_res.get("ok")) if isinstance(exec_res, dict) else True,
         "scene_name": str(scene_name),
+        "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+        "room_name": resolved_room_name,
+        "device_id": str(device_id),
+        "resolve": rd,
+        "execute": exec_res,
+    }
+
+
+@Mcp.tool(
+    name="c4_scene_set_state_by_name",
+    description=(
+        "Fast-path: resolve a scene (UI Button) by name and set its on/off state in a single call. "
+        "This is ideal for devices like 'Space Heater' that expose SetState(State=On|Off). "
+        "Optionally scope the search by room_name. Best-effort confirmation polls the STATE variable."
+    ),
+)
+def c4_scene_set_state_by_name_tool(
+    scene_name: str,
+    state: str,
+    room_name: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    confirm_timeout_s: float = 2.0,
+    dry_run: bool = False,
+) -> dict:
+    state_norm = str(state or "").strip().lower()
+    if state_norm not in {"on", "off"}:
+        return {"ok": False, "error": "state must be 'on' or 'off'"}
+
+    resolved_room_id: int | None = None
+    resolved_room_name: str | None = None
+
+    if room_name is not None and str(room_name).strip():
+        rr = resolve_room(
+            str(room_name),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+        resolved_room_name = str(rr.get("name")) if rr.get("name") is not None else None
+
+    rd = resolve_device(
+        str(scene_name),
+        category="scenes",
+        room_id=resolved_room_id,
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
+    if not isinstance(rd, dict) or not rd.get("ok"):
+        return {"ok": False, "error": "could not resolve scene", "details": rd}
+
+    device_id = rd.get("device_id")
+    if device_id is None:
+        return {"ok": False, "error": "resolve_device returned no device_id", "details": rd}
+
+    planned = {
+        "device_id": str(device_id),
+        "command": "SetState",
+        "params": {"State": ("On" if state_norm == "on" else "Off")},
+        "confirm_timeout_s": float(confirm_timeout_s),
+    }
+
+    if bool(dry_run):
+        return {
+            "ok": True,
+            "scene_name": str(scene_name),
+            "state": str(state),
+            "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+            "room_name": resolved_room_name,
+            "device_id": str(device_id),
+            "resolve": rd,
+            "planned": planned,
+            "dry_run": True,
+        }
+
+    exec_res = item_set_state(int(device_id), state_norm, confirm_timeout_s=float(confirm_timeout_s))
+    return {
+        "ok": bool(exec_res.get("ok")) if isinstance(exec_res, dict) else True,
+        "scene_name": str(scene_name),
+        "state": str(state),
         "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
         "room_name": resolved_room_name,
         "device_id": str(device_id),

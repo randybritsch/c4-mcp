@@ -106,6 +106,15 @@ def item_send_command(device_id: int, command: str, params: Optional[Dict[str, A
     return gateway.item_send_command(int(device_id), str(command or ""), params)
 
 
+def item_set_state(device_id: int, state: str, confirm_timeout_s: float = 2.0, poll_interval_s: float = 0.2) -> Json:
+    return gateway.item_set_state(
+        int(device_id),
+        str(state or ""),
+        confirm_timeout_s=float(confirm_timeout_s),
+        poll_interval_s=float(poll_interval_s),
+    )  # type: ignore[misc]
+
+
 def room_send_command(room_id: int, command: str, params: Optional[Dict[str, Any]] = None) -> Json:
     return gateway.room_send_command(int(room_id), str(command or ""), params)  # type: ignore[misc]
 
