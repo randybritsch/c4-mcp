@@ -44,7 +44,7 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 
 ## Today’s Objectives + Acceptance Criteria
 
-- Media (Basement Roku): c4_media_watch_launch_app(..., room_id=456, app="Netflix"|"Paramount+") returns ok=true and summary_text shows Watch active and CURRENT_APP_ID changing to the expected value.
+- Media (Roku): c4_media_watch_launch_app(..., room_id=<ROOM_ID>, app="Netflix"|"Paramount+") returns ok=true and summary_text shows Watch active and CURRENT_APP_ID changing to the expected value.
 - Room off: room-off command returns accepted=true and the room Watch becomes inactive best-effort.
 - Thermostat safety: c4_thermostat_set_target_f chooses the correct setpoint (heat vs cool) based on mode and confirms when possible; no exceptions due to mode mismatch.
 - Reliability: no MCP tool call hangs; timeouts return structured results.
@@ -73,13 +73,13 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 ```text
 Load context from docs/project_overview.md and docs/context_pack.md.
 
-Goal: run an end-to-end validation of Basement Roku watch+launch and one thermostat write-test with auto-restore.
+Goal: run an end-to-end validation of Roku watch+launch and one thermostat write-test with auto-restore.
 
-Use room_id=456 and Roku-related device ids 2074/2075/2076/2077.
+Use your own ids (discover them via c4_list_rooms / c4_list_devices).
 
 Steps:
-1) Call c4_media_watch_launch_app(device_id=2074, room_id=456, app="Netflix") and report summary_text.
-2) Call c4_media_roku_list_apps(device_id=2075, search="Paramount") then launch Paramount+ via c4_media_watch_launch_app.
+1) Call c4_media_watch_launch_app(device_id=<ROKU_DEVICE_ID>, room_id=<ROOM_ID>, app="Netflix") and report summary_text.
+2) Call c4_media_roku_list_apps(device_id=<ROKU_DEVICE_ID>, search="Paramount") then launch Paramount+ via c4_media_watch_launch_app.
 3) Pick one thermostat, call c4_thermostat_get_state then c4_thermostat_set_target_f(+1F) with confirm, then restore.
 
 Constraints: keep strict layering; no signature changes; add explicit timeouts; report accepted vs confirmed clearly.

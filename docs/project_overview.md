@@ -104,14 +104,14 @@ Control4 Director
 
 ```json
 {
-  "id": 2214,
+  "id": 1234,
   "typeName": "device",
-  "name": "Front Door Lock",
+  "name": "Example Lock",
   "control": "lock",
-  "parentId": 2213,
+  "parentId": 1233,
   "URIs": {
-    "commands": "/api/v1/items/2214/commands",
-    "variables": "/api/v1/items/2214/variables"
+    "commands": "/api/v1/items/1234/commands",
+    "variables": "/api/v1/items/1234/variables"
   }
 }
 ```

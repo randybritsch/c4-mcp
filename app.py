@@ -1066,7 +1066,7 @@ def c4_media_launch_app_tool(device_id: str, app: str) -> dict:
     name="c4_media_watch_launch_app",
     description=(
         "High-level helper: select the room video source for the given media device (Watch/HDMI) and then launch an app. "
-        "This makes 'Open Paramount+ on the basement Roku' reliably visible by ensuring the TV is on the Roku input first."
+        "This makes app launches reliably visible by ensuring the room is on the correct video input first."
     ),
 )
 def c4_media_watch_launch_app(device_id: str, app: str, room_id: str | None = None, pre_home: bool = True) -> dict:

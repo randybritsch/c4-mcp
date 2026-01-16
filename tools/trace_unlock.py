@@ -1,7 +1,7 @@
 """Trace lock unlock behavior by snapshotting and polling key variables.
 
 Usage:
-  python tools/trace_unlock.py --target 2214 --also 2215 --poll 0.5 --seconds 15
+    python tools/trace_unlock.py --target <LOCK_ID> --also <RELATED_ID> --poll 0.5 --seconds 15
 
 This will:
   1) Print a snapshot for each item

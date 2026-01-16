@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 import inspect
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -108,9 +109,48 @@ class Control4Gateway:
     # ---------- config / auth ----------
 
     def _load_config(self, cfg_path: Optional[str]) -> Config:
-        path = Path(cfg_path) if cfg_path else Path(__file__).with_name("config.json")
+        env_host = (os.environ.get("C4_HOST") or os.environ.get("CONTROL4_HOST") or "").strip()
+        env_user = (os.environ.get("C4_USERNAME") or os.environ.get("CONTROL4_USERNAME") or "").strip()
+        env_pass = (os.environ.get("C4_PASSWORD") or os.environ.get("CONTROL4_PASSWORD") or "").strip()
+
+        if env_host or env_user or env_pass:
+            missing = [
+                k
+                for k, v in {
+                    "C4_HOST": env_host,
+                    "C4_USERNAME": env_user,
+                    "C4_PASSWORD": env_pass,
+                }.items()
+                if not v
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Incomplete Control4 config from environment. Missing: "
+                    + ", ".join(missing)
+                    + ". Provide all three env vars (or none)."
+                )
+            return Config(host=env_host, username=env_user, password=env_pass)
+
+        env_cfg = (os.environ.get("C4_CONFIG_PATH") or os.environ.get("CONTROL4_CONFIG_PATH") or "").strip()
+        path = Path(cfg_path or env_cfg) if (cfg_path or env_cfg) else Path(__file__).with_name("config.json")
+        if not path.exists():
+            raise RuntimeError(
+                "Missing Control4 config. Set env vars C4_HOST/C4_USERNAME/C4_PASSWORD, "
+                "or create config.json (or set C4_CONFIG_PATH)."
+            )
+
         data = json.loads(path.read_text(encoding="utf-8"))
-        return Config(host=data["host"], username=data["username"], password=data["password"])
+        try:
+            host = str(data["host"]).strip()
+            username = str(data["username"]).strip()
+            password = str(data["password"]).strip()
+        except Exception as e:
+            raise RuntimeError(f"Invalid config file {str(path)!r}: expected keys host/username/password") from e
+
+        if not host or not username or not password:
+            raise RuntimeError(f"Invalid config file {str(path)!r}: host/username/password must be non-empty")
+
+        return Config(host=host, username=username, password=password)
 
     def _token_valid(self) -> bool:
         return bool(self._director_token) and (time.time() - self._director_token_time) < self._token_ttl_s

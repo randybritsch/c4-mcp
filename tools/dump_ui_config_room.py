@@ -1,7 +1,7 @@
 """Dump Control4 UI configuration for a specific room.
 
 Usage:
-  python tools/dump_ui_config_room.py --room-id 456
+    python tools/dump_ui_config_room.py --room-id <ROOM_ID>
 
 This is a diagnostic utility; it prints a trimmed JSON view of the matching room node.
 """

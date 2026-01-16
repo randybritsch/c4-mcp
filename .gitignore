@@ -48,6 +48,11 @@ logs/
 *.log.*
 /var/log/
 
+# Local Control4 credentials/config
+config.json
+config.local.json
+config.*.local.json
+
 # Flask
 instance/
 .webassets-cache

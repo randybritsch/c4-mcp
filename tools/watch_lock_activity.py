@@ -1,18 +1,18 @@
 """Watch *all* variable changes for items connected to a lock via bindings.
 
 Why:
-  You toggled the lock in the Control4 app and neither 2214 (lock proxy) nor 2215 (relay proxy)
+    You toggled the lock in the Control4 app and neither the lock proxy nor the relay proxy
   variables changed. This script builds a binding-connected set of items and watches their variables
   to discover what actually changes when the app acts.
 
 Usage:
-    python tools/watch_lock_activity.py --start 2214 2215 2213 2212 --depth 3 --seconds 120 --interval 0.5
+    python tools/watch_lock_activity.py --start <LOCK_PROXY_ID> <RELAY_PROXY_ID> --depth 3 --seconds 120 --interval 0.5
 
     # Or widen the net to all lock-related items (recommended if Control4 behavior is sporadic):
     python tools/watch_lock_activity.py --all-locks --seconds 180 --interval 0.5
 
     # Or only locks in a given room:
-    python tools/watch_lock_activity.py --all-locks --room-id 420 --seconds 180 --interval 0.5
+    python tools/watch_lock_activity.py --all-locks --room-id <ROOM_ID> --seconds 180 --interval 0.5
 
 Run it, then unlock/lock from the Control4 app during the window.
 """

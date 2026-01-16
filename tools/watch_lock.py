@@ -1,7 +1,7 @@
 """Watch lock-related items for state/variable changes.
 
 Usage:
-  python tools/watch_lock.py 2214 2215 --interval 0.5
+    python tools/watch_lock.py <ITEM_ID> <ITEM_ID> --interval 0.5
 
 Tip:
   Run this, then lock/unlock from the Control4 app to see which item/vars actually change.

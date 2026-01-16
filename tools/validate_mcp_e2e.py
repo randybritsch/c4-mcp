@@ -12,7 +12,7 @@ Safety:
 Usage examples:
   python tools/validate_mcp_e2e.py --base-url http://127.0.0.1:3333
   python tools/validate_mcp_e2e.py --base-url http://127.0.0.1:3333 --light-id 1234 --do-writes
-  python tools/validate_mcp_e2e.py --base-url http://127.0.0.1:3333 --lock-id 2214 --do-writes
+    python tools/validate_mcp_e2e.py --base-url http://127.0.0.1:3333 --lock-id 1234 --do-writes
 
 Auth:
 - If FLASK_MCP_AUTH_MODE=apikey, pass --api-key.
