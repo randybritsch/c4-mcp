@@ -2,6 +2,13 @@
 
 Control4 MCP Server (Flask) exposing Control4 automation as MCP tools.
 
+## Python version note (important)
+
+This project depends on `flask-mcp-server`, which in turn depends on `pydantic`/`pydantic-core`.
+At the time of writing, **Python 3.14 will not work out-of-the-box on Windows** because `pydantic-core` does not ship wheels for it yet.
+
+Use **Python 3.12** (recommended) or another version with `pydantic-core` wheels available.
+
 ## Setup
 
 This project is intended to work with any Control4 system. Nothing in the server is hard-coded to a specific home.
@@ -64,6 +71,51 @@ Notes:
 
 - Start server: `python app.py`
 - Verify MCP is up: `GET http://127.0.0.1:3333/mcp/list`
+
+## Claude Desktop (MCP stdio) setup (Windows)
+
+Claude Desktop launches MCP servers over **STDIO** (it starts a subprocess and speaks JSON-RPC over stdin/stdout).
+
+This repo can run in that mode via `flask-mcp-server`'s built-in stdio server, as long as you use a supported Python version.
+
+1) Create your venv using Python 3.12 (recommended; 3.13 also works):
+
+- `py -3.12 -m venv .venv`
+- `\.\.venv\Scripts\Activate.ps1`
+- `python -m pip install -r requirements.txt`
+
+2) Edit Claude Desktop config:
+
+- File: `%APPDATA%\Claude\claude_desktop_config.json`
+
+Add an MCP server entry like this (edit paths + env vars):
+
+```json
+{
+	"mcpServers": {
+		"c4-mcp": {
+			"command": "C:\\Users\\YOUR_USER\\c4-mcp\\.venv\\Scripts\\python.exe",
+			"args": ["mcp_cli.py", "serve-stdio", "--module", "app"],
+			"cwd": "C:\\Users\\YOUR_USER\\c4-mcp",
+			"env": {
+				"C4_HOST": "192.168.1.2",
+				"C4_USERNAME": "you@example.com",
+				"C4_PASSWORD": "your-password",
+				"C4_WRITE_GUARDRAILS": "true",
+				"C4_WRITES_ENABLED": "false"
+			}
+		}
+	}
+}
+```
+
+3) Restart Claude Desktop.
+
+If everything is wired up correctly, Claude should show the `c4-mcp` tools as available.
+
+Notes:
+- All non-protocol logging must go to **stderr**; this repo's logging defaults to stderr.
+- If you want to enable write tools, flip `C4_WRITES_ENABLED` to `true` (guardrails still apply).
 
 ### Optional: write guardrails (recommended for safety)
 
