@@ -1,0 +1,11 @@
+# Core server
+flask==3.1.2
+flask-mcp-server==0.6.1
+
+# Control4 + HTTP
+pyControl4==1.5.0
+aiohttp==3.13.3
+requests==2.32.5
+
+# Compatibility: pyControl4 expects async_timeout with sync context manager support
+async-timeout==3.0.1

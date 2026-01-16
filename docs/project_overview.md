@@ -61,6 +61,8 @@ Control4 Director
 - aiohttp (HTTP fallback + polling, e.g., Roku app confirmation)
 - flask-mcp-server (MCP protocol implementation)
 
+Python dependencies are pinned in `requirements.txt`.
+
 ---
 
 ## 3. Directory structure
@@ -223,6 +225,13 @@ Control4 Director
 * `c4_lock_lock`
 * `c4_lock_set_by_name(lock_name, state, room_name|room_id, ...)` (resolve + lock/unlock)
 
+**Alarm / Security (best-effort)**
+
+* `c4_alarm_list` (discover alarm/security panel-like devices)
+* `c4_alarm_get_state(device_id)`
+* `c4_alarm_set_mode(device_id, mode, code?, confirm_timeout_s, dry_run)`
+* `c4_alarm_arm_away(device_id, ...)`, `c4_alarm_arm_stay(device_id, ...)`, `c4_alarm_disarm(device_id, ...)`
+
 **Macros / Scheduler / Announcements**
 
 * `c4_macro_list`
@@ -241,7 +250,7 @@ Control4 Director
 ### Authentication
 
 * MCP auth handled by `flask-mcp-server` middleware
-* Control4 auth handled internally via pyControl4 (cloud + Director tokens)
+* Control4 auth handled internally via Control4 cloud auth + Director bearer tokens
 
 ---
 
@@ -255,6 +264,9 @@ Control4 Director
 
 * **pyControl4 for all Director access**
   → Avoids 401s and protocol mismatches seen with raw REST calls.
+
+* **Direct cloud auth HTTP (avoid pyControl4 account auth)**
+  → `pyControl4.account` currently uses `async_timeout` in a way that breaks on modern versions; the gateway performs the necessary Control4 cloud auth requests directly to keep startup/auth reliable across environments.
 
 * **Command execution by name, not ID**
   → Director REST rejects `commandId`; named commands are accepted.
@@ -354,6 +366,15 @@ Control4 Director
   * `username`
   * `password`
 
+### Setup / install
+
+PowerShell (recommended):
+
+* Create venv: `py -3.13 -m venv .venv`
+* Install deps: `./.venv/Scripts/python -m pip install -r requirements.txt`
+* Start server: `./.venv/Scripts/python app.py`
+* Verify: `GET http://127.0.0.1:3333/mcp/list`
+
 ### Secrets
 
 * Never committed
@@ -369,7 +390,7 @@ Control4 Director
 
 ## 11. Coding conventions
 
-* Python 3.11+ (validated on Python 3.14)
+* Python 3.11+ (validated on Python 3.13)
 * Type hints everywhere
 * Explicit timeouts on I/O
 * No silent exception swallowing

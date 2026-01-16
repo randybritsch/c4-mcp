@@ -29,6 +29,7 @@ Expose Control4 home automation as stable local MCP tools over HTTP, optimized f
 - **Media (Watch)**: `c4_room_select_video_device`, `c4_media_watch_launch_app`, `c4_media_watch_launch_app_by_name`, `c4_media_roku_list_apps`.
 - **Watch diagnostics (read-only)**: `c4_room_watch_status`, `c4_room_list_video_devices` (may return empty depending on Director/UI config).
 - **Listen**: `c4_room_listen_status`, `c4_room_listen`, `c4_room_off` (restore).
+- **Alarm/security (best-effort)**: `c4_alarm_list`, `c4_alarm_get_state`, `c4_alarm_set_mode` (may be empty if no alarm panel exists).
 - **Debug/inspection**: `c4_item_variables`, `c4_item_commands`, `c4_item_bindings`.
 
 ## **6) Coding conventions (must-follow rules)**

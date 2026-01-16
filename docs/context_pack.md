@@ -23,6 +23,7 @@ This project exposes Control4 home automation as stable MCP tools via a local Fl
 - `docs/context_pack.md` — this file; kept current after sessions.
 - `tools/validate_mcp_e2e.py` — baseline regression entry (read-only by default).
 - `tools/validate_listen.py` — Listen validator; now supports auto-picking a safe room when `--room-id` is omitted.
+- `tools/validate_alarm.py` — alarm/security validator; safe when no alarm panel exists.
 
 ## Interfaces / contracts that must not break
 
@@ -58,6 +59,10 @@ Keep tool names and signatures stable; add new tools instead of changing old one
 **Locks**
 
 - `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`, `c4_lock_set_by_name`
+
+**Alarm / Security (best-effort)**
+
+- `c4_alarm_list`, `c4_alarm_get_state`, `c4_alarm_set_mode`
 
 **Media (Roku watch+launch)**
 

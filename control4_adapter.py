@@ -187,6 +187,33 @@ def motion_get_state(device_id: int, timeout_s: float = 6.0) -> Json:
     return gateway.motion_get_state(int(device_id), timeout_s=float(timeout_s))  # type: ignore[misc]
 
 
+# --------- Alarm / Security (best-effort) ---------
+
+
+def alarm_list(limit: int = 200) -> Json:
+    return gateway.alarm_list(int(limit))  # type: ignore[misc]
+
+
+def alarm_get_state(device_id: int, timeout_s: float = 8.0) -> Json:
+    return gateway.alarm_get_state(int(device_id), timeout_s=float(timeout_s))  # type: ignore[misc]
+
+
+def alarm_set_mode(
+    device_id: int,
+    mode: str,
+    code: str | None = None,
+    confirm_timeout_s: float = 12.0,
+    dry_run: bool = False,
+) -> Json:
+    return gateway.alarm_set_mode(
+        int(device_id),
+        str(mode or ""),
+        (str(code) if code is not None else None),
+        confirm_timeout_s=float(confirm_timeout_s),
+        dry_run=bool(dry_run),
+    )  # type: ignore[misc]
+
+
 # --------- Intercom (best-effort) ---------
 
 def intercom_list() -> Json:

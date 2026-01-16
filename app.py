@@ -71,6 +71,9 @@ from control4_adapter import (
     scheduler_set_enabled,
     motion_get_state,
     motion_list,
+    alarm_list,
+    alarm_get_state,
+    alarm_set_mode,
     resolve_device,
     resolve_room,
     resolve_room_and_device,
@@ -816,6 +819,68 @@ def c4_scene_activate_by_name_tool(
     }
 
 
+# ---- Alarm / Security (best-effort) ----
+
+
+@Mcp.tool(
+    name="c4_alarm_list",
+    description=(
+        "List alarm/security panel-like devices (best-effort discovery). "
+        "Returns an empty list when no alarm panel is present."
+    ),
+)
+def c4_alarm_list_tool(limit: int = 200) -> dict:
+    return alarm_list(int(limit))
+
+
+@Mcp.tool(
+    name="c4_alarm_get_state",
+    description=(
+        "Get best-effort alarm/security state from device variables (armed/mode/alarm_active/ready/trouble when available)."
+    ),
+)
+def c4_alarm_get_state_tool(device_id: str, timeout_s: float = 8.0) -> dict:
+    return alarm_get_state(int(device_id), timeout_s=float(timeout_s))
+
+
+@Mcp.tool(
+    name="c4_alarm_set_mode",
+    description=(
+        "Arm/disarm an alarm/security panel (best-effort). Mode must be one of: disarmed, away, stay, night. "
+        "Optionally pass code (PIN/user code) if the driver requires it. Supports dry_run and returns accepted/confirmed."
+    ),
+)
+def c4_alarm_set_mode_tool(
+    device_id: str,
+    mode: str,
+    code: str | None = None,
+    confirm_timeout_s: float = 12.0,
+    dry_run: bool = False,
+) -> dict:
+    return alarm_set_mode(
+        int(device_id),
+        str(mode or ""),
+        (str(code) if code is not None else None),
+        confirm_timeout_s=float(confirm_timeout_s),
+        dry_run=bool(dry_run),
+    )
+
+
+@Mcp.tool(name="c4_alarm_disarm", description="Disarm an alarm/security panel (best-effort).")
+def c4_alarm_disarm_tool(device_id: str, code: str | None = None, confirm_timeout_s: float = 12.0, dry_run: bool = False) -> dict:
+    return c4_alarm_set_mode_tool(device_id=device_id, mode="disarmed", code=code, confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))
+
+
+@Mcp.tool(name="c4_alarm_arm_away", description="Arm an alarm/security panel in Away mode (best-effort).")
+def c4_alarm_arm_away_tool(device_id: str, code: str | None = None, confirm_timeout_s: float = 12.0, dry_run: bool = False) -> dict:
+    return c4_alarm_set_mode_tool(device_id=device_id, mode="away", code=code, confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))
+
+
+@Mcp.tool(name="c4_alarm_arm_stay", description="Arm an alarm/security panel in Stay mode (best-effort).")
+def c4_alarm_arm_stay_tool(device_id: str, code: str | None = None, confirm_timeout_s: float = 12.0, dry_run: bool = False) -> dict:
+    return c4_alarm_set_mode_tool(device_id=device_id, mode="stay", code=code, confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))
+
+
 @Mcp.tool(
     name="c4_scene_set_state_by_name",
     description=(
@@ -1360,6 +1425,8 @@ def c4_list_devices(category: str) -> dict:
         "shades": set(),
         # Scenes are usually exposed as UI Button devices.
         "scenes": set(),
+        # Alarm/security varies wildly by driver; discover by heuristics.
+        "alarm": set(),
         "media": {
             "media_player",
             "media_service",
@@ -1409,6 +1476,43 @@ def c4_list_devices(category: str) -> dict:
                 or any(t in control_l for t in ("shade", "blind", "drape", "curtain", "screen"))
                 or any(any(t in c for t in ("shade", "blind", "drape", "curtain", "screen")) for c in cat_l)
             ):
+                continue
+        elif category == "alarm":
+            proxy_l = str(i.get("proxy") or "").lower()
+            control_l = str(control or "").lower()
+            protocol_l = str(i.get("protocolFilename") or "").lower()
+            cat_l = [str(c).lower() for c in categories] if isinstance(categories, list) else []
+
+            if proxy_l in {"uibutton", "voice-scene"}:
+                continue
+
+            # Avoid common false positives.
+            if "keypad" in proxy_l or "keypad" in control_l:
+                continue
+            if proxy_l in {"light", "light_v2", "thermostat", "tv", "receiver", "media_player"}:
+                continue
+
+            token_sources = " ".join([proxy_l, control_l, protocol_l, " ".join(cat_l)])
+            name_l = str(i.get("name") or "").lower()
+
+            security_tokens = (
+                "security",
+                "alarm",
+                "dsc",
+                "honeywell",
+                "vista",
+                "ademco",
+                "elk",
+                "elkm1",
+                "paradox",
+                "qolsys",
+                "2gig",
+            )
+            has_security = any(t in token_sources for t in security_tokens) or any(t in name_l for t in ("security", "alarm"))
+            has_panelish = any(t in token_sources for t in ("panel", "partition"))
+            name_panelish = ("panel" in name_l and ("alarm" in name_l or "security" in name_l))
+
+            if not (name_panelish or has_security or (has_panelish and ("alarm" in name_l or "security" in name_l))):
                 continue
         elif category == "scenes":
             proxy_l = str(i.get("proxy") or "").lower()
@@ -1490,7 +1594,7 @@ def c4_shade_set_position_tool(device_id: str, position: int, confirm_timeout_s:
 @Mcp.tool(
     name="c4_find_devices",
     description=(
-        "Find devices by name (case-insensitive, fuzzy). Optional filters: category in {lights, locks, thermostat, media, scenes, shades} and room_id."
+        "Find devices by name (case-insensitive, fuzzy). Optional filters: category in {lights, locks, thermostat, media, scenes, shades, alarm} and room_id."
     ),
 )
 def c4_find_devices_tool(
@@ -1513,7 +1617,7 @@ def c4_find_devices_tool(
 @Mcp.tool(
     name="c4_resolve_device",
     description=(
-        "Resolve a device name to a single device_id (best-effort). Optional filters: category (lights, locks, thermostat, media, scenes, shades) and room_id. Returns candidates when ambiguous."
+        "Resolve a device name to a single device_id (best-effort). Optional filters: category (lights, locks, thermostat, media, scenes, shades, alarm) and room_id. Returns candidates when ambiguous."
     ),
 )
 def c4_resolve_device_tool(

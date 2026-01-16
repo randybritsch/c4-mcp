@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -19,6 +20,16 @@ from urllib.parse import urljoin
 import aiohttp
 from pyControl4.account import C4Account
 from pyControl4.director import C4Director
+
+
+# pyControl4's C4Account currently uses `with async_timeout.timeout(...)` inside
+# async functions, which fails on modern async_timeout versions.
+# To keep this project robust across environments, we perform the required
+# Control4 cloud authentication requests directly.
+_C4_AUTHENTICATION_ENDPOINT = "https://apis.control4.com/authentication/v1/rest"
+_C4_CONTROLLER_AUTHORIZATION_ENDPOINT = "https://apis.control4.com/authentication/v1/rest/authorization"
+_C4_GET_CONTROLLERS_ENDPOINT = "https://apis.control4.com/account/v3/rest/accounts"
+_C4_APPLICATION_KEY = "78f6791373d61bea49fdb9fb8897f1f3af193f11"
 
 
 class AsyncLoopThread:
@@ -206,37 +217,93 @@ class Control4Gateway:
         if self._token_valid():
             return self._director_token  # type: ignore[return-value]
 
-        account = C4Account(self._cfg.username, self._cfg.password)
+        async def _cloud_post_json(url: str, payload: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
+            timeout = aiohttp.ClientTimeout(total=max(5.0, self._auth_timeout_s))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    text = await resp.text()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"Control4 cloud HTTP {resp.status}: {text[:600]}")
+                    try:
+                        return json.loads(text)
+                    except Exception as e:
+                        raise RuntimeError(f"Control4 cloud invalid JSON: {text[:200]}") from e
 
-        # 1) Cloud bearer token (can be slow)
-        await self._with_retries(
+        async def _cloud_get_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+            timeout = aiohttp.ClientTimeout(total=max(5.0, self._auth_timeout_s))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as resp:
+                    text = await resp.text()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"Control4 cloud HTTP {resp.status}: {text[:600]}")
+                    try:
+                        return json.loads(text)
+                    except Exception as e:
+                        raise RuntimeError(f"Control4 cloud invalid JSON: {text[:200]}") from e
+
+        # 1) Cloud account bearer token (can be slow)
+        def _account_token_payload() -> dict[str, Any]:
+            return {
+                "clientInfo": {
+                    "device": {
+                        "deviceName": "c4-mcp",
+                        "deviceUUID": "0000000000000000",
+                        "make": "c4-mcp",
+                        "model": "c4-mcp",
+                        "os": "Windows",
+                        "osVersion": sys.version.split()[0],
+                    },
+                    "userInfo": {
+                        "applicationKey": _C4_APPLICATION_KEY,
+                        "password": self._cfg.password,
+                        "userName": self._cfg.username,
+                    },
+                }
+            }
+
+        auth_json = await self._with_retries(
             "getAccountBearerToken",
-            lambda: account.getAccountBearerToken(),
+            lambda: _cloud_post_json(_C4_AUTHENTICATION_ENDPOINT, _account_token_payload()),
             timeout_s=30,
             retries=3,
         )
+        try:
+            account_token = str(auth_json["authToken"]["token"])
+        except Exception as e:
+            raise RuntimeError(f"Control4 cloud auth response missing authToken.token: {auth_json!r}") from e
+
+        headers = {"Authorization": f"Bearer {account_token}"}
 
         # 2) Controllers (cache chosen controller)
         if not self._controller_name:
-            controller_info = await self._with_retries(
+            controllers_json = await self._with_retries(
                 "getAccountControllers",
-                lambda: account.getAccountControllers(),
+                lambda: _cloud_get_json(_C4_GET_CONTROLLERS_ENDPOINT, headers=headers),
                 timeout_s=45,
                 retries=3,
             )
-            # NOTE: this assumes dict response with controllerCommonName
-            self._controller_name = controller_info["controllerCommonName"]
+            try:
+                self._controller_name = str(controllers_json["account"]["controllerCommonName"])
+            except Exception as e:
+                raise RuntimeError(
+                    f"Control4 cloud controllers response missing account.controllerCommonName: {controllers_json!r}"
+                ) from e
 
         # 3) Director bearer token
-        token_resp = await self._with_retries(
+        def _director_token_payload() -> dict[str, Any]:
+            return {"serviceInfo": {"commonName": self._controller_name, "services": "director"}}
+
+        director_json = await self._with_retries(
             "getDirectorBearerToken",
-            lambda: account.getDirectorBearerToken(self._controller_name),  # type: ignore[arg-type]
+            lambda: _cloud_post_json(_C4_CONTROLLER_AUTHORIZATION_ENDPOINT, _director_token_payload(), headers=headers),
             timeout_s=45,
             retries=3,
         )
+        try:
+            self._director_token = str(director_json["authToken"]["token"])
+        except Exception as e:
+            raise RuntimeError(f"Control4 cloud director response missing authToken.token: {director_json!r}") from e
 
-        # NOTE: this assumes dict response with "token"
-        self._director_token = token_resp["token"]
         self._director_token_time = time.time()
         return self._director_token
 
@@ -1689,6 +1756,8 @@ class Control4Gateway:
             # Scenes are typically represented as UI Button devices (proxy/control='uibutton').
             # We treat this category specially below so it works across driver variance.
             "scenes": set(),
+            # Alarm/security varies wildly by driver; discover by heuristics below.
+            "alarm": set(),
             "media": {
                 "media_player",
                 "media_service",
@@ -1716,6 +1785,7 @@ class Control4Gateway:
         allowed_controls = category_controls.get(category) if category else None
         is_lock_category = category == "locks"
         is_scene_category = category == "scenes"
+        is_alarm_category = category == "alarm"
 
         matches: list[dict[str, Any]] = []
         for i in items:
@@ -1735,6 +1805,28 @@ class Control4Gateway:
                     or control in {"uibutton", "voice-scene"}
                     or "scene" in name_l
                 ):
+                    continue
+            elif is_alarm_category:
+                proxy_l = str(i.get("proxy") or "").lower()
+                control_l = str(i.get("control") or "").lower()
+                protocol_l = str(i.get("protocolFilename") or "").lower()
+                cats = i.get("categories")
+                cat_l = [str(c).lower() for c in cats] if isinstance(cats, list) else []
+
+                # Avoid misclassifying UI buttons/scenes that mention "security".
+                if proxy_l in {"uibutton", "voice-scene"}:
+                    continue
+
+                # Heuristic: prefer explicit proxy/control/category/protocol signals.
+                token_sources = " ".join([proxy_l, control_l, protocol_l, " ".join(cat_l)])
+                has_security = any(t in token_sources for t in ("security", "alarm"))
+                has_panel = any(t in token_sources for t in ("panel", "keypad", "partition"))
+
+                # As a last resort, allow name-based match only if it looks like a panel.
+                name_l = str(i.get("name") or "").lower()
+                name_panelish = ("panel" in name_l and ("alarm" in name_l or "security" in name_l))
+
+                if not (has_security or has_panel or name_panelish):
                     continue
             elif allowed_controls is not None:
                 if control not in allowed_controls and not is_lock_category:
@@ -2881,6 +2973,379 @@ class Control4Gateway:
         return self._loop_thread.run(
             self._shade_send_command_best_effort_async(int(device_id), "set", int(position), float(confirm_timeout_s), bool(dry_run)),
             timeout_s=float(confirm_timeout_s) + 12.0,
+        )
+
+    # ---------- Alarm / Security (best-effort) ----------
+
+    @staticmethod
+    def _is_alarm_panel_like_item(item: dict[str, Any]) -> bool:
+        if not isinstance(item, dict) or item.get("typeName") != "device":
+            return False
+        proxy_l = str(item.get("proxy") or "").lower()
+        control_l = str(item.get("control") or "").lower()
+        protocol_l = str(item.get("protocolFilename") or "").lower()
+        cats = item.get("categories")
+        cat_l = [str(c).lower() for c in cats] if isinstance(cats, list) else []
+        name_l = str(item.get("name") or "").lower()
+
+        # Exclude obvious non-panels.
+        if proxy_l in {"uibutton", "voice-scene"}:
+            return False
+
+        # Avoid common false positives.
+        if "keypad" in proxy_l or "keypad" in control_l:
+            return False
+        if proxy_l in {"light", "light_v2", "thermostat", "tv", "receiver", "media_player"}:
+            return False
+
+        token_sources = " ".join([proxy_l, control_l, protocol_l, " ".join(cat_l)])
+        security_tokens = (
+            "security",
+            "alarm",
+            "dsc",
+            "honeywell",
+            "vista",
+            "ademco",
+            "elk",
+            "elkm1",
+            "paradox",
+            "qolsys",
+            "2gig",
+        )
+        has_security = any(t in token_sources for t in security_tokens) or any(t in name_l for t in ("security", "alarm"))
+
+        # "Panel-ish" hints are only trusted when accompanied by security/alarm in the name.
+        has_panelish = any(t in token_sources for t in ("panel", "partition"))
+        name_panelish = ("panel" in name_l and ("alarm" in name_l or "security" in name_l))
+
+        if name_panelish:
+            return True
+        if has_security:
+            return True
+        if has_panelish and ("security" in name_l or "alarm" in name_l):
+            return True
+        return False
+
+    def alarm_list(self, limit: int = 200) -> dict[str, Any]:
+        items = self.get_all_items()
+        limit = max(1, min(2000, int(limit)))
+        rooms_by_id = {
+            str(i.get("id")): i.get("name")
+            for i in items
+            if isinstance(i, dict) and i.get("typeName") == "room" and i.get("id") is not None
+        }
+
+        panels: list[dict[str, Any]] = []
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+            if not self._is_alarm_panel_like_item(i):
+                continue
+
+            room_id = i.get("roomId") or i.get("parentId")
+            resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(room_id)) if room_id is not None else None)
+            panels.append(
+                {
+                    "device_id": int(i.get("id") or 0),
+                    "name": i.get("name"),
+                    "room_id": (int(room_id) if room_id is not None else None),
+                    "room_name": resolved_room_name,
+                    "control": i.get("control"),
+                    "proxy": i.get("proxy"),
+                    "categories": i.get("categories") or [],
+                    "protocolFilename": i.get("protocolFilename"),
+                }
+            )
+
+        panels = [p for p in panels if int(p.get("device_id") or 0) > 0]
+        panels.sort(key=lambda d: (str(d.get("room_name") or ""), str(d.get("name") or ""), int(d.get("device_id") or 0)))
+        return {"ok": True, "count": len(panels), "panels": panels[:limit]}
+
+    @staticmethod
+    def _alarm_coerce_bool(val: Any) -> bool | None:
+        if val is None:
+            return None
+        if isinstance(val, bool):
+            return bool(val)
+        if isinstance(val, (int, float)):
+            return bool(int(val))
+        s = str(val).strip().lower()
+        if not s:
+            return None
+        if s in {"true", "1", "yes", "on", "armed", "arming", "away", "stay", "night", "home"}:
+            return True
+        if s in {"false", "0", "no", "off", "disarmed", "ready", "idle", "normal", "clear"}:
+            return False
+        return None
+
+    @staticmethod
+    def _alarm_normalize_mode(val: Any) -> str | None:
+        if val is None:
+            return None
+        s = str(val).strip().lower()
+        if not s:
+            return None
+
+        # Normalize common arm/disarm modes.
+        if s in {"disarm", "disarmed", "off"}:
+            return "disarmed"
+        if s in {"away", "arm_away", "armaway", "armed away"}:
+            return "away"
+        if s in {"stay", "arm_stay", "armstay", "home", "arm_home", "armhome", "armed stay", "armed home"}:
+            return "stay"
+        if s in {"night", "arm_night", "armnight"}:
+            return "night"
+        return s
+
+    @classmethod
+    def _alarm_parse_state(cls, variables: list[dict[str, Any]]) -> dict[str, Any]:
+        # Map varName -> value (case-insensitive)
+        by_name: dict[str, Any] = {}
+        for v in variables:
+            if not isinstance(v, dict):
+                continue
+            n = v.get("varName") or v.get("name")
+            if n is None:
+                continue
+            by_name[str(n).strip().lower()] = v.get("value")
+
+        # Best-effort fields.
+        mode_raw = None
+        for k in (
+            "armedstate",
+            "armstate",
+            "armmode",
+            "armed mode",
+            "securitystate",
+            "panelstate",
+            "systemstate",
+        ):
+            if k in by_name and by_name.get(k) is not None:
+                mode_raw = by_name.get(k)
+                break
+
+        mode = cls._alarm_normalize_mode(mode_raw)
+        armed = None
+        for k in ("armed", "isarmed", "systemarmed", "armedstate"):
+            if k in by_name:
+                armed = cls._alarm_coerce_bool(by_name.get(k))
+                if armed is not None:
+                    break
+
+        # If armed flag missing, derive from mode if possible.
+        if armed is None and isinstance(mode, str):
+            if mode in {"away", "stay", "night", "armed"}:
+                armed = True
+            if mode in {"disarmed"}:
+                armed = False
+
+        alarm_active = None
+        for k in ("alarm", "alarmstate", "alarm_state", "siren", "alarmactive"):
+            if k in by_name:
+                alarm_active = cls._alarm_coerce_bool(by_name.get(k))
+                if alarm_active is not None:
+                    break
+        if alarm_active is None:
+            # Some drivers use string states.
+            for k in ("alarmstate", "alarm"):
+                v = by_name.get(k)
+                if isinstance(v, str) and v.strip():
+                    s = v.strip().lower()
+                    if any(t in s for t in ("trigger", "alarm", "siren", "breach")):
+                        alarm_active = True
+                    elif any(t in s for t in ("clear", "normal", "ready", "idle")):
+                        alarm_active = False
+                    break
+
+        ready = None
+        for k in ("ready", "systemready", "isready"):
+            if k in by_name:
+                ready = cls._alarm_coerce_bool(by_name.get(k))
+                if ready is not None:
+                    break
+
+        trouble = None
+        for k in ("trouble", "systemtrouble", "fault", "tamper"):
+            if k in by_name:
+                trouble = cls._alarm_coerce_bool(by_name.get(k))
+                if trouble is not None:
+                    break
+
+        return {
+            "armed": armed,
+            "mode": mode,
+            "alarm_active": alarm_active,
+            "ready": ready,
+            "trouble": trouble,
+        }
+
+    async def _alarm_get_state_async(self, device_id: int, timeout_s: float = 8.0) -> dict[str, Any]:
+        device_id = int(device_id)
+        try:
+            vars_resp = await asyncio.wait_for(self._item_get_variables_async(device_id), timeout=float(timeout_s))
+        except asyncio.TimeoutError:
+            return {"ok": False, "device_id": device_id, "error": "timeout"}
+        except Exception as e:
+            return {"ok": False, "device_id": device_id, "error": str(e), "error_type": type(e).__name__}
+
+        variables = vars_resp.get("variables") if isinstance(vars_resp, dict) else None
+        var_list: list[dict[str, Any]] = variables if isinstance(variables, list) else []
+        parsed = self._alarm_parse_state(var_list)
+        return {
+            "ok": bool(vars_resp.get("ok")) if isinstance(vars_resp, dict) else True,
+            "device_id": device_id,
+            "state": parsed,
+            "variables_count": len(var_list),
+            "variables_source": (vars_resp.get("source") if isinstance(vars_resp, dict) else None),
+        }
+
+    def alarm_get_state(self, device_id: int, timeout_s: float = 8.0) -> dict[str, Any]:
+        return self._loop_thread.run(self._alarm_get_state_async(int(device_id), float(timeout_s)), timeout_s=float(timeout_s) + 8.0)
+
+    @staticmethod
+    def _alarm_norm_command_name(cmd: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(cmd or "").strip().lower())
+
+    @classmethod
+    def _alarm_pick_command(cls, cmd_list: list[dict[str, Any]], preferred: list[str]) -> dict[str, Any] | None:
+        if not cmd_list:
+            return None
+        by_norm: dict[str, dict[str, Any]] = {}
+        for c in cmd_list:
+            if not isinstance(c, dict):
+                continue
+            n = c.get("command") or c.get("name") or c.get("display")
+            if not n:
+                continue
+            by_norm[cls._alarm_norm_command_name(str(n))] = c
+
+        for cand in preferred:
+            hit = by_norm.get(cls._alarm_norm_command_name(cand))
+            if hit is not None:
+                return hit
+        return None
+
+    @staticmethod
+    def _alarm_pick_code_param_name(cmd: dict[str, Any] | None) -> str | None:
+        if not isinstance(cmd, dict):
+            return None
+        params = cmd.get("params")
+        if isinstance(params, list):
+            names = [str(p.get("name") or "") for p in params if isinstance(p, dict) and p.get("name")]
+            for n in names:
+                nl = n.strip().lower()
+                if any(t in nl for t in ("code", "pin", "user")):
+                    return n
+            if len(names) == 1:
+                return names[0]
+        return None
+
+    @classmethod
+    def _alarm_state_matches_mode(cls, state_payload: dict[str, Any], mode: str) -> bool:
+        st = state_payload.get("state") if isinstance(state_payload, dict) else None
+        if not isinstance(st, dict):
+            return False
+        target = cls._alarm_normalize_mode(mode) or str(mode or "").strip().lower()
+        armed = st.get("armed")
+        current_mode = st.get("mode")
+        if target in {"disarmed"}:
+            return armed is False or (isinstance(current_mode, str) and cls._alarm_normalize_mode(current_mode) == "disarmed")
+        if target in {"away", "stay", "night"}:
+            if armed is not True:
+                return False
+            if isinstance(current_mode, str) and cls._alarm_normalize_mode(current_mode) == target:
+                return True
+            # If we can't read a specific mode, accept any armed=true.
+            return True
+        return False
+
+    async def _alarm_set_mode_async(
+        self,
+        device_id: int,
+        mode: str,
+        code: str | None = None,
+        confirm_timeout_s: float = 12.0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        mode_n = self._alarm_normalize_mode(mode)
+        if mode_n not in {"disarmed", "away", "stay", "night"}:
+            return {"ok": False, "device_id": device_id, "error": "mode must be one of: disarmed, away, stay, night"}
+
+        before = await self._alarm_get_state_async(device_id, timeout_s=min(8.0, float(self._director_timeout_s) + 2.0))
+
+        cmds_payload = await self._item_get_commands_async(device_id)
+        cmds = cmds_payload.get("commands") if isinstance(cmds_payload, dict) else None
+        cmd_list: list[dict[str, Any]] = cmds if isinstance(cmds, list) else []
+
+        preferred_cmds = {
+            "disarmed": ["DISARM", "OFF", "DISARM_SYSTEM"],
+            "away": ["ARM_AWAY", "ARM_AWAY_INSTANT", "ARM_AWAY_NO_DELAY", "ARM"],
+            "stay": ["ARM_STAY", "ARM_HOME", "ARM_STAY_INSTANT", "ARM_STAY_NO_DELAY", "ARM"],
+            "night": ["ARM_NIGHT", "ARM_STAY", "ARM_HOME", "ARM"],
+        }[mode_n]
+
+        chosen = self._alarm_pick_command(cmd_list, preferred_cmds)
+        planned_cmd = str((chosen or {}).get("command") or "" or preferred_cmds[0]).strip()
+        if not planned_cmd:
+            planned_cmd = preferred_cmds[0]
+
+        planned_params: dict[str, Any] = {}
+        if code is not None and str(code).strip():
+            pname = self._alarm_pick_code_param_name(chosen) or "CODE"
+            planned_params[str(pname)] = str(code)
+
+        planned = {"command": planned_cmd, "params": planned_params}
+        if bool(dry_run):
+            return {
+                "ok": True,
+                "device_id": device_id,
+                "mode": mode_n,
+                "dry_run": True,
+                "planned": planned,
+                "before": before,
+                "commands_source": (cmds_payload.get("source") if isinstance(cmds_payload, dict) else None),
+            }
+
+        exec_result = await self._item_send_command_async(device_id, planned_cmd, planned_params)
+        accepted = bool(exec_result.get("ok"))
+
+        confirmed = False
+        after = None
+        trace: list[dict[str, Any]] = []
+        deadline = time.time() + float(confirm_timeout_s)
+        while time.time() < deadline:
+            after = await self._alarm_get_state_async(device_id, timeout_s=min(8.0, float(self._director_timeout_s) + 2.0))
+            trace.append({"t": round(time.time(), 3), "state": (after.get("state") if isinstance(after, dict) else None)})
+            if self._alarm_state_matches_mode(after, mode_n):
+                confirmed = True
+                break
+            await asyncio.sleep(0.4)
+
+        return {
+            "ok": accepted,
+            "device_id": device_id,
+            "mode": mode_n,
+            "accepted": accepted,
+            "confirmed": confirmed,
+            "planned": planned,
+            "before": before,
+            "after": after,
+            "confirm_trace": trace[-10:],
+            "execute": exec_result,
+        }
+
+    def alarm_set_mode(
+        self,
+        device_id: int,
+        mode: str,
+        code: str | None = None,
+        confirm_timeout_s: float = 12.0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._alarm_set_mode_async(int(device_id), str(mode or ""), (str(code) if code is not None else None), float(confirm_timeout_s), bool(dry_run)),
+            timeout_s=float(confirm_timeout_s) + 18.0,
         )
 
     # ---------- Motion sensors (best-effort; mostly ContactState-based) ----------
