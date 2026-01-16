@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from difflib import SequenceMatcher
 import inspect
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -1359,6 +1361,284 @@ class Control4Gateway:
         rooms = [i for i in items if isinstance(i, dict) and i.get("typeName") == "room"]
         rooms.sort(key=lambda r: (str(r.get("name") or ""), str(r.get("id") or "")))
         return rooms
+
+    # ---------- name-based discovery / resolution ----------
+
+    @staticmethod
+    def _norm_search_text(text: str) -> str:
+        s = str(text or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @classmethod
+    def _score_match(cls, query: str, candidate: str) -> int:
+        qn = cls._norm_search_text(query)
+        cn = cls._norm_search_text(candidate)
+        if not qn or not cn:
+            return 0
+        if qn == cn:
+            return 100
+        if qn in cn:
+            # Prefer tighter substring matches.
+            return max(60, 90 - min(30, abs(len(cn) - len(qn))))
+
+        q_tokens = set(qn.split(" "))
+        c_tokens = set(cn.split(" "))
+        overlap = len(q_tokens & c_tokens)
+        union = max(1, len(q_tokens | c_tokens))
+        token_score = int(round((overlap / union) * 75))
+
+        ratio = SequenceMatcher(a=qn, b=cn).ratio()
+        seq_score = int(round(ratio * 70))
+
+        return max(token_score, seq_score)
+
+    def find_rooms(self, search: str, limit: int = 10, include_raw: bool = False) -> dict[str, Any]:
+        search = str(search or "").strip()
+        limit = max(1, min(50, int(limit)))
+        include_raw = bool(include_raw)
+
+        if not search:
+            return {"ok": False, "error": "search is required", "matches": []}
+
+        rooms = self.list_rooms()
+        matches: list[dict[str, Any]] = []
+        for r in rooms:
+            if not isinstance(r, dict):
+                continue
+            name = str(r.get("name") or "")
+            score = self._score_match(search, name)
+            if score <= 0:
+                continue
+            out: dict[str, Any] = {
+                "room_id": str(r.get("id")),
+                "name": name,
+                "score": int(score),
+            }
+            if include_raw:
+                out["raw"] = r
+            matches.append(out)
+
+        matches.sort(key=lambda m: (-int(m.get("score") or 0), str(m.get("name") or ""), str(m.get("room_id") or "")))
+        return {"ok": True, "search": search, "matches": matches[:limit]}
+
+    def resolve_room(self, name: str, require_unique: bool = True, include_candidates: bool = True) -> dict[str, Any]:
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "error": "name is required"}
+
+        found = self.find_rooms(name, limit=8, include_raw=False)
+        if not found.get("ok"):
+            return found
+
+        matches = list(found.get("matches") or [])
+        if not matches:
+            return {"ok": False, "error": "not_found", "details": f"No rooms matched '{name}'", "candidates": []}
+
+        best = matches[0]
+        best_score = int(best.get("score") or 0)
+        second_score = int(matches[1].get("score") or 0) if len(matches) > 1 else 0
+
+        # Accept if it's an exact match, or a clearly better fuzzy match.
+        accept = (best_score >= 100) or (best_score >= 80 and (best_score - second_score) >= 10)
+        if not accept and bool(require_unique):
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "details": f"Multiple rooms could match '{name}'.",
+                "candidates": matches if include_candidates else [],
+            }
+
+        out: dict[str, Any] = {"ok": True, "room_id": str(best.get("room_id")), "name": str(best.get("name"))}
+        if include_candidates:
+            out["candidates"] = matches
+        return out
+
+    def find_devices(
+        self,
+        search: str | None = None,
+        category: str | None = None,
+        room_id: int | None = None,
+        limit: int = 20,
+        include_raw: bool = False,
+    ) -> dict[str, Any]:
+        search = (str(search).strip() if search is not None else "")
+        category = (str(category).lower().strip() if category is not None else "")
+        limit = max(1, min(100, int(limit)))
+        include_raw = bool(include_raw)
+        room_id_i = int(room_id) if room_id is not None else None
+
+        category_controls = {
+            "lights": {"light_v2", "control4_lights_gen3", "outlet_light", "outlet_module_v2"},
+            # Locks may appear either as a lock proxy (control=lock) or as a relay-style door lock proxy.
+            "locks": {"lock", "control4_relaysingle"},
+            "thermostat": {"thermostatV2"},
+            "media": {
+                "media_player",
+                "media_service",
+                "receiver",
+                "tv",
+                "dvd",
+                "tuner",
+                "satellite",
+                "avswitch",
+                "av_gen",
+                "control4_digitalaudio",
+            },
+        }
+
+        if category and category not in category_controls:
+            return {"ok": False, "error": f"Unknown category '{category}'. Use one of: {sorted(category_controls.keys())}"}
+
+        items = self.get_all_items()
+        rooms_by_id = {
+            str(i.get("id")): i.get("name")
+            for i in items
+            if isinstance(i, dict) and i.get("typeName") == "room" and i.get("id") is not None
+        }
+
+        allowed_controls = category_controls.get(category) if category else None
+        is_lock_category = category == "locks"
+
+        matches: list[dict[str, Any]] = []
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+
+            device_room_id = i.get("roomId") or i.get("parentId")
+            if room_id_i is not None and device_room_id is not None and int(device_room_id) != int(room_id_i):
+                continue
+
+            control = str(i.get("control") or "").lower()
+            if allowed_controls is not None:
+                if control not in allowed_controls and not is_lock_category:
+                    continue
+                if is_lock_category:
+                    # In lock category, accept either explicit lock control or relay single.
+                    if control not in allowed_controls and str(i.get("proxy") or "").lower() != "lock":
+                        continue
+
+            name_i = str(i.get("name") or "")
+            score = self._score_match(search, name_i) if search else 1
+            if score <= 0:
+                continue
+
+            resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(device_room_id)) if device_room_id is not None else None)
+            out: dict[str, Any] = {
+                "device_id": str(i.get("id")),
+                "name": name_i,
+                "room_id": (str(device_room_id) if device_room_id is not None else None),
+                "room_name": resolved_room_name,
+                "control": (i.get("control") or None),
+                "proxy": (i.get("proxy") or None),
+                "score": int(score),
+            }
+            if include_raw:
+                out["raw"] = i
+            matches.append(out)
+
+        matches.sort(key=lambda m: (-int(m.get("score") or 0), str(m.get("name") or ""), str(m.get("device_id") or "")))
+        return {
+            "ok": True,
+            "search": (search if search else None),
+            "category": (category if category else None),
+            "room_id": (str(room_id_i) if room_id_i is not None else None),
+            "matches": matches[:limit],
+        }
+
+    def resolve_device(
+        self,
+        name: str,
+        category: str | None = None,
+        room_id: int | None = None,
+        require_unique: bool = True,
+        include_candidates: bool = True,
+    ) -> dict[str, Any]:
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "error": "name is required"}
+
+        found = self.find_devices(search=name, category=category, room_id=room_id, limit=8, include_raw=False)
+        if not found.get("ok"):
+            return found
+
+        matches = list(found.get("matches") or [])
+        if not matches:
+            return {
+                "ok": False,
+                "error": "not_found",
+                "details": f"No devices matched '{name}'",
+                "candidates": [],
+            }
+
+        best = matches[0]
+        best_score = int(best.get("score") or 0)
+        second_score = int(matches[1].get("score") or 0) if len(matches) > 1 else 0
+
+        accept = (best_score >= 100) or (best_score >= 80 and (best_score - second_score) >= 10)
+        if not accept and bool(require_unique):
+            return {
+                "ok": False,
+                "error": "ambiguous",
+                "details": f"Multiple devices could match '{name}'.",
+                "candidates": matches if include_candidates else [],
+            }
+
+        out: dict[str, Any] = {
+            "ok": True,
+            "device_id": str(best.get("device_id")),
+            "name": str(best.get("name")),
+            "room_id": best.get("room_id"),
+            "room_name": best.get("room_name"),
+        }
+        if include_candidates:
+            out["candidates"] = matches
+        return out
+
+    def resolve_room_and_device(
+        self,
+        room_name: str | None = None,
+        device_name: str | None = None,
+        category: str | None = None,
+        require_unique: bool = True,
+        include_candidates: bool = True,
+    ) -> dict[str, Any]:
+        room_name = (str(room_name).strip() if room_name is not None else "")
+        device_name = (str(device_name).strip() if device_name is not None else "")
+        category = (str(category).strip() if category is not None else None)
+
+        if not room_name and not device_name:
+            return {"ok": False, "error": "room_name or device_name is required"}
+
+        room_res: dict[str, Any] | None = None
+        room_id: int | None = None
+        if room_name:
+            room_res = self.resolve_room(room_name, require_unique=bool(require_unique), include_candidates=bool(include_candidates))
+            if not room_res.get("ok"):
+                return {"ok": False, "error": "room_resolve_failed", "room": room_res}
+            try:
+                room_id = int(room_res.get("room_id"))
+            except Exception:
+                room_id = None
+
+        dev_res: dict[str, Any] | None = None
+        if device_name:
+            dev_res = self.resolve_device(
+                device_name,
+                category=category,
+                room_id=room_id,
+                require_unique=bool(require_unique),
+                include_candidates=bool(include_candidates),
+            )
+            if not dev_res.get("ok"):
+                return {"ok": False, "error": "device_resolve_failed", "room": room_res, "device": dev_res}
+
+        out: dict[str, Any] = {"ok": True}
+        if room_res is not None:
+            out["room"] = room_res
+        if dev_res is not None:
+            out["device"] = dev_res
+        return out
 
     # ---------- item variables (debug tool support) ----------
 

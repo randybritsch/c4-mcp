@@ -773,6 +773,14 @@ def main() -> int:
         )
         _print_json(f"light {lid} initial state", {"state": s0, "level": l0})
 
+        initial_state: bool | None = None
+        if isinstance(s0, dict) and s0.get("state") in (True, False):
+            initial_state = bool(s0.get("state"))
+
+        initial_level: int | None = None
+        if isinstance(l0, dict) and isinstance(l0.get("level"), int):
+            initial_level = int(l0.get("level"))
+
         if args.do_writes:
             off = _unwrap_call_payload(
                 mcp_call(
@@ -847,6 +855,49 @@ def main() -> int:
                 _print_json(f"light {lid} read-back after {target}", rb)
                 _assert_light_expectations(rb, expected_level=int(target))
 
+            # Best-effort restore to the initial state so write smoke tests don't leave the home changed.
+            try:
+                print(f"Restoring light {lid} to initial state...")
+                if initial_state is False or (isinstance(initial_level, int) and initial_level <= 0):
+                    rr = _unwrap_call_payload(
+                        mcp_call(
+                            args.base_url,
+                            "tool",
+                            "c4_item_send_command",
+                            {"device_id": lid, "command": "OFF"},
+                            float(args.timeout),
+                            headers,
+                        )
+                    )
+                    _print_json(f"light {lid} restore OFF", rr)
+                else:
+                    rr = _unwrap_call_payload(
+                        mcp_call(
+                            args.base_url,
+                            "tool",
+                            "c4_item_send_command",
+                            {"device_id": lid, "command": "ON"},
+                            float(args.timeout),
+                            headers,
+                        )
+                    )
+                    _print_json(f"light {lid} restore ON", rr)
+
+                    if isinstance(initial_level, int) and 1 <= int(initial_level) <= 100:
+                        rr2 = _unwrap_call_payload(
+                            mcp_call(
+                                args.base_url,
+                                "tool",
+                                "c4_light_set_level",
+                                {"device_id": lid, "level": int(initial_level)},
+                                float(args.timeout),
+                                headers,
+                            )
+                        )
+                        _print_json(f"light {lid} restore level {initial_level}", rr2)
+            except Exception as e:
+                print(f"WARN: failed to restore light {lid}: {e}")
+
     # ---- Locks ----
     if args.lock_id:
         kid = str(args.lock_id)
@@ -855,6 +906,10 @@ def main() -> int:
         )
         _print_json(f"lock {kid} get_state", st)
         _expect(bool(st.get("ok")), "c4_lock_get_state did not return ok")
+
+        orig_locked: bool | None = None
+        if isinstance(st, dict) and st.get("locked") in (True, False):
+            orig_locked = bool(st.get("locked"))
 
         if args.do_writes:
             u = _unwrap_call_payload(
@@ -872,6 +927,17 @@ def main() -> int:
             _expect(bool(l.get("ok")), "c4_lock_lock did not return ok")
             _expect("accepted" in l, "lock lock missing accepted")
             _expect("confirmed" in l, "lock lock missing confirmed")
+
+            # Best-effort restore to initial state.
+            if orig_locked is False:
+                try:
+                    print(f"Restoring lock {kid} to unlocked...")
+                    ru = _unwrap_call_payload(
+                        mcp_call(args.base_url, "tool", "c4_lock_unlock", {"device_id": kid}, float(args.timeout), headers)
+                    )
+                    _print_json(f"lock {kid} restore unlock", ru)
+                except Exception as e:
+                    print(f"WARN: failed to restore lock {kid} to unlocked: {e}")
 
     # ---- Thermostats ----
     selected_thermostat_id: str | None = str(args.thermostat_id) if args.thermostat_id else None

@@ -26,6 +26,62 @@ def get_all_items() -> List[Json]:
     return gateway.get_all_items()  # type: ignore[return-value]
 
 
+def find_rooms(search: str, limit: int = 10, include_raw: bool = False) -> Json:
+    return gateway.find_rooms(str(search or ""), limit=int(limit), include_raw=bool(include_raw))  # type: ignore[misc]
+
+
+def resolve_room(name: str, require_unique: bool = True, include_candidates: bool = True) -> Json:
+    return gateway.resolve_room(str(name or ""), require_unique=bool(require_unique), include_candidates=bool(include_candidates))  # type: ignore[misc]
+
+
+def find_devices(
+    search: str | None = None,
+    category: str | None = None,
+    room_id: int | None = None,
+    limit: int = 20,
+    include_raw: bool = False,
+) -> Json:
+    return gateway.find_devices(
+        (str(search) if search is not None else None),
+        (str(category) if category is not None else None),
+        (int(room_id) if room_id is not None else None),
+        limit=int(limit),
+        include_raw=bool(include_raw),
+    )  # type: ignore[misc]
+
+
+def resolve_device(
+    name: str,
+    category: str | None = None,
+    room_id: int | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+) -> Json:
+    return gateway.resolve_device(
+        str(name or ""),
+        category=(str(category) if category is not None else None),
+        room_id=(int(room_id) if room_id is not None else None),
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )  # type: ignore[misc]
+
+
+def resolve_room_and_device(
+    room_name: str | None = None,
+    device_name: str | None = None,
+    category: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+) -> Json:
+    return gateway.resolve_room_and_device(
+        (str(room_name) if room_name is not None else None),
+        (str(device_name) if device_name is not None else None),
+        (str(category) if category is not None else None),
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )  # type: ignore[misc]
+
+
 def item_get_variables(device_id: int, timeout_s: float = 12.0) -> Any:
     """
     Raw variables for an item. The latest gateway code doesn't expose item_get_variables,

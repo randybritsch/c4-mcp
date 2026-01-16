@@ -57,11 +57,27 @@ Notes:
 - Start server: `\.venv\\Scripts\\python.exe app.py`
 - Verify MCP is up: `GET http://127.0.0.1:3333/mcp/list`
 
+### Optional: write guardrails (recommended for safety)
+
+By default, tools that change state (locks, lights, thermostat, media remote, etc.) are allowed.
+If you want a **read-only** server unless explicitly enabled, set:
+
+- `C4_WRITE_GUARDRAILS=true` (turns on enforcement)
+- `C4_WRITES_ENABLED=true` (allows write tools)
+
+Optional filters (comma-separated tool names):
+
+- `C4_WRITE_ALLOWLIST=c4_light_set_level,c4_light_ramp` (only allow these write tools)
+- `C4_WRITE_DENYLIST=c4_lock_unlock,c4_lock_lock` (block these write tools)
+
 ## Discover IDs
 
 Device and room ids are specific to your Control4 project. Use:
 
 - `c4_list_rooms`
+- `c4_find_rooms` / `c4_resolve_room` (search by name)
 - `c4_list_devices` (by category)
+- `c4_find_devices` / `c4_resolve_device` (search by name; optional category/room filters)
+- `c4_resolve` (resolve room + device together; device resolution can be scoped to the resolved room)
 
 Then pass the discovered ids into tools like `c4_media_watch_launch_app` or the scripts in `tools/`.

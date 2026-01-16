@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
+import time
+import uuid
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from werkzeug.exceptions import HTTPException
 from flask_mcp_server import Mcp, mount_mcp
 from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
@@ -32,6 +37,8 @@ from control4_adapter import (
     fan_list,
     fan_set_power,
     fan_set_speed,
+    find_devices,
+    find_rooms,
     get_all_items,
     intercom_list,
     intercom_touchscreen_screensaver,
@@ -62,6 +69,9 @@ from control4_adapter import (
     scheduler_set_enabled,
     motion_get_state,
     motion_list,
+    resolve_device,
+    resolve_room,
+    resolve_room_and_device,
     room_off,
     room_list_commands,
     room_remote,
@@ -91,6 +101,287 @@ from control4_adapter import (
 
 # ---------- App / Gateway ----------
 app = Flask(__name__)
+
+
+def _setup_logging() -> logging.Logger:
+    """Configure structured logging for the MCP server.
+
+    This is intentionally lightweight and safe:
+    - No contract changes to MCP responses
+    - Avoids logging sensitive fields by default
+    """
+
+    logger = logging.getLogger("c4-mcp")
+    if getattr(logger, "_c4_configured", False):
+        return logger
+
+    level_name = str(os.getenv("C4_LOG_LEVEL", "INFO")).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+
+    os.makedirs("logs", exist_ok=True)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    sh = logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    fh = RotatingFileHandler(os.path.join("logs", "mcp_server.log"), maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    logger.propagate = False
+    logger._c4_configured = True
+    return logger
+
+
+_log = _setup_logging()
+
+
+def _safe_json(obj: object) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return json.dumps({"_error": "json-encode-failed"})
+
+
+_SENSITIVE_ARG_KEYS = {
+    "password",
+    "pass",
+    "token",
+    "api_key",
+    "apikey",
+    "secret",
+}
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_csv(name: str) -> list[str]:
+    raw = os.getenv(name)
+    if not raw:
+        return []
+    parts = [p.strip() for p in str(raw).split(",")]
+    return [p for p in parts if p]
+
+
+# Best-effort classification of tools that mutate state.
+# This list is intentionally conservative; you can refine over time.
+_WRITE_TOOL_NAMES = {
+    # Generic / debug
+    "c4_item_send_command",
+    "c4_item_execute_command",
+    # Lighting
+    "c4_light_set_level",
+    "c4_light_ramp",
+    # Locks
+    "c4_lock_lock",
+    "c4_lock_unlock",
+    # Thermostat
+    "c4_thermostat_set_target_f",
+    "c4_thermostat_set_heat_setpoint_f",
+    "c4_thermostat_set_cool_setpoint_f",
+    "c4_thermostat_set_hvac_mode",
+    "c4_thermostat_set_fan_mode",
+    "c4_thermostat_set_hold_mode",
+    # Room / UI actions
+    "c4_room_send_command",
+    "c4_room_remote",
+    "c4_room_off",
+    "c4_room_select_video_device",
+    "c4_room_select_audio_device",
+    "c4_room_listen",
+    "c4_uibutton_activate",
+    # Media
+    "c4_media_send_command",
+    "c4_media_remote",
+    "c4_media_remote_sequence",
+    "c4_media_launch_app",
+    "c4_media_watch_launch_app",
+    # Scheduler
+    "c4_scheduler_set_enabled",
+    # Macros / announcements
+    "c4_macro_execute",
+    "c4_macro_execute_by_name",
+    "c4_announcement_execute",
+    "c4_announcement_execute_by_name",
+    # Intercom / doorstation
+    "c4_intercom_touchscreen_screensaver",
+    "c4_intercom_touchscreen_set_feature",
+    "c4_doorstation_set_led",
+    "c4_doorstation_set_external_chime",
+    "c4_doorstation_set_raw_setting",
+    # Fans
+    "c4_fan_set_power",
+    "c4_fan_set_speed",
+    # Keypads (actions)
+    "c4_keypad_button_action",
+    "c4_control_keypad_send_command",
+}
+
+
+def _is_write_tool(tool_name: str) -> bool:
+    if not tool_name:
+        return False
+    name = str(tool_name)
+    if name in _WRITE_TOOL_NAMES:
+        return True
+    # Heuristic fallback for common write naming patterns.
+    lowered = name.lower()
+    return any(
+        lowered.startswith(prefix)
+        for prefix in (
+            "c4_set_",
+            "c4_light_set_",
+            "c4_light_ramp",
+            "c4_lock_",
+            "c4_thermostat_set_",
+            "c4_media_remote",
+            "c4_media_send_",
+            "c4_room_send_",
+        )
+    )
+
+
+def _write_guardrails_enabled() -> bool:
+    # Opt-in only: leaving this off preserves current behavior.
+    return _env_truthy("C4_WRITE_GUARDRAILS", default=False)
+
+
+def _writes_enabled() -> bool:
+    # Only relevant when guardrails are enabled.
+    return _env_truthy("C4_WRITES_ENABLED", default=False)
+
+
+def _write_allowed(tool_name: str) -> tuple[bool, str | None]:
+    deny = {s.lower() for s in _env_csv("C4_WRITE_DENYLIST")}
+    allow = {s.lower() for s in _env_csv("C4_WRITE_ALLOWLIST")}
+
+    tn = str(tool_name or "")
+    tnl = tn.lower()
+
+    if tnl in deny:
+        return False, "write denied by C4_WRITE_DENYLIST"
+    if allow and tnl not in allow:
+        return False, "write not present in C4_WRITE_ALLOWLIST"
+    return True, None
+
+
+@app.before_request
+def _c4_before_request() -> None:
+    g._c4_start = time.perf_counter()
+    g.request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+
+    # Opt-in: allow operators to run the server in a safe, read-only mode.
+    # This is enforced at the HTTP boundary so we don't have to thread flags through tool code.
+    try:
+        if not _write_guardrails_enabled():
+            return
+
+        if request.path.endswith("/mcp/call") and request.method.upper() == "POST" and request.is_json:
+            body = request.get_json(silent=True) or {}
+            if isinstance(body, dict) and body.get("kind") == "tool":
+                tool_name = str(body.get("name") or "")
+                if _is_write_tool(tool_name):
+                    if not _writes_enabled():
+                        _log.warning(
+                            _safe_json(
+                                {
+                                    "event": "write_blocked",
+                                    "request_id": getattr(g, "request_id", None),
+                                    "reason": "C4_WRITES_ENABLED is not true",
+                                    "tool": tool_name,
+                                }
+                            )
+                        )
+                        # Match our general JSON error shape; keep it simple.
+                        return (
+                            jsonify(
+                                {
+                                    "ok": False,
+                                    "error": "writes_disabled",
+                                    "details": "Write tools are blocked (set C4_WRITES_ENABLED=true or disable C4_WRITE_GUARDRAILS).",
+                                    "request_id": getattr(g, "request_id", None),
+                                }
+                            ),
+                            403,
+                        )
+
+                    allowed, why = _write_allowed(tool_name)
+                    if not allowed:
+                        _log.warning(
+                            _safe_json(
+                                {
+                                    "event": "write_blocked",
+                                    "request_id": getattr(g, "request_id", None),
+                                    "reason": why,
+                                    "tool": tool_name,
+                                }
+                            )
+                        )
+                        return (
+                            jsonify(
+                                {
+                                    "ok": False,
+                                    "error": "write_not_allowed",
+                                    "details": why,
+                                    "request_id": getattr(g, "request_id", None),
+                                }
+                            ),
+                            403,
+                        )
+    except Exception:
+        # Never break requests due to guardrails parsing.
+        return
+
+
+@app.after_request
+def _c4_after_request(resp):
+    try:
+        resp.headers["X-Request-Id"] = getattr(g, "request_id", "")
+
+        start = getattr(g, "_c4_start", None)
+        duration_ms = None
+        if isinstance(start, (int, float)):
+            duration_ms = round((time.perf_counter() - float(start)) * 1000.0, 2)
+
+        fields: dict[str, object] = {
+            "event": "http_request",
+            "request_id": getattr(g, "request_id", None),
+            "method": request.method,
+            "path": request.path,
+            "status": int(getattr(resp, "status_code", 0) or 0),
+            "duration_ms": duration_ms,
+        }
+
+        # MCP-specific context (best-effort). Avoid logging full args.
+        if request.path.endswith("/mcp/call"):
+            body = request.get_json(silent=True) if request.is_json else None
+            if isinstance(body, dict):
+                fields["mcp_kind"] = body.get("kind")
+                fields["mcp_name"] = body.get("name")
+                args = body.get("args")
+                if isinstance(args, dict):
+                    lowered = {str(k).lower() for k in args.keys()}
+                    fields["arg_count"] = len(args)
+                    fields["arg_redacted"] = any(k in _SENSITIVE_ARG_KEYS for k in lowered)
+                    if not fields["arg_redacted"]:
+                        keys = [str(k) for k in args.keys()]
+                        fields["arg_keys"] = keys[:25]
+
+        _log.info(_safe_json(fields))
+    except Exception:
+        # Never let logging break a request.
+        pass
+    return resp
 
 # Locks can block (cloud/driver latency); run them in a small thread pool
 _lock_pool = ThreadPoolExecutor(max_workers=4)
@@ -299,6 +590,22 @@ def c4_debug_trace_command(
 @Mcp.tool(name="c4_list_rooms", description="List rooms from Control4 (live).")
 def c4_list_rooms() -> dict:
     return {"ok": True, "rooms": list_rooms()}
+
+
+@Mcp.tool(name="c4_find_rooms", description="Find rooms by name (case-insensitive, fuzzy).")
+def c4_find_rooms_tool(search: str, limit: int = 10, include_raw: bool = False) -> dict:
+    return find_rooms(str(search or ""), limit=int(limit), include_raw=bool(include_raw))
+
+
+@Mcp.tool(
+    name="c4_resolve_room",
+    description=(
+        "Resolve a room name to a single room_id (best-effort). Returns candidates when ambiguous. "
+        "Use c4_find_rooms if you want to pick manually."
+    ),
+)
+def c4_resolve_room_tool(name: str, require_unique: bool = True, include_candidates: bool = True) -> dict:
+    return resolve_room(str(name or ""), require_unique=bool(require_unique), include_candidates=bool(include_candidates))
 
 
 @Mcp.tool(name="c4_list_typenames", description="List Control4 item typeName values and counts (discovery).")
@@ -922,6 +1229,75 @@ def c4_list_devices(category: str) -> dict:
 
     devices.sort(key=lambda d: ((d.get("roomName") or ""), (d.get("name") or "")))
     return {"ok": True, "category": category, "devices": devices}
+
+
+@Mcp.tool(
+    name="c4_find_devices",
+    description=(
+        "Find devices by name (case-insensitive, fuzzy). Optional filters: category in {lights, locks, thermostat, media} and room_id."
+    ),
+)
+def c4_find_devices_tool(
+    search: str | None = None,
+    category: str | None = None,
+    room_id: str | None = None,
+    limit: int = 20,
+    include_raw: bool = False,
+) -> dict:
+    rid = int(room_id) if room_id is not None and str(room_id).strip() else None
+    return find_devices(
+        (str(search) if search is not None else None),
+        (str(category) if category is not None else None),
+        room_id=rid,
+        limit=int(limit),
+        include_raw=bool(include_raw),
+    )
+
+
+@Mcp.tool(
+    name="c4_resolve_device",
+    description=(
+        "Resolve a device name to a single device_id (best-effort). Optional filters: category and room_id. Returns candidates when ambiguous."
+    ),
+)
+def c4_resolve_device_tool(
+    name: str,
+    category: str | None = None,
+    room_id: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+) -> dict:
+    rid = int(room_id) if room_id is not None and str(room_id).strip() else None
+    return resolve_device(
+        str(name or ""),
+        category=(str(category) if category is not None else None),
+        room_id=rid,
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
+
+
+@Mcp.tool(
+    name="c4_resolve",
+    description=(
+        "Resolve room and/or device names to ids in one call (best-effort). "
+        "If room_name is provided, device resolution is scoped to that room."
+    ),
+)
+def c4_resolve_tool(
+    room_name: str | None = None,
+    device_name: str | None = None,
+    category: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+) -> dict:
+    return resolve_room_and_device(
+        (str(room_name) if room_name is not None else None),
+        (str(device_name) if device_name is not None else None),
+        (str(category) if category is not None else None),
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
 
 
 # ---- TV / Room-level control ----
