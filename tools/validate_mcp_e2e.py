@@ -603,6 +603,8 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=25.0, help="Per-request timeout")
 
     p.add_argument("--light-id", type=str, default=None, help="Light device_id to validate")
+    p.add_argument("--light-name", type=str, default=None, help="Light name to validate via c4_light_set_by_name (dry_run)")
+    p.add_argument("--light-room-name", type=str, default=None, help="Optional room name to scope --light-name")
     p.add_argument(
         "--auto-light",
         action="store_true",
@@ -619,6 +621,8 @@ def main() -> int:
         help="Auto-select a lock name from c4_list_devices(locks) for by-name validation",
     )
     p.add_argument("--media-id", type=str, default=None, help="Media/AV device_id to validate")
+    p.add_argument("--watch-room-name", type=str, default=None, help="Room name to validate via c4_tv_watch_by_name (dry_run)")
+    p.add_argument("--watch-source-name", type=str, default=None, help="Video source device name for --watch-room-name")
     p.add_argument(
         "--auto-media",
         action="store_true",
@@ -710,6 +714,35 @@ def main() -> int:
         headers=headers,
     )
     _print_json("c4_list_devices(lights)", devices_lights)
+
+    # ---- Lighting by-name (dry_run) ----
+    if args.light_name:
+        print(f"\n-- Light by-name validation (light_name={args.light_name}) --")
+        payload = {
+            "device_name": str(args.light_name),
+            "state": "on",
+            "dry_run": True,
+            "include_candidates": True,
+        }
+        if args.light_room_name:
+            payload["room_name"] = str(args.light_room_name)
+
+        by_name = _unwrap_call_payload(
+            mcp_call(
+                args.base_url,
+                "tool",
+                "c4_light_set_by_name",
+                payload,
+                float(args.timeout),
+                headers,
+            )
+        )
+        _print_json("c4_light_set_by_name (dry_run)", by_name)
+        _expect(bool(by_name.get("ok")), "c4_light_set_by_name did not return ok")
+        _expect(by_name.get("dry_run") is True, "c4_light_set_by_name did not honor dry_run=true")
+        planned = by_name.get("planned")
+        _expect(isinstance(planned, dict), "c4_light_set_by_name missing planned")
+        _expect(bool(planned.get("device_id")), "c4_light_set_by_name planned missing device_id")
 
     selected_light_id: str | None = str(args.light_id) if args.light_id else None
     if not selected_light_id and args.auto_light:
@@ -960,6 +993,34 @@ def main() -> int:
         planned = by_name.get("planned")
         _expect(isinstance(planned, dict), "c4_lock_set_by_name missing planned")
         _expect(bool(planned.get("device_id")), "c4_lock_set_by_name planned missing device_id")
+
+    # ---- Watch by-name (dry_run) ----
+    if args.watch_room_name or args.watch_source_name:
+        _expect(bool(args.watch_room_name) and bool(args.watch_source_name), "Provide both --watch-room-name and --watch-source-name")
+        print(f"\n-- Watch by-name validation (room={args.watch_room_name}, source={args.watch_source_name}) --")
+        by_name = _unwrap_call_payload(
+            mcp_call(
+                args.base_url,
+                "tool",
+                "c4_tv_watch_by_name",
+                {
+                    "room_name": str(args.watch_room_name),
+                    "source_device_name": str(args.watch_source_name),
+                    "dry_run": True,
+                    "include_candidates": True,
+                    "require_unique": True,
+                },
+                float(args.timeout),
+                headers,
+            )
+        )
+        _print_json("c4_tv_watch_by_name (dry_run)", by_name)
+        _expect(bool(by_name.get("ok")), "c4_tv_watch_by_name did not return ok")
+        _expect(by_name.get("dry_run") is True, "c4_tv_watch_by_name did not honor dry_run=true")
+        planned = by_name.get("planned")
+        _expect(isinstance(planned, dict), "c4_tv_watch_by_name missing planned")
+        _expect(bool(planned.get("room_id")), "c4_tv_watch_by_name planned missing room_id")
+        _expect(bool(planned.get("source_device_id")), "c4_tv_watch_by_name planned missing source_device_id")
 
     if args.lock_id:
         kid = str(args.lock_id)

@@ -34,6 +34,31 @@ def resolve_room(name: str, require_unique: bool = True, include_candidates: boo
     return gateway.resolve_room(str(name or ""), require_unique=bool(require_unique), include_candidates=bool(include_candidates))  # type: ignore[misc]
 
 
+def resolve_named_candidates(
+    query: str,
+    rows: List[Json],
+    *,
+    entity: str,
+    name_key: str = "name",
+    id_key: str = "id",
+    max_candidates: int = 10,
+) -> Json:
+    """Resolve a row from an arbitrary candidate list using the gateway's safe resolver.
+
+    This is useful when Control4 returns a list of valid options (e.g., Listen sources for a room)
+    and we want consistent name resolution behavior without duplicating matching logic.
+    """
+
+    return gateway._resolve_named_row(  # type: ignore[attr-defined]
+        str(query or ""),
+        list(rows or []),
+        entity=str(entity or "item"),
+        name_key=str(name_key or "name"),
+        id_key=str(id_key or "id"),
+        max_candidates=int(max_candidates),
+    )
+
+
 def find_devices(
     search: str | None = None,
     category: str | None = None,

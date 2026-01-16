@@ -1651,6 +1651,164 @@ class Control4Gateway:
         return re.sub(r"\s+", " ", s).strip()
 
     @classmethod
+    def _resolve_named_row(
+        cls,
+        query: str,
+        rows: list[dict[str, Any]],
+        *,
+        entity: str,
+        name_key: str = "name",
+        id_key: str = "id",
+        max_candidates: int = 10,
+    ) -> dict[str, Any]:
+        """Resolve a row from a list of dicts using safe fuzzy-ish matching.
+
+        This is intended for "*_by_name" execution helpers (write-ish operations),
+        so it will only auto-select when the match is unambiguous.
+
+        Resolution order:
+        1) Normalized exact match (ignores punctuation/case/whitespace)
+        2) Unique normalized prefix match
+        3) Unique normalized contains match (requires query length >= 6)
+        4) Strong fuzzy match (high score + clear lead over #2)
+
+        Otherwise: returns ok=False with suggestions and does not execute.
+        """
+
+        q_raw = str(query or "").strip()
+        if not q_raw:
+            return {"ok": False, "error": "name is required", "error_code": "missing_name", "candidates": []}
+
+        q_norm = cls._norm_search_text(q_raw)
+        items: list[dict[str, Any]] = []
+
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get(id_key)
+            name = str(r.get(name_key) or "").strip()
+            if rid is None or not name:
+                continue
+            n_norm = cls._norm_search_text(name)
+            score = int(cls._score_match(q_raw, name))
+            items.append({"id": rid, "name": name, "norm": n_norm, "score": score})
+
+        # Sort: best score first, then stable-ish name/id ordering.
+        items.sort(key=lambda m: (-int(m.get("score") or 0), str(m.get("name") or ""), str(m.get("id") or "")))
+        candidates = [{k: v for k, v in m.items() if k != "norm"} for m in items[:max(1, int(max_candidates))]]
+
+        if not items:
+            return {
+                "ok": False,
+                "error_code": "not_found",
+                "error": f"No {entity} items available to match against",
+                "query": q_raw,
+                "candidates": [],
+                "suggestions": [],
+            }
+
+        # 1) Normalized exact match.
+        if q_norm:
+            exact = [m for m in items if m.get("norm") == q_norm]
+            if len(exact) == 1:
+                m = exact[0]
+                return {
+                    "ok": True,
+                    "id": m.get("id"),
+                    "name": m.get("name"),
+                    "match_type": "normalized_exact",
+                    "query": q_raw,
+                    "candidates": candidates,
+                }
+            if len(exact) > 1:
+                matches = [{k: v for k, v in m.items() if k != "norm"} for m in exact]
+                return {
+                    "ok": False,
+                    "error_code": "ambiguous",
+                    "error": f"{entity.title()} name is ambiguous (multiple normalized matches)",
+                    "query": q_raw,
+                    "matches": matches,
+                    "candidates": candidates,
+                    "suggestions": matches[:max(1, int(max_candidates))],
+                }
+
+            # 2) Unique normalized prefix match.
+            prefix = [m for m in items if str(m.get("norm") or "").startswith(q_norm)]
+            if len(prefix) == 1:
+                m = prefix[0]
+                return {
+                    "ok": True,
+                    "id": m.get("id"),
+                    "name": m.get("name"),
+                    "match_type": "prefix",
+                    "query": q_raw,
+                    "candidates": candidates,
+                }
+            if len(prefix) > 1:
+                suggestions = [{k: v for k, v in m.items() if k != "norm"} for m in prefix[:max(1, int(max_candidates))]]
+                return {
+                    "ok": False,
+                    "error_code": "ambiguous",
+                    "error": f"{entity.title()} name is ambiguous (multiple prefix matches)",
+                    "query": q_raw,
+                    "candidates": candidates,
+                    "suggestions": suggestions,
+                }
+
+            # 3) Unique normalized contains match (only if query is reasonably specific).
+            if len(q_norm) >= 6:
+                contains = [m for m in items if q_norm in str(m.get("norm") or "")]
+                if len(contains) == 1:
+                    m = contains[0]
+                    return {
+                        "ok": True,
+                        "id": m.get("id"),
+                        "name": m.get("name"),
+                        "match_type": "contains",
+                        "query": q_raw,
+                        "candidates": candidates,
+                    }
+                if len(contains) > 1:
+                    suggestions = [{k: v for k, v in m.items() if k != "norm"} for m in contains[:max(1, int(max_candidates))]]
+                    return {
+                        "ok": False,
+                        "error_code": "ambiguous",
+                        "error": f"{entity.title()} name is ambiguous (multiple contains matches)",
+                        "query": q_raw,
+                        "candidates": candidates,
+                        "suggestions": suggestions,
+                    }
+
+        # 4) Strong fuzzy match with a clear lead.
+        best = items[0]
+        best_score = int(best.get("score") or 0)
+        second_score = int(items[1].get("score") or 0) if len(items) > 1 else 0
+        accept = (best_score >= 95) or (best_score >= 90 and (best_score - second_score) >= 15)
+        if accept:
+            return {
+                "ok": True,
+                "id": best.get("id"),
+                "name": best.get("name"),
+                "match_type": "fuzzy",
+                "query": q_raw,
+                "candidates": candidates,
+            }
+
+        # Otherwise: do not select.
+        return {
+            "ok": False,
+            "error_code": "not_found" if best_score < 50 else "ambiguous",
+            "error": (
+                f"No {entity} matched name (unambiguous match required)"
+                if best_score < 50
+                else f"Multiple {entity} items could match '{q_raw}'"
+            ),
+            "query": q_raw,
+            "candidates": candidates,
+            "suggestions": candidates,
+        }
+
+    @classmethod
     def _score_match(cls, query: str, candidate: str) -> int:
         qn = cls._norm_search_text(query)
         cn = cls._norm_search_text(candidate)
@@ -1715,21 +1873,84 @@ class Control4Gateway:
         if not matches:
             return {"ok": False, "error": "not_found", "details": f"No rooms matched '{name}'", "candidates": []}
 
-        best = matches[0]
-        best_score = int(best.get("score") or 0)
-        second_score = int(matches[1].get("score") or 0) if len(matches) > 1 else 0
+        # Safe resolution: only auto-pick when unambiguous.
+        q_norm = self._norm_search_text(name)
 
-        # Accept if it's an exact match, or a clearly better fuzzy match.
-        accept = (best_score >= 100) or (best_score >= 80 and (best_score - second_score) >= 10)
-        if not accept and bool(require_unique):
-            return {
-                "ok": False,
-                "error": "ambiguous",
-                "details": f"Multiple rooms could match '{name}'.",
-                "candidates": matches if include_candidates else [],
-            }
+        def _norm_of(m: dict[str, Any]) -> str:
+            return self._norm_search_text(str(m.get("name") or ""))
 
-        out: dict[str, Any] = {"ok": True, "room_id": str(best.get("room_id")), "name": str(best.get("name"))}
+        def _one(predicate) -> tuple[dict[str, Any] | None, str | None, list[dict[str, Any]]]:
+            picked = [m for m in matches if predicate(m)]
+            if len(picked) == 1:
+                return picked[0], None, picked
+            if len(picked) > 1:
+                return None, "ambiguous", picked
+            return None, None, []
+
+        best: dict[str, Any] | None = None
+        match_type: str | None = None
+
+        if q_norm:
+            one, err, picked = _one(lambda m: _norm_of(m) == q_norm)
+            if err and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple rooms could match '{name}' (normalized exact match).",
+                    "candidates": matches if include_candidates else [],
+                    "matches": picked,
+                }
+            if one is not None:
+                best, match_type = one, "normalized_exact"
+
+        if best is None and q_norm:
+            one, err, picked = _one(lambda m: _norm_of(m).startswith(q_norm))
+            if err and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple rooms could match '{name}' (prefix match).",
+                    "candidates": matches if include_candidates else [],
+                    "matches": picked,
+                }
+            if one is not None:
+                best, match_type = one, "prefix"
+
+        if best is None and q_norm and len(q_norm) >= 6:
+            one, err, picked = _one(lambda m: q_norm in _norm_of(m))
+            if err and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple rooms could match '{name}' (contains match).",
+                    "candidates": matches if include_candidates else [],
+                    "matches": picked,
+                }
+            if one is not None:
+                best, match_type = one, "contains"
+
+        if best is None:
+            best = matches[0]
+            best_score = int(best.get("score") or 0)
+            second_score = int(matches[1].get("score") or 0) if len(matches) > 1 else 0
+
+            # Strong fuzzy match with a clear lead.
+            accept = (best_score >= 95) or (best_score >= 90 and (best_score - second_score) >= 15)
+            if not accept and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple rooms could match '{name}'.",
+                    "candidates": matches if include_candidates else [],
+                }
+            match_type = "fuzzy" if accept else "best_effort"
+
+        out: dict[str, Any] = {
+            "ok": True,
+            "room_id": str(best.get("room_id")),
+            "name": str(best.get("name")),
+            "match_type": match_type,
+        }
         if include_candidates:
             out["candidates"] = matches
         return out
@@ -1889,18 +2110,76 @@ class Control4Gateway:
                 "candidates": [],
             }
 
-        best = matches[0]
-        best_score = int(best.get("score") or 0)
-        second_score = int(matches[1].get("score") or 0) if len(matches) > 1 else 0
+        # Safe resolution: only auto-pick when unambiguous.
+        q_norm = self._norm_search_text(name)
 
-        accept = (best_score >= 100) or (best_score >= 80 and (best_score - second_score) >= 10)
-        if not accept and bool(require_unique):
-            return {
-                "ok": False,
-                "error": "ambiguous",
-                "details": f"Multiple devices could match '{name}'.",
-                "candidates": matches if include_candidates else [],
-            }
+        def _norm_of(m: dict[str, Any]) -> str:
+            return self._norm_search_text(str(m.get("name") or ""))
+
+        def _one(predicate) -> tuple[dict[str, Any] | None, str | None, list[dict[str, Any]]]:
+            picked = [m for m in matches if predicate(m)]
+            if len(picked) == 1:
+                return picked[0], None, picked
+            if len(picked) > 1:
+                return None, "ambiguous", picked
+            return None, None, []
+
+        best: dict[str, Any] | None = None
+        match_type: str | None = None
+
+        if q_norm:
+            one, err, picked = _one(lambda m: _norm_of(m) == q_norm)
+            if err and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple devices could match '{name}' (normalized exact match).",
+                    "candidates": matches if include_candidates else [],
+                    "matches": picked,
+                }
+            if one is not None:
+                best, match_type = one, "normalized_exact"
+
+        if best is None and q_norm:
+            one, err, picked = _one(lambda m: _norm_of(m).startswith(q_norm))
+            if err and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple devices could match '{name}' (prefix match).",
+                    "candidates": matches if include_candidates else [],
+                    "matches": picked,
+                }
+            if one is not None:
+                best, match_type = one, "prefix"
+
+        if best is None and q_norm and len(q_norm) >= 6:
+            one, err, picked = _one(lambda m: q_norm in _norm_of(m))
+            if err and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple devices could match '{name}' (contains match).",
+                    "candidates": matches if include_candidates else [],
+                    "matches": picked,
+                }
+            if one is not None:
+                best, match_type = one, "contains"
+
+        if best is None:
+            best = matches[0]
+            best_score = int(best.get("score") or 0)
+            second_score = int(matches[1].get("score") or 0) if len(matches) > 1 else 0
+
+            accept = (best_score >= 95) or (best_score >= 90 and (best_score - second_score) >= 15)
+            if not accept and bool(require_unique):
+                return {
+                    "ok": False,
+                    "error": "ambiguous",
+                    "details": f"Multiple devices could match '{name}'.",
+                    "candidates": matches if include_candidates else [],
+                }
+            match_type = "fuzzy" if accept else "best_effort"
 
         out: dict[str, Any] = {
             "ok": True,
@@ -1908,6 +2187,7 @@ class Control4Gateway:
             "name": str(best.get("name")),
             "room_id": best.get("room_id"),
             "room_name": best.get("room_name"),
+            "match_type": match_type,
         }
         if include_candidates:
             out["candidates"] = matches
@@ -3562,8 +3842,8 @@ class Control4Gateway:
         """Execute a macro by its configured name.
 
         Safety behavior:
-        - Match is case-insensitive exact equality after trimming.
-        - If 0 matches or >1 matches, do not execute.
+        - Uses safe name resolution (normalized exact/prefix/contains/strong fuzzy).
+        - If the match is missing or ambiguous, does not execute.
         """
 
         needle = str(name or "").strip()
@@ -3576,43 +3856,39 @@ class Control4Gateway:
             macros = payload if isinstance(payload, list) else []
             macros_norm = [m for m in macros if isinstance(m, dict)]
 
-            needle_l = needle.lower()
-            exact = [m for m in macros_norm if str(m.get("name") or "").strip().lower() == needle_l]
+            resolved = self._resolve_named_row(needle, macros_norm, entity="macro", name_key="name", id_key="id", max_candidates=10)
+            if not resolved.get("ok"):
+                out: dict[str, Any] = {"ok": False, "name": needle, "http": http}
+                out.update(resolved)
+                return out
 
-            if len(exact) == 0:
-                contains = [
-                    {"id": m.get("id"), "name": m.get("name")}
-                    for m in macros_norm
-                    if needle_l in str(m.get("name") or "").strip().lower()
-                ]
-                contains = contains[:10]
-                return {
-                    "ok": False,
-                    "name": needle,
-                    "error": "No macro matched name (exact match required)",
-                    "suggestions": contains,
-                    "http": http,
-                }
-
-            if len(exact) > 1:
-                return {
-                    "ok": False,
-                    "name": needle,
-                    "error": "Macro name is ambiguous (multiple exact matches)",
-                    "matches": [{"id": m.get("id"), "name": m.get("name")} for m in exact],
-                    "http": http,
-                }
-
-            mid = int(exact[0].get("id") or 0)
+            mid = int(resolved.get("id") or 0)
             if mid <= 0:
-                return {"ok": False, "name": needle, "error": "Matched macro had invalid id", "match": exact[0]}
+                return {"ok": False, "name": needle, "error": "Matched macro had invalid id", "match": resolved, "http": http}
+
+            resolved_name = str(resolved.get("name") or needle)
 
             planned = {"agent": "macros", "command": "EXECUTE_MACRO", "params": {"id": mid}}
             if bool(dry_run):
-                return {"ok": True, "name": needle, "macro_id": mid, "dry_run": True, "planned": planned}
+                return {
+                    "ok": True,
+                    "name": needle,
+                    "resolved_name": resolved_name,
+                    "macro_id": mid,
+                    "dry_run": True,
+                    "planned": planned,
+                    "resolve": resolved,
+                }
 
             r = await self._agent_send_command_async("macros", "EXECUTE_MACRO", {"id": mid})
-            return {"ok": bool(r.get("ok")), "name": needle, "macro_id": mid, "execute": r}
+            return {
+                "ok": bool(r.get("ok")),
+                "name": needle,
+                "resolved_name": resolved_name,
+                "macro_id": mid,
+                "execute": r,
+                "resolve": resolved,
+            }
 
         return self._loop_thread.run(_run(), timeout_s=18)
 
@@ -3815,8 +4091,8 @@ class Control4Gateway:
         """Execute an announcement by its configured name.
 
         Safety behavior:
-        - Match is case-insensitive exact equality after trimming.
-        - If 0 matches or >1 matches, do not execute.
+        - Uses safe name resolution (normalized exact/prefix/contains/strong fuzzy).
+        - If the match is missing or ambiguous, does not execute.
         """
 
         needle = str(name or "").strip()
@@ -3829,54 +4105,45 @@ class Control4Gateway:
             ann = payload if isinstance(payload, list) else []
             ann_norm = [a for a in ann if isinstance(a, dict)]
 
-            needle_l = needle.lower()
-            exact = [a for a in ann_norm if str(a.get("name") or "").strip().lower() == needle_l]
+            resolved = self._resolve_named_row(
+                needle,
+                ann_norm,
+                entity="announcement",
+                name_key="name",
+                id_key="id",
+                max_candidates=10,
+            )
+            if not resolved.get("ok"):
+                out: dict[str, Any] = {"ok": False, "name": needle, "http": http}
+                out.update(resolved)
+                return out
 
-            if len(exact) == 0:
-                # Provide suggestions but do not attempt fuzzy execution.
-                contains = [
-                    {"id": a.get("id"), "name": a.get("name")}
-                    for a in ann_norm
-                    if needle_l in str(a.get("name") or "").strip().lower()
-                ]
-                contains = contains[:10]
-                return {
-                    "ok": False,
-                    "name": needle,
-                    "error": "No announcement matched name (exact match required)",
-                    "suggestions": contains,
-                    "http": http,
-                }
-
-            if len(exact) > 1:
-                return {
-                    "ok": False,
-                    "name": needle,
-                    "error": "Announcement name is ambiguous (multiple exact matches)",
-                    "matches": [{"id": a.get("id"), "name": a.get("name")} for a in exact],
-                    "http": http,
-                }
-
-            aid = int(exact[0].get("id") or 0)
+            aid = int(resolved.get("id") or 0)
             if aid <= 0:
-                return {"ok": False, "name": needle, "error": "Matched announcement had invalid id", "match": exact[0]}
+                return {"ok": False, "name": needle, "error": "Matched announcement had invalid id", "match": resolved, "http": http}
+
+            resolved_name = str(resolved.get("name") or needle)
 
             planned = {"agent": "announcements", "command": "execute_announcement", "params": {"id": aid}}
             if bool(dry_run):
                 return {
                     "ok": True,
                     "name": needle,
+                    "resolved_name": resolved_name,
                     "announcement_id": aid,
                     "dry_run": True,
                     "planned": planned,
+                    "resolve": resolved,
                 }
 
             r = await self._agent_send_command_async("announcements", "execute_announcement", {"id": aid})
             return {
                 "ok": bool(r.get("ok")),
                 "name": needle,
+                "resolved_name": resolved_name,
                 "announcement_id": aid,
                 "execute": r,
+                "resolve": resolved,
             }
 
         return self._loop_thread.run(_run(), timeout_s=18)

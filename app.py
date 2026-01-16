@@ -75,6 +75,7 @@ from control4_adapter import (
     alarm_get_state,
     alarm_set_mode,
     resolve_device,
+    resolve_named_candidates,
     resolve_room,
     resolve_room_and_device,
     room_off,
@@ -214,8 +215,10 @@ _WRITE_TOOL_NAMES = {
     "c4_room_remote",
     "c4_room_off",
     "c4_room_select_video_device",
+    "c4_tv_watch_by_name",
     "c4_room_select_audio_device",
     "c4_room_listen",
+    "c4_room_listen_by_name",
     "c4_uibutton_activate",
     "c4_scene_activate",
     "c4_scene_activate_by_name",
@@ -1726,6 +1729,92 @@ def c4_tv_watch_tool(room_id: str, source_device_id: str, deselect: bool = False
 
 
 @Mcp.tool(
+    name="c4_tv_watch_by_name",
+    description=(
+        "Resolve a room by name and a video source device by name, then start/ensure a Watch session in that room. "
+        "If resolution is ambiguous, returns candidates and does not execute."
+    ),
+)
+def c4_tv_watch_by_name_tool(
+    room_name: str,
+    source_device_name: str,
+    room_id: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    deselect: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    resolved_room_id: int | None = None
+    rr: dict | None = None
+
+    if room_id is not None and str(room_id).strip():
+        try:
+            resolved_room_id = int(room_id)
+        except Exception:
+            resolved_room_id = None
+    else:
+        rr = resolve_room(
+            str(room_name or ""),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+
+    if resolved_room_id is None:
+        return {"ok": False, "error": "room_id could not be resolved", "details": rr}
+
+    # For Watch, we resolve the source device within the room to avoid cross-room ambiguity.
+    rd = resolve_device(
+        str(source_device_name or ""),
+        category="media",
+        room_id=resolved_room_id,
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
+    if not isinstance(rd, dict) or not rd.get("ok"):
+        return {"ok": False, "error": "could not resolve video source device", "details": rd}
+
+    source_device_id = rd.get("device_id")
+    if source_device_id is None:
+        return {"ok": False, "error": "resolve_device returned no device_id", "details": rd}
+
+    planned = {
+        "room_id": str(resolved_room_id),
+        "source_device_id": str(source_device_id),
+        "deselect": bool(deselect),
+    }
+
+    if bool(dry_run):
+        return {
+            "ok": True,
+            "dry_run": True,
+            "planned": planned,
+            "room_name": str(room_name or ""),
+            "room_id": str(resolved_room_id),
+            "resolve_room": rr,
+            "source_device_name": str(source_device_name or ""),
+            "resolve_source": rd,
+        }
+
+    result = room_select_video_device(int(resolved_room_id), int(source_device_id), bool(deselect))
+    return {
+        "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+        "planned": planned,
+        "room_name": str(room_name or ""),
+        "room_id": str(resolved_room_id),
+        "resolve_room": rr,
+        "source_device_name": str(source_device_name or ""),
+        "resolve_source": rd,
+        "result": result,
+    }
+
+
+@Mcp.tool(
     name="c4_tv_off",
     description=(
         "Turn off the room's Audio/Video session (ROOM_OFF). Best-effort confirms Watch becomes inactive."
@@ -1760,6 +1849,143 @@ def c4_room_select_audio_device_tool(room_id: str, source_device_id: str, desele
 def c4_room_listen_tool(room_id: str, source_device_id: str, confirm_timeout_s: float = 10.0) -> dict:
     result = room_listen(int(room_id), int(source_device_id), float(confirm_timeout_s))
     return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_listen_by_name",
+    description=(
+        "Resolve a room by name and a Listen source device by name, then start a room Listen session. "
+        "Uses the same safe name resolution as c4_light_set_by_name and c4_media_watch_launch_app_by_name. "
+        "If resolution is ambiguous, returns candidates and does not execute."
+    ),
+)
+def c4_room_listen_by_name_tool(
+    room_name: str,
+    source_device_name: str,
+    room_id: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    confirm_timeout_s: float = 10.0,
+    dry_run: bool = False,
+) -> dict:
+    resolved_room_id: int | None = None
+    rr: dict | None = None
+
+    if room_id is not None and str(room_id).strip():
+        try:
+            resolved_room_id = int(room_id)
+        except Exception:
+            resolved_room_id = None
+    else:
+        rr = resolve_room(
+            str(room_name or ""),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+
+    if resolved_room_id is None:
+        return {"ok": False, "error": "room_id could not be resolved", "details": rr}
+
+    # Resolve the source from the room's actual available Listen sources.
+    ls_raw = room_listen_status(int(resolved_room_id))
+    ls = ls_raw if isinstance(ls_raw, dict) else {"ok": True, "result": ls_raw}
+    listen = ls.get("listen") if isinstance(ls.get("listen"), dict) else {}
+    sources = listen.get("sources") if isinstance(listen.get("sources"), list) else []
+
+    source_rows: list[dict] = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        sid = None
+        for k in ("deviceid", "deviceId", "id"):
+            if s.get(k) is None:
+                continue
+            try:
+                sid = int(s.get(k))
+                break
+            except Exception:
+                continue
+        if sid is None or sid <= 0:
+            continue
+        label = None
+        for k in ("name", "label", "display", "title"):
+            v = s.get(k)
+            if isinstance(v, str) and v.strip():
+                label = v.strip()
+                break
+        source_rows.append({"id": int(sid), "name": str(label or sid)})
+
+    if not source_rows:
+        return {
+            "ok": False,
+            "error": "no listen sources found for room",
+            "room_id": str(resolved_room_id),
+            "listen_status": ls,
+        }
+
+    resolved_src = resolve_named_candidates(
+        str(source_device_name or ""),
+        source_rows,
+        entity="listen_source",
+        name_key="name",
+        id_key="id",
+        max_candidates=10,
+    )
+    if not isinstance(resolved_src, dict) or not resolved_src.get("ok"):
+        return {
+            "ok": False,
+            "error": "could not resolve listen source device",
+            "room_id": str(resolved_room_id),
+            "source_device_name": str(source_device_name or ""),
+            "resolve_source": resolved_src,
+            "listen_sources": source_rows[:15],
+        }
+
+    source_device_id = resolved_src.get("id")
+    if source_device_id is None:
+        return {
+            "ok": False,
+            "error": "resolved listen source missing id",
+            "resolve_source": resolved_src,
+        }
+
+    planned = {
+        "room_id": str(resolved_room_id),
+        "source_device_id": str(source_device_id),
+        "confirm_timeout_s": float(confirm_timeout_s),
+    }
+
+    if bool(dry_run):
+        return {
+            "ok": True,
+            "dry_run": True,
+            "planned": planned,
+            "room_name": str(room_name or ""),
+            "room_id": str(resolved_room_id),
+            "resolve_room": rr,
+            "source_device_name": str(source_device_name or ""),
+            "resolve_source": resolved_src,
+            "listen_status": ls,
+        }
+
+    result = room_listen(int(resolved_room_id), int(source_device_id), float(confirm_timeout_s))
+    return {
+        "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+        "planned": planned,
+        "room_name": str(room_name or ""),
+        "room_id": str(resolved_room_id),
+        "resolve_room": rr,
+        "source_device_name": str(source_device_name or ""),
+        "resolve_source": resolved_src,
+        "listen_status": ls,
+        "result": result,
+    }
 
 
 @Mcp.tool(

@@ -11,8 +11,10 @@ Safety:
 
 Usage:
   python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-id 6
+    python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-name "Kitchen"
   python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-id 6 --doit
   python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-id 6 --source-device-id 1772 --doit
+    python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-name "Kitchen" --source-device-name "Sonos" --doit
     python tools/validate_listen.py --base-url http://127.0.0.1:3333
 
 Auth:
@@ -172,7 +174,9 @@ def main() -> int:
     parser.add_argument("--api-key", type=str, default=None)
     parser.add_argument("--timeout", type=float, default=25.0)
     parser.add_argument("--room-id", type=int, required=False, default=None)
+    parser.add_argument("--room-name", type=str, default=None, help="Room name to resolve via c4_resolve_room")
     parser.add_argument("--source-device-id", type=int, default=None)
+    parser.add_argument("--source-device-name", type=str, default=None, help="Listen source name (resolved via c4_room_listen_by_name)")
     parser.add_argument("--confirm-timeout", type=float, default=10.0)
     parser.add_argument("--doit", action="store_true", help="Actually perform c4_room_listen + restore")
     parser.add_argument(
@@ -200,6 +204,30 @@ def main() -> int:
 
     base_url = str(args.base_url)
     room_id = int(args.room_id) if args.room_id is not None else None
+
+    if room_id is None and args.room_name is not None and str(args.room_name).strip():
+        rr_raw = mcp_call(
+            base_url,
+            "c4_resolve_room",
+            {"name": str(args.room_name), "require_unique": True, "include_candidates": True},
+            timeout_s=args.timeout,
+            headers=headers,
+        )
+        rr = _unwrap(rr_raw)
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            print(json.dumps(rr_raw, indent=2)[:4000])
+            print("ERROR: could not resolve room-name")
+            return 2
+        try:
+            room_id = int(rr.get("room_id"))
+        except Exception:
+            room_id = None
+        if room_id is None:
+            print(json.dumps(rr_raw, indent=2)[:4000])
+            print("ERROR: c4_resolve_room returned no room_id")
+            return 2
+        print(f"Resolved room_name='{args.room_name}' -> room_id={room_id}")
+
     if room_id is None:
         picked = _auto_pick_room_id(
             base_url=base_url,
@@ -239,33 +267,53 @@ def main() -> int:
             picked = args.source_device_id or _find_source_id(sources[0])
             if picked is not None:
                 print(f"Try: --source-device-id {picked} --doit")
+        if args.room_name and args.source_device_name:
+            print("Try: add --doit to exercise c4_room_listen_by_name")
         return 0
 
     if active_before and not args.force:
         print("Refusing to change audio source because listen.active is already True. Use --force to override.")
         return 2
 
-    picked_id = int(args.source_device_id) if args.source_device_id is not None else None
-    if picked_id is None:
-        # choose first source with an id
-        for s in sources:
-            sid = _find_source_id(s)
-            if sid is not None:
-                picked_id = sid
-                break
+    if args.source_device_name is not None and str(args.source_device_name).strip():
+        print(f"\nLISTEN: selecting source_device_name='{args.source_device_name}'...")
+        r_listen_raw = mcp_call(
+            base_url,
+            "c4_room_listen_by_name",
+            {
+                "room_name": (str(args.room_name or "") or str(room_id)),
+                "room_id": str(room_id),
+                "source_device_name": str(args.source_device_name),
+                "confirm_timeout_s": float(args.confirm_timeout),
+                "dry_run": False,
+                "include_candidates": True,
+                "require_unique": True,
+            },
+            timeout_s=max(args.timeout, args.confirm_timeout + 25.0),
+            headers=headers,
+        )
+    else:
+        picked_id = int(args.source_device_id) if args.source_device_id is not None else None
+        if picked_id is None:
+            # choose first source with an id
+            for s in sources:
+                sid = _find_source_id(s)
+                if sid is not None:
+                    picked_id = sid
+                    break
 
-    if picked_id is None:
-        print("No source_device_id provided and no sources with ids found; cannot proceed.")
-        return 2
+        if picked_id is None:
+            print("No source_device_id provided and no sources with ids found; cannot proceed.")
+            return 2
 
-    print(f"\nLISTEN: selecting source_device_id={picked_id}...")
-    r_listen_raw = mcp_call(
-        base_url,
-        "c4_room_listen",
-        {"room_id": room_id, "source_device_id": picked_id, "confirm_timeout_s": float(args.confirm_timeout)},
-        timeout_s=max(args.timeout, args.confirm_timeout + 25.0),
-        headers=headers,
-    )
+        print(f"\nLISTEN: selecting source_device_id={picked_id}...")
+        r_listen_raw = mcp_call(
+            base_url,
+            "c4_room_listen",
+            {"room_id": room_id, "source_device_id": picked_id, "confirm_timeout_s": float(args.confirm_timeout)},
+            timeout_s=max(args.timeout, args.confirm_timeout + 25.0),
+            headers=headers,
+        )
     r_listen = _unwrap(r_listen_raw)
     print(json.dumps(r_listen_raw, indent=2)[:6000])
 
