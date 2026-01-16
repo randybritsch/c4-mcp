@@ -12,7 +12,7 @@ Below is a **complete, ready-to-commit `PROJECT_OVERVIEW.md`**, filled in for yo
 
 ## 1. Executive summary
 
-The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, media/AV, plus macros/scheduler/announcements) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`).
+The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, media/AV, room Watch/Listen, plus macros/scheduler/announcements) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`). For room-level audio now-playing, the server provides best-effort metadata derived from device variables (driver-dependent), exposed both by device id and by room id.
 
 ---
 
@@ -172,6 +172,13 @@ Control4 Director
 * `c4_debug_trace_command(device_id, command, params, ...)` (debug)
 * `c4_room_select_video_device(room_id, device_id, deselect)`
 
+**Audio (Room-based / Listen)**
+
+* `c4_room_select_audio_device(room_id, source_device_id, deselect)`
+* `c4_room_listen(room_id, source_device_id, confirm_timeout_s)`
+* `c4_room_listen_status(room_id)` (read-only; discover available Listen sources)
+* `c4_room_now_playing(room_id, max_sources)` (read-only; best-effort “what’s playing” for the room)
+
 **Media / AV**
 
 * `c4_media_get_state(device_id)`
@@ -179,6 +186,7 @@ Control4 Director
 * `c4_media_remote(device_id, button, press)`
 * `c4_media_remote_sequence(device_id, buttons, press, delay_ms)`
 * `c4_media_now_playing(device_id)`
+* `c4_room_now_playing(room_id, max_sources)`
 * `c4_media_launch_app(device_id, app)`
 * `c4_media_watch_launch_app(device_id, app, room_id, pre_home)` (returns `summary` + `summary_text`)
 * `c4_media_roku_list_apps(device_id, search)`

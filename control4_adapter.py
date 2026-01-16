@@ -221,6 +221,10 @@ def room_listen(room_id: int, device_id: int, confirm_timeout_s: float = 10.0) -
 def room_listen_status(room_id: int) -> dict[str, Any]:
     return gateway.room_listen_status(room_id=int(room_id))
 
+
+def room_now_playing(room_id: int, max_sources: int = 30) -> Json:
+    return gateway.room_now_playing(int(room_id), int(max_sources))  # type: ignore[misc]
+
 def room_off(room_id: int, confirm_timeout_s: float = 10.0) -> Json:
     return gateway.room_off(int(room_id), confirm_timeout_s=float(confirm_timeout_s))  # type: ignore[misc]
 

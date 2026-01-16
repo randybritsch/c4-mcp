@@ -3446,10 +3446,52 @@ class Control4Gateway:
 
         # Common-ish fields across drivers (best-effort only).
         now_playing: dict[str, Any] = {
-            "title": pick("TITLE", "TRACK_TITLE", "MEDIA_TITLE", "NOW_PLAYING_TITLE"),
-            "artist": pick("ARTIST", "TRACK_ARTIST", "MEDIA_ARTIST", "NOW_PLAYING_ARTIST"),
-            "album": pick("ALBUM", "TRACK_ALBUM", "MEDIA_ALBUM", "NOW_PLAYING_ALBUM"),
-            "station": pick("STATION", "STATION_NAME", "CHANNEL", "CHANNEL_NAME"),
+            "title": pick(
+                "TITLE",
+                "Title",
+                "TRACK_TITLE",
+                "Track Title",
+                "SONG_TITLE",
+                "Song Title",
+                "MEDIA_TITLE",
+                "Media Title",
+                "NOW_PLAYING_TITLE",
+                "Now Playing Title",
+            ),
+            "artist": pick(
+                "ARTIST",
+                "Artist",
+                "TRACK_ARTIST",
+                "Track Artist",
+                "ARTIST_NAME",
+                "Artist Name",
+                "MEDIA_ARTIST",
+                "Media Artist",
+                "NOW_PLAYING_ARTIST",
+                "Now Playing Artist",
+            ),
+            "album": pick(
+                "ALBUM",
+                "Album",
+                "TRACK_ALBUM",
+                "Track Album",
+                "ALBUM_NAME",
+                "Album Name",
+                "MEDIA_ALBUM",
+                "Media Album",
+                "NOW_PLAYING_ALBUM",
+                "Now Playing Album",
+            ),
+            "station": pick(
+                "STATION",
+                "Station",
+                "STATION_NAME",
+                "Station Name",
+                "CHANNEL",
+                "CHANNEL_NAME",
+                "Channel",
+                "Channel Name",
+            ),
             "source": pick("SOURCE", "CURRENT_SOURCE", "INPUT"),
             "play_state": pick("PLAY_STATE", "TRANSPORT_STATE", "STATE"),
             "power_state": pick("POWER_STATE", "POWER"),
@@ -3495,6 +3537,90 @@ class Control4Gateway:
 
     def media_get_now_playing(self, device_id: int) -> dict[str, Any]:
         return self._loop_thread.run(self._media_get_now_playing_async(int(device_id)), timeout_s=12)
+
+    async def _room_now_playing_async(self, room_id: int, max_sources: int = 30) -> dict[str, Any]:
+        room_id = int(room_id)
+        try:
+            limit = max(1, min(int(max_sources), 80))
+        except Exception:
+            limit = 30
+
+        listen = await self._ui_listen_status_async(room_id)
+        if not isinstance(listen, dict):
+            return {"ok": False, "room_id": room_id, "error": "Listen UI status not available"}
+
+        sources = listen.get("sources") if isinstance(listen.get("sources"), list) else []
+        active = bool(listen.get("active"))
+
+        # If the room isn't actively listening, it's unlikely we'll find audio now-playing.
+        if not active:
+            return {"ok": True, "room_id": room_id, "active": False, "probe": [], "best": None}
+
+        # Prefer DIGITAL_AUDIO_CLIENT first (often holds queue/transport state).
+        def _score(src: dict[str, Any]) -> int:
+            t = str(src.get("type") or "").upper()
+            if t == "DIGITAL_AUDIO_CLIENT":
+                return 0
+            if t in {"AUDIO_SELECTION", "DIGITAL_AUDIO_SERVER"}:
+                return 1
+            return 2
+
+        ordered = [s for s in sources if isinstance(s, dict) and s.get("id") is not None]
+        ordered.sort(key=_score)
+
+        probed: list[dict[str, Any]] = []
+        best: dict[str, Any] | None = None
+
+        for src in ordered[:limit]:
+            try:
+                device_id = int(src.get("id"))
+            except Exception:
+                continue
+
+            np = await self._media_get_now_playing_async(device_id)
+            nowp = np.get("now_playing") if isinstance(np, dict) else None
+            cands = np.get("candidates") if isinstance(np, dict) else None
+
+            has_nowp = isinstance(nowp, dict) and len(nowp) > 0
+            has_cands = isinstance(cands, list) and len(cands) > 0
+            probed.append(
+                {
+                    "device_id": device_id,
+                    "name": src.get("name"),
+                    "type": src.get("type"),
+                    "has_now_playing": bool(has_nowp),
+                    "candidates_count": len(cands) if isinstance(cands, list) else 0,
+                }
+            )
+
+            if has_nowp or has_cands:
+                best = {
+                    "device_id": device_id,
+                    "name": src.get("name"),
+                    "type": src.get("type"),
+                    "now_playing": nowp if isinstance(nowp, dict) else {},
+                    "candidates": cands if isinstance(cands, list) else [],
+                    "source": np.get("source") if isinstance(np, dict) else None,
+                }
+                # Prefer a result with normalized now_playing keys.
+                if has_nowp:
+                    break
+
+        return {
+            "ok": True,
+            "room_id": room_id,
+            "active": True,
+            "best": best,
+            "probe": probed,
+            "max_sources": limit,
+        }
+
+    def room_now_playing(self, room_id: int, max_sources: int = 30) -> dict[str, Any]:
+        # Give the async probe a bit of headroom (each item vars fetch has its own bounded timeout).
+        return self._loop_thread.run(
+            self._room_now_playing_async(int(room_id), int(max_sources)),
+            timeout_s=25,
+        )
 
     @staticmethod
     def _normalize_remote_press(press: str | None) -> str:

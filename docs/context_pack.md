@@ -2,7 +2,7 @@
 
 ## Mini Executive Summary (≤120 words)
 
-This project exposes Control4 automation (lights, locks, thermostats, media/AV) as MCP tools via a local Flask server. It enforces a strict 3-layer design: synchronous MCP/Flask entrypoints -> sync adapter pass-through -> async gateway that owns all Control4 I/O on a single background asyncio loop thread. Some cloud lock drivers can physically actuate while Director variables remain stale; lock actions report "accepted" (Director ack) separately from "confirmed" (observed state change) and may include a best-effort estimate. Roku app launching is made reliable by selecting the room Watch source when needed, broadcasting LaunchApp across the Roku protocol group, and confirming success by polling Roku variables (notably CURRENT_APP_ID).
+This project exposes Control4 automation (lights, locks, thermostats, media/AV, room Watch/Listen) as MCP tools via a local Flask server. It enforces a strict 3-layer design: synchronous MCP/Flask entrypoints -> sync adapter pass-through -> async gateway that owns all Control4 I/O on a single background asyncio loop thread. Some cloud lock drivers can physically actuate while Director variables remain stale; lock actions report "accepted" (Director ack) separately from "confirmed" (observed state change) and may include a best-effort estimate. Roku app launching is made reliable by selecting the room Watch source when needed, broadcasting LaunchApp across the Roku protocol group, and confirming success by polling Roku variables (notably CURRENT_APP_ID). Room-level “what’s playing” is best-effort and is derived from device variables (which vary by driver) rather than UI configuration.
 
 ## Critical Architecture (≤6 bullets)
 
@@ -12,12 +12,14 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 - "accepted" vs "confirmed": preserve this split for actions where Director state may lag (locks; Roku app changes).
 - Media visibility: ensure the room is "watching" the Roku input before launching apps (SELECT_VIDEO_DEVICE).
 - Roku reliability: broadcast LaunchApp across the Roku protocol group and confirm via CURRENT_APP_ID polling.
+- Audio now-playing: UI configuration lists sources + active, but does not include selected source/track; use device variables and room-scoped probing (`c4_room_now_playing`).
 
 ## Current Working Set (3–7 files)
 
 - ../app.py — MCP tools + summaries.
 - ../control4_adapter.py — sync wrappers and gateway lifecycle.
 - ../control4_gateway.py — async Control4 integration; media watch+launch; thermostat safe set-target; lock semantics.
+- ../control4_gateway.py — includes best-effort now-playing normalization (driver variable-name variants) and room-scoped now-playing probe.
 - project_overview.md — tool list + decisions.
 - ../tools/get_roku_current_app.py — quick confirmation helper.
 - ../tools/test_paramount_basement.py — E2E watch+launch validation.
@@ -27,6 +29,7 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 - Discovery/debug: ping, c4_server_info, c4_list_rooms, c4_list_devices, c4_item_variables, c4_item_commands, c4_item_bindings, c4_item_send_command, c4_debug_trace_command
 - Discovery/power: c4_capabilities_report
 - Rooms/media: c4_room_list_commands, c4_room_send_command, c4_room_select_video_device, c4_media_watch_launch_app, c4_media_launch_app, c4_media_roku_list_apps, c4_media_remote, c4_media_remote_sequence, c4_media_now_playing, c4_media_get_state
+- Rooms/audio: c4_room_select_audio_device, c4_room_listen, c4_room_listen_status, c4_room_now_playing
 - Scenes/UI Buttons: c4_uibutton_list, c4_uibutton_activate, c4_scene_list, c4_scene_activate
 - Contacts/sensors: c4_contact_list, c4_contact_get_state
 - Motion sensors: c4_motion_list, c4_motion_get_state
@@ -49,6 +52,7 @@ This project exposes Control4 automation (lights, locks, thermostats, media/AV) 
 - Thermostat safety: c4_thermostat_set_target_f chooses the correct setpoint (heat vs cool) based on mode and confirms when possible; no exceptions due to mode mismatch.
 - Reliability: no MCP tool call hangs; timeouts return structured results.
 - Scheduler writes: c4_scheduler_set_enabled is best-effort; always check confirmed (some Director builds return 400 "Timeout Modifying Scheduled Event" or 200 no-op responses).
+- Audio: c4_room_listen_status(room_id) returns active+sources; c4_room_now_playing(room_id) returns ok=true plus a best-effort `best` result when Listen is active.
 
 ## Guardrails (Conventions & Constraints)
 
@@ -81,6 +85,7 @@ Steps:
 1) Call c4_media_watch_launch_app(device_id=<ROKU_DEVICE_ID>, room_id=<ROOM_ID>, app="Netflix") and report summary_text.
 2) Call c4_media_roku_list_apps(device_id=<ROKU_DEVICE_ID>, search="Paramount") then launch Paramount+ via c4_media_watch_launch_app.
 3) Pick one thermostat, call c4_thermostat_get_state then c4_thermostat_set_target_f(+1F) with confirm, then restore.
+4) Pick one room that is currently listening and call c4_room_now_playing(room_id=<ROOM_ID>) to report the station/title (if present).
 
 Constraints: keep strict layering; no signature changes; add explicit timeouts; report accepted vs confirmed clearly.
 ```

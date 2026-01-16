@@ -86,6 +86,7 @@ from control4_adapter import (
     room_select_audio_device,
     room_listen,
     room_listen_status,
+    room_now_playing,
 )
 
 # ---------- App / Gateway ----------
@@ -1034,6 +1035,18 @@ def c4_room_listen_tool(room_id: str, source_device_id: str, confirm_timeout_s: 
 )
 def c4_room_listen_status_tool(room_id: str) -> dict:
     result = room_listen_status(int(room_id))
+    return result if isinstance(result, dict) else {"ok": True, "result": result}
+
+
+@Mcp.tool(
+    name="c4_room_now_playing",
+    description=(
+        "Read-only: best-effort room-scoped now playing. Probes the room's Listen sources and returns the first "
+        "device that exposes usable now-playing metadata (normalized when available), plus probe diagnostics."
+    ),
+)
+def c4_room_now_playing_tool(room_id: str, max_sources: int = 30) -> dict:
+    result = room_now_playing(int(room_id), int(max_sources))
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 

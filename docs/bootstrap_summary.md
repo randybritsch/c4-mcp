@@ -10,6 +10,7 @@ Expose Control4 automation (lights, locks, thermostats, media/AV, macros, schedu
 - Write tools use **accepted vs confirmed**: do not claim state changed unless observed via a follow-up read.
 - MCP is mounted at **/mcp**; the public surface used by validators is **GET /mcp/list** and **POST /mcp/call**.
 - Windows ops note: stale `app.py` processes can expose an outdated tool registry; use `c4_server_info` to verify PID/tool_count.
+- Windows ops note: run the server with the project venv interpreter (e.g., `.venv\\Scripts\\python.exe app.py`) to ensure dependencies like `flask_mcp_server` are available.
 
 ## **3) Key modules and roles**
 - **app.py** — Flask app + MCP tool registration; input validation; response shaping; patches MCP registry dispatch to avoid argument-name collisions.
@@ -30,7 +31,8 @@ Expose Control4 automation (lights, locks, thermostats, media/AV, macros, schedu
 - **MCP HTTP**: `GET /mcp/list`, `POST /mcp/call` (body: `{kind, name, args}`).
 - **Core discovery/diagnostics**: `ping`, `c4_server_info`, `c4_list_rooms`, `c4_list_devices(category)`.
 - **Low-level inspection**: `c4_item_variables`, `c4_item_commands`, `c4_item_bindings`, `c4_item_send_command`, `c4_debug_trace_command`.
-- **Rooms/media**: `c4_room_select_video_device`, `c4_room_list_commands`, `c4_room_send_command`, `c4_media_watch_launch_app`, `c4_media_roku_list_apps`, `c4_media_remote(_sequence)`, `c4_media_now_playing`, `c4_room_off`.
+- **Rooms/media**: `c4_room_select_video_device`, `c4_room_list_commands`, `c4_room_send_command`, `c4_media_watch_launch_app`, `c4_media_roku_list_apps`, `c4_media_remote(_sequence)`, `c4_media_now_playing`, `c4_room_now_playing`, `c4_room_off`.
+- **Rooms/audio (Listen)**: `c4_room_listen_status` (discover sources), `c4_room_listen` / `c4_room_select_audio_device` (start Listen), `c4_room_now_playing` (best-effort room-scoped now playing).
 - **Macros/scheduler/announcements**: `c4_macro_list`, `c4_macro_execute_by_name`; `c4_scheduler_list`, `c4_scheduler_get`, `c4_scheduler_set_enabled` (best-effort); `c4_announcement_list`, `c4_announcement_execute_by_name`.
 - **Thermostats/lights/locks**: `c4_thermostat_get_state`, `c4_thermostat_set_target_f`; `c4_light_get_state`, `c4_light_set_level`, `c4_light_ramp`; `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`.
 
@@ -48,7 +50,7 @@ Expose Control4 automation (lights, locks, thermostats, media/AV, macros, schedu
 2. Keep dispatcher/tool-call stability (no arg-name collisions; maintain tool registry correctness).
 3. Improve scheduler write reliability (more confirmed success, clearer diagnostics when not).
 4. Maintain safe write patterns (timeouts + confirmation + restore in validation scripts).
-5. Keep docs + tooling in sync after each debugging session.
+5. Improve room-scoped audio telemetry (Listen + best-effort now-playing by room/device variables) and keep docs + tooling in sync after each debugging session.
 
 ## **8) Open risks/unknowns (Top 5)**
 1. Driver state can be stale even when actions physically occur (locks especially).
