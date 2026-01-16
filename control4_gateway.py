@@ -5013,3 +5013,246 @@ class Control4Gateway:
         return bool(
             self._loop_thread.run(self._light_ramp_async(int(device_id), int(level), int(time_ms)), timeout_s=12)
         )
+
+    async def _light_set_level_ex_async(
+        self,
+        device_id: int,
+        level: int,
+        ramp_ms: int | None = None,
+        confirm_timeout_s: float = 0.0,
+        poll_interval_s: float = 0.2,
+        tolerance: int = 1,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        level = max(0, min(100, int(level)))
+        poll_interval_s = max(0.05, float(poll_interval_s))
+        confirm_timeout_s = float(confirm_timeout_s)
+        tolerance = max(0, int(tolerance))
+
+        before_level: int | None = None
+        try:
+            before_level = int(await self._light_get_level_async(device_id))
+        except Exception:
+            before_level = None
+
+        if ramp_ms is not None:
+            ramp_ms = max(0, int(ramp_ms))
+            cmd = "RAMP_TO_LEVEL"
+            params: dict[str, Any] = {"LEVEL": level, "TIME": ramp_ms}
+        else:
+            cmd = "SET_LEVEL"
+            params = {"LEVEL": level}
+
+        send_res = await self._item_send_command_async(device_id, cmd, params)
+        ok = bool(send_res.get("ok"))
+        out: dict[str, Any] = {
+            "ok": ok,
+            "device_id": int(device_id),
+            "target_level": int(level),
+            "command": cmd,
+            "params": params,
+            "before_level": before_level,
+            "send": send_res,
+        }
+        if not ok:
+            return out
+
+        if confirm_timeout_s <= 0:
+            out["confirmed"] = None
+            return out
+
+        deadline = time.time() + confirm_timeout_s
+        last_level: int | None = None
+        start = time.time()
+        while time.time() <= deadline:
+            try:
+                last_level = int(await self._light_get_level_async(device_id))
+            except Exception:
+                last_level = None
+
+            if last_level is not None and abs(int(last_level) - int(level)) <= tolerance:
+                out["confirmed"] = True
+                out["observed_level"] = int(last_level)
+                out["confirm_elapsed_s"] = round(time.time() - start, 3)
+                return out
+
+            await asyncio.sleep(poll_interval_s)
+
+        out["confirmed"] = False
+        out["observed_level"] = (int(last_level) if last_level is not None else None)
+        out["confirm_elapsed_s"] = round(time.time() - start, 3)
+        return out
+
+    def light_set_level_ex(
+        self,
+        device_id: int,
+        level: int,
+        ramp_ms: int | None = None,
+        confirm_timeout_s: float = 0.0,
+        poll_interval_s: float = 0.2,
+        tolerance: int = 1,
+    ) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._light_set_level_ex_async(
+                int(device_id),
+                int(level),
+                (int(ramp_ms) if ramp_ms is not None else None),
+                float(confirm_timeout_s),
+                float(poll_interval_s),
+                int(tolerance),
+            ),
+            timeout_s=max(12.0, float(confirm_timeout_s) + 6.0),
+        )
+
+    async def _room_lights_set_async(
+        self,
+        room_id: int,
+        level: int,
+        exclude_names: list[str] | None = None,
+        include_names: list[str] | None = None,
+        ramp_ms: int | None = None,
+        confirm_timeout_s: float = 0.0,
+        poll_interval_s: float = 0.2,
+        tolerance: int = 1,
+        concurrency: int = 3,
+    ) -> dict[str, Any]:
+        room_id = int(room_id)
+        level = max(0, min(100, int(level)))
+        poll_interval_s = max(0.05, float(poll_interval_s))
+        confirm_timeout_s = float(confirm_timeout_s)
+        tolerance = max(0, int(tolerance))
+        concurrency = max(1, min(10, int(concurrency)))
+
+        def norm(s: str) -> str:
+            return self._norm_search_text(str(s or ""))
+
+        exclude = {norm(s) for s in (exclude_names or []) if str(s or "").strip()}
+        include = {norm(s) for s in (include_names or []) if str(s or "").strip()}
+
+        # Async-safe inventory fetch that respects the existing cache without deadlocking.
+        items = self._items_cache_get()
+        if items is None:
+            fetched = await self._get_all_items_async()
+            items = [i for i in fetched if isinstance(i, dict)]
+            self._items_cache_set(items)
+
+        rooms_by_id = {
+            str(i.get("id")): i.get("name")
+            for i in items
+            if isinstance(i, dict) and i.get("typeName") == "room" and i.get("id") is not None
+        }
+        room_name = rooms_by_id.get(str(room_id))
+
+        allowed_controls = {"light_v2", "control4_lights_gen3", "outlet_light", "outlet_module_v2"}
+        candidates: list[dict[str, Any]] = []
+        for it in items:
+            if not isinstance(it, dict) or it.get("typeName") != "device":
+                continue
+            device_room_id = it.get("roomId") or it.get("parentId")
+            try:
+                if int(device_room_id) != int(room_id):
+                    continue
+            except Exception:
+                continue
+
+            control = str(it.get("control") or "").lower()
+            if control not in allowed_controls:
+                continue
+
+            name = str(it.get("name") or "")
+            name_n = norm(name)
+            if exclude and name_n in exclude:
+                continue
+            if include and name_n not in include:
+                continue
+
+            try:
+                device_id = int(it.get("id") or 0)
+            except Exception:
+                continue
+            if device_id <= 0:
+                continue
+
+            candidates.append(
+                {
+                    "device_id": device_id,
+                    "name": name,
+                    "room_id": room_id,
+                    "room_name": (it.get("roomName") or room_name),
+                    "control": (it.get("control") or None),
+                    "proxy": (it.get("proxy") or None),
+                }
+            )
+
+        candidates.sort(key=lambda d: (str(d.get("name") or ""), int(d.get("device_id") or 0)))
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def run_one(row: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                did = int(row["device_id"])
+                res = await self._light_set_level_ex_async(
+                    did,
+                    int(level),
+                    (int(ramp_ms) if ramp_ms is not None else None),
+                    float(confirm_timeout_s),
+                    float(poll_interval_s),
+                    int(tolerance),
+                )
+                return {
+                    "device_id": did,
+                    "name": row.get("name"),
+                    "ok": bool(res.get("ok")),
+                    "confirmed": res.get("confirmed"),
+                    "before_level": res.get("before_level"),
+                    "observed_level": res.get("observed_level"),
+                    "execute": res,
+                }
+
+        start = time.time()
+        results = await asyncio.gather(*(run_one(r) for r in candidates), return_exceptions=False)
+        ok_count = sum(1 for r in results if isinstance(r, dict) and r.get("ok") is True)
+
+        return {
+            "ok": ok_count == len(results),
+            "room_id": room_id,
+            "room_name": room_name,
+            "target_level": int(level),
+            "ramp_ms": (int(ramp_ms) if ramp_ms is not None else None),
+            "confirm_timeout_s": float(confirm_timeout_s),
+            "poll_interval_s": float(poll_interval_s),
+            "tolerance": int(tolerance),
+            "concurrency": int(concurrency),
+            "count": len(results),
+            "ok_count": int(ok_count),
+            "elapsed_s": round(time.time() - start, 3),
+            "devices": results,
+        }
+
+    def room_lights_set(
+        self,
+        room_id: int,
+        level: int,
+        exclude_names: list[str] | None = None,
+        include_names: list[str] | None = None,
+        ramp_ms: int | None = None,
+        confirm_timeout_s: float = 0.0,
+        poll_interval_s: float = 0.2,
+        tolerance: int = 1,
+        concurrency: int = 3,
+    ) -> dict[str, Any]:
+        timeout_s = max(20.0, float(confirm_timeout_s) + 10.0)
+        return self._loop_thread.run(
+            self._room_lights_set_async(
+                int(room_id),
+                int(level),
+                (list(exclude_names) if exclude_names is not None else None),
+                (list(include_names) if include_names is not None else None),
+                (int(ramp_ms) if ramp_ms is not None else None),
+                float(confirm_timeout_s),
+                float(poll_interval_s),
+                int(tolerance),
+                int(concurrency),
+            ),
+            timeout_s=timeout_s,
+        )

@@ -356,6 +356,73 @@ def light_ramp(device_id: int, level: int, time_ms: int) -> bool:
         return bool(gateway.light_ramp(int(device_id), int(level), int(time_ms)))  # type: ignore[misc]
     return False
 
+
+def light_set_level_ex(
+    device_id: int,
+    level: int,
+    ramp_ms: int | None = None,
+    confirm_timeout_s: float = 0.0,
+    poll_interval_s: float = 0.2,
+    tolerance: int = 1,
+) -> Json:
+    if hasattr(gateway, "light_set_level_ex"):
+        return gateway.light_set_level_ex(
+            int(device_id),
+            int(level),
+            (int(ramp_ms) if ramp_ms is not None else None),
+            float(confirm_timeout_s),
+            float(poll_interval_s),
+            int(tolerance),
+        )  # type: ignore[misc]
+    return {
+        "ok": False,
+        "device_id": int(device_id),
+        "error": "gateway does not implement light_set_level_ex",
+    }
+
+
+def room_lights_set(
+    room_id: int,
+    level: int,
+    exclude_names: list[str] | None = None,
+    include_names: list[str] | None = None,
+    ramp_ms: int | None = None,
+    confirm_timeout_s: float = 0.0,
+    poll_interval_s: float = 0.2,
+    tolerance: int = 1,
+    concurrency: int = 3,
+    dry_run: bool = False,
+) -> Json:
+    if bool(dry_run):
+        return {
+            "ok": True,
+            "room_id": int(room_id),
+            "planned": {
+                "level": int(level),
+                "exclude_names": list(exclude_names or []),
+                "include_names": list(include_names or []),
+                "ramp_ms": (int(ramp_ms) if ramp_ms is not None else None),
+                "confirm_timeout_s": float(confirm_timeout_s),
+                "poll_interval_s": float(poll_interval_s),
+                "tolerance": int(tolerance),
+                "concurrency": int(concurrency),
+            },
+            "dry_run": True,
+        }
+    if hasattr(gateway, "room_lights_set"):
+        return gateway.room_lights_set(
+            int(room_id),
+            int(level),
+            (list(exclude_names) if exclude_names is not None else None),
+            (list(include_names) if include_names is not None else None),
+            (int(ramp_ms) if ramp_ms is not None else None),
+            float(confirm_timeout_s),
+            float(poll_interval_s),
+            int(tolerance),
+            int(concurrency),
+        )  # type: ignore[misc]
+    return {"ok": False, "room_id": int(room_id), "error": "gateway does not implement room_lights_set"}
+
 def shade_list(limit: int = 200) -> Json:
     return gateway.shade_list(limit=int(limit))  # type: ignore[misc]
 

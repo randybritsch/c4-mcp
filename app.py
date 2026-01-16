@@ -56,6 +56,7 @@ from control4_adapter import (
     light_get_state,
     light_ramp,
     light_set_level,
+    light_set_level_ex,
     list_rooms,
     lock_get_state,
     lock_lock,
@@ -98,6 +99,7 @@ from control4_adapter import (
     room_listen,
     room_listen_status,
     room_now_playing,
+    room_lights_set,
     shade_close,
     shade_get_state,
     shade_list,
@@ -189,6 +191,8 @@ _WRITE_TOOL_NAMES = {
     # Lighting
     "c4_light_set_level",
     "c4_light_ramp",
+    "c4_light_set_by_name",
+    "c4_room_lights_set",
     # Locks
     "c4_lock_lock",
     "c4_lock_unlock",
@@ -1894,6 +1898,228 @@ def c4_light_ramp_tool(device_id: str, level: int, time_ms: int) -> dict:
         return {"ok": False, "error": "time_ms must be >= 0"}
     state = light_ramp(int(device_id), level, time_ms)
     return {"ok": True, "device_id": str(device_id), "level": level, "time_ms": time_ms, "state": bool(state)}
+
+
+@Mcp.tool(
+    name="c4_light_set_by_name",
+    description=(
+        "Fast-path: resolve a light by name (optionally scoped by room) and set level/on/off in a single call. "
+        "Uses inventory caching for fast resolution. Optionally ramps and best-effort confirms final level."
+    ),
+)
+def c4_light_set_by_name_tool(
+    device_name: str,
+    level: int | None = None,
+    state: str | None = None,
+    room_name: str | None = None,
+    room_id: int | None = None,
+    on_level: int = 100,
+    ramp_ms: int | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    confirm_timeout_s: float = 1.5,
+    poll_interval_s: float = 0.2,
+    dry_run: bool = False,
+) -> dict:
+    if (level is None) == (state is None):
+        return {"ok": False, "error": "provide exactly one of: level or state"}
+
+    target_level: int
+    if state is not None:
+        state_norm = str(state or "").strip().lower()
+        if state_norm not in {"on", "off"}:
+            return {"ok": False, "error": "state must be 'on' or 'off'"}
+        on_level = max(0, min(100, int(on_level)))
+        target_level = on_level if state_norm == "on" else 0
+    else:
+        target_level = int(level)  # type: ignore[arg-type]
+        if target_level < 0 or target_level > 100:
+            return {"ok": False, "error": "level must be 0-100"}
+
+    resolved_room_id: int | None = None
+    resolved_room_name: str | None = None
+
+    if room_id is not None:
+        try:
+            resolved_room_id = int(room_id)
+        except Exception:
+            resolved_room_id = None
+    elif room_name is not None and str(room_name).strip():
+        rr = resolve_room(
+            str(room_name),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+        resolved_room_name = str(rr.get("name")) if rr.get("name") is not None else None
+
+    rd = resolve_device(
+        str(device_name),
+        category="lights",
+        room_id=resolved_room_id,
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
+    if not isinstance(rd, dict) or not rd.get("ok"):
+        return {"ok": False, "error": "could not resolve light", "details": rd}
+
+    device_id = rd.get("device_id")
+    if device_id is None:
+        return {"ok": False, "error": "resolve_device returned no device_id", "details": rd}
+
+    planned = {
+        "device_id": str(device_id),
+        "target_level": int(target_level),
+        "ramp_ms": (int(ramp_ms) if ramp_ms is not None else None),
+        "confirm_timeout_s": float(confirm_timeout_s),
+        "poll_interval_s": float(poll_interval_s),
+        "tolerance": 1,
+    }
+
+    if bool(dry_run):
+        return {
+            "ok": True,
+            "device_name": str(device_name),
+            "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+            "room_name": resolved_room_name,
+            "resolve": rd,
+            "planned": planned,
+            "dry_run": True,
+        }
+
+    exec_res = light_set_level_ex(
+        int(device_id),
+        int(target_level),
+        (int(ramp_ms) if ramp_ms is not None else None),
+        float(confirm_timeout_s),
+        float(poll_interval_s),
+        1,
+    )
+
+    ok = bool(exec_res.get("ok")) if isinstance(exec_res, dict) else bool(exec_res)
+    return {
+        "ok": ok,
+        "device_name": str(device_name),
+        "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+        "room_name": resolved_room_name,
+        "device_id": str(device_id),
+        "resolve": rd,
+        "execute": exec_res,
+    }
+
+
+@Mcp.tool(
+    name="c4_room_lights_set",
+    description=(
+        "Fast-path: set all lights in a room to a level (or on/off) in a single call. "
+        "Optionally exclude/include by device name, ramp, and best-effort confirm each light."
+    ),
+)
+def c4_room_lights_set_tool(
+    room_id: int | None = None,
+    room_name: str | None = None,
+    level: int | None = None,
+    state: str | None = None,
+    on_level: int = 100,
+    exclude_names: list[str] | None = None,
+    include_names: list[str] | None = None,
+    ramp_ms: int | None = None,
+    confirm_timeout_s: float = 0.8,
+    poll_interval_s: float = 0.2,
+    concurrency: int = 3,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    if (room_id is None) == (room_name is None):
+        return {"ok": False, "error": "provide exactly one of: room_id or room_name"}
+    if (level is None) == (state is None):
+        return {"ok": False, "error": "provide exactly one of: level or state"}
+
+    resolved_room_id: int | None = None
+    resolved_room_name: str | None = None
+    if room_id is not None:
+        try:
+            resolved_room_id = int(room_id)
+        except Exception:
+            resolved_room_id = None
+    else:
+        rr = resolve_room(
+            str(room_name),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+        resolved_room_name = str(rr.get("name")) if rr.get("name") is not None else None
+
+    if resolved_room_id is None:
+        return {"ok": False, "error": "invalid room_id"}
+
+    target_level: int
+    if state is not None:
+        state_norm = str(state or "").strip().lower()
+        if state_norm not in {"on", "off"}:
+            return {"ok": False, "error": "state must be 'on' or 'off'"}
+        on_level = max(0, min(100, int(on_level)))
+        target_level = on_level if state_norm == "on" else 0
+    else:
+        target_level = int(level)  # type: ignore[arg-type]
+        if target_level < 0 or target_level > 100:
+            return {"ok": False, "error": "level must be 0-100"}
+
+    planned = {
+        "room_id": int(resolved_room_id),
+        "target_level": int(target_level),
+        "exclude_names": list(exclude_names or []),
+        "include_names": list(include_names or []),
+        "ramp_ms": (int(ramp_ms) if ramp_ms is not None else None),
+        "confirm_timeout_s": float(confirm_timeout_s),
+        "poll_interval_s": float(poll_interval_s),
+        "tolerance": 1,
+        "concurrency": int(concurrency),
+    }
+
+    if bool(dry_run):
+        preview = find_devices(search=None, category="lights", room_id=int(resolved_room_id), limit=200, include_raw=False)
+        return {
+            "ok": True,
+            "room_id": str(resolved_room_id),
+            "room_name": resolved_room_name,
+            "preview": preview,
+            "planned": planned,
+            "dry_run": True,
+        }
+
+    exec_res = room_lights_set(
+        int(resolved_room_id),
+        int(target_level),
+        exclude_names=list(exclude_names or []),
+        include_names=list(include_names or []),
+        ramp_ms=(int(ramp_ms) if ramp_ms is not None else None),
+        confirm_timeout_s=float(confirm_timeout_s),
+        poll_interval_s=float(poll_interval_s),
+        tolerance=1,
+        concurrency=int(concurrency),
+        dry_run=False,
+    )
+    ok = bool(exec_res.get("ok")) if isinstance(exec_res, dict) else bool(exec_res)
+    return {
+        "ok": ok,
+        "room_id": str(resolved_room_id),
+        "room_name": resolved_room_name,
+        "planned": planned,
+        "execute": exec_res,
+    }
 
 
 # ---- Locks ----
