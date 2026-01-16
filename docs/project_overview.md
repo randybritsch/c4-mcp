@@ -12,7 +12,7 @@ Below is a **complete, ready-to-commit `PROJECT_OVERVIEW.md`**, filled in for yo
 
 ## 1. Executive summary
 
-The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, media/AV, room Watch/Listen, plus macros/scheduler/announcements) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`). For room-level audio now-playing, the server provides best-effort metadata derived from device variables (driver-dependent), exposed both by device id and by room id.
+The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, media/AV, room Watch/Listen, plus macros/scheduler/announcements) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. It is optimized for fast “common actions” by caching Director item inventory with a short TTL and offering single-call tools like `c4_light_set_by_name` and `c4_room_lights_set` to reduce round trips. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`). For room-level audio now-playing, the server provides best-effort metadata derived from device variables (driver-dependent), exposed both by device id and by room id.
 
 ---
 
@@ -189,6 +189,7 @@ Control4 Director
 * `c4_room_now_playing(room_id, max_sources)`
 * `c4_media_launch_app(device_id, app)`
 * `c4_media_watch_launch_app(device_id, app, room_id, pre_home)` (returns `summary` + `summary_text`)
+* `c4_media_watch_launch_app_by_name(device_name, app, room_name|room_id, pre_home, ...)` (resolves ids, then calls watch+launch)
 * `c4_media_roku_list_apps(device_id, search)`
 
 **Thermostats**
@@ -207,6 +208,8 @@ Control4 Director
 * `c4_light_get_level`
 * `c4_light_set_level`
 * `c4_light_ramp`
+* `c4_light_set_by_name` (fast-path: resolve by name and set level/state in one call)
+* `c4_room_lights_set` (fast-path: set all lights in a room; optional exclude/include, ramp, confirm)
 
 **Locks**
 
@@ -258,6 +261,12 @@ Control4 Director
 
 * **Room Watch before visible media actions**
   → Selecting the room’s active video device (Watch/HDMI) is required for app launching to be reliably visible on-screen.
+
+* **Item inventory cache (short TTL)**
+  → Name resolution and list endpoints rely on `/api/v1/items`; caching with `C4_ITEMS_CACHE_TTL_S` reduces latency dramatically for repeated actions.
+
+* **Fast-path lighting tools**
+  → Common actions (set a specific light, set all room lights) are implemented as single MCP calls to minimize round trips and keep the cache warm.
 
 * **Best-effort state estimate when stale**
   → The gateway tracks recent lock intent and returns an estimate when confirmation via variables is unreliable.
@@ -385,6 +394,8 @@ Control4 Director
 ### Recently completed
 
 * Implement light write-path (`OFF`/`ON`/`SET_LEVEL`/`RAMP_TO_LEVEL`) and validate against real devices
+* Add fast-path lighting tools: `c4_light_set_by_name` and `c4_room_lights_set` (batch + optional confirm)
+* Add short-TTL Director item inventory cache (`C4_ITEMS_CACHE_TTL_S`) to speed device discovery and by-name actions
 * Add thermostat end-to-end support (read + safe write/confirm patterns)
 * Add media/AV tooling (remote/navigation, now-playing best-effort, app launching)
 * Make Roku app launching reliable (Watch/HDMI selection + protocol-group routing + `CURRENT_APP_ID` confirmation)
@@ -395,7 +406,7 @@ Control4 Director
 * Room-based commands (e.g., “lock all doors”)
 * Friendly name resolution (room + device)
 * Expand room-level media control (power off / end session, volume, input)
-* Optional caching of item metadata
+* Cache observability and tuning (hit-rate + per-category caches + safe invalidation)
 
 ---
 

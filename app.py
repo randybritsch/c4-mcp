@@ -220,6 +220,7 @@ _WRITE_TOOL_NAMES = {
     "c4_media_remote_sequence",
     "c4_media_launch_app",
     "c4_media_watch_launch_app",
+    "c4_media_watch_launch_app_by_name",
     # Scheduler
     "c4_scheduler_set_enabled",
     # Macros / announcements
@@ -1789,6 +1790,110 @@ def c4_media_watch_launch_app(device_id: str, app: str, room_id: str | None = No
 
     result["summary"] = summary
     return result
+
+
+@Mcp.tool(
+    name="c4_media_watch_launch_app_by_name",
+    description=(
+        "One-call helper: resolve a media device by name (optionally scoped by room) and then run c4_media_watch_launch_app. "
+        "Use this to say things like 'Watch Netflix on <Roku Name> in <Room Name>' without looking up ids. "
+        "Returns resolution details and preserves accepted/confirmed semantics from the underlying watch+launch flow."
+    ),
+)
+def c4_media_watch_launch_app_by_name_tool(
+    device_name: str,
+    app: str,
+    room_name: str | None = None,
+    room_id: str | None = None,
+    pre_home: bool = True,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    dry_run: bool = False,
+) -> dict:
+    resolved_room_id: int | None = None
+    resolved_room_name: str | None = None
+    rr: dict | None = None
+
+    if room_id is not None and str(room_id).strip():
+        try:
+            resolved_room_id = int(room_id)
+        except Exception:
+            resolved_room_id = None
+    elif room_name is not None and str(room_name).strip():
+        rr = resolve_room(
+            str(room_name),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+        resolved_room_name = str(rr.get("name")) if rr.get("name") is not None else None
+
+    rd = resolve_device(
+        str(device_name or ""),
+        category="media",
+        room_id=resolved_room_id,
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
+    if not isinstance(rd, dict) or not rd.get("ok"):
+        return {"ok": False, "error": "could not resolve media device", "details": rd}
+
+    # If the caller didn't specify a room scope, keep the resolved device's room
+    # for better targeting + more informative output.
+    if resolved_room_id is None and rd.get("room_id") is not None:
+        try:
+            resolved_room_id = int(rd.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+    if resolved_room_name is None and rd.get("room_name") is not None:
+        resolved_room_name = str(rd.get("room_name"))
+
+    device_id = rd.get("device_id")
+    if device_id is None:
+        return {"ok": False, "error": "resolve_device returned no device_id", "details": rd}
+
+    planned = {
+        "device_id": str(device_id),
+        "app": str(app or ""),
+        "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+        "pre_home": bool(pre_home),
+    }
+
+    if bool(dry_run):
+        return {
+            "ok": True,
+            "device_name": str(device_name),
+            "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+            "room_name": resolved_room_name,
+            "resolve_room": rr,
+            "resolve": rd,
+            "planned": planned,
+            "dry_run": True,
+        }
+
+    # Reuse the existing tool function so the output includes summary_text/summary.
+    res = c4_media_watch_launch_app(
+        device_id=str(device_id),
+        app=str(app or ""),
+        room_id=(str(resolved_room_id) if resolved_room_id is not None else None),
+        pre_home=bool(pre_home),
+    )
+    ok = bool(res.get("ok")) if isinstance(res, dict) else bool(res)
+
+    if isinstance(res, dict):
+        res["device_name"] = str(device_name)
+        res["resolve"] = rd
+        if rr is not None:
+            res["resolve_room"] = rr
+        if resolved_room_name is not None and res.get("room_id") is not None:
+            res["room_name"] = resolved_room_name
+
+    return res if isinstance(res, dict) else {"ok": ok, "result": res, "planned": planned, "resolve": rd}
 
 
 @Mcp.tool(

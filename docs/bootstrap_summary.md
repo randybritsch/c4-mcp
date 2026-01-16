@@ -1,68 +1,65 @@
 # PROJECT BOOTSTRAP SUMMARY — Control4 MCP Server
 
 ## **1) One-line purpose**
-Expose Control4 automation (lights, locks, thermostats, media/AV, macros, scheduler, announcements) as stable local MCP tools via a strict sync/async gateway.
+Expose Control4 home automation as stable local MCP tools, optimized for fast “common actions” (especially lighting) while keeping a strict sync/async boundary.
 
 ## **2) Architecture overview (3–6 bullets)**
-- **Three strict layers**: MCP/Flask tool handlers (sync) -> adapter (sync) -> gateway (async).
-- **One background asyncio loop** (owned by the gateway) performs *all* Control4 I/O (pyControl4 + Director HTTP).
-- Tools are **bounded-time** (explicit timeouts) and return **structured JSON** failures (no hangs).
-- Write tools use **accepted vs confirmed**: do not claim state changed unless observed via a follow-up read.
-- MCP is mounted at **/mcp**; the public surface used by validators is **GET /mcp/list** and **POST /mcp/call**.
-- Windows ops note: stale `app.py` processes can expose an outdated tool registry; use `c4_server_info` to verify PID/tool_count.
-- Windows ops note: run the server with the project venv interpreter (e.g., `.venv\\Scripts\\python.exe app.py`) to ensure dependencies like `flask_mcp_server` are available.
+- **Three strict layers**: MCP/Flask tools (sync) → adapter (sync passthrough) → gateway (async).
+- **One background asyncio loop thread** (gateway-owned) performs *all* Control4 I/O (pyControl4 + Director HTTP).
+- **Performance**: item inventory is cached with short TTL (`C4_ITEMS_CACHE_TTL_S`) to speed name resolution.
+- **Write semantics**: tools return structured JSON and prefer **accepted vs confirmed** (confirm via follow-up reads when possible).
+- MCP surface: **GET /mcp/list** and **POST /mcp/call**.
 
 ## **3) Key modules and roles**
-- **app.py** — Flask app + MCP tool registration; input validation; response shaping; patches MCP registry dispatch to avoid argument-name collisions.
-- **control4_adapter.py** — Thin synchronous facade; no business logic; delegates to gateway.
-- **control4_gateway.py** — Async orchestrator; owns loop + pyControl4; implements retries/confirmation logic (locks, Roku launches, scheduler writes).
-- **tools/validate_mcp_e2e.py** — End-to-end validator for **/mcp/call**; read-only by default; write tests gated by flags.
-- **tools/validate_scheduler_toggle.py** — Safe scheduler toggle+restore validator; defaults to dry-run.
-- **config.json** — Local runtime config (Director host + credentials); treat as uncommitted secret-ish state.
+- **app.py** — MCP tool registration + validation + guardrails; includes registry patch to avoid tool-arg name collisions.
+- **control4_adapter.py** — thin sync facade; no business logic.
+- **control4_gateway.py** — owns the async loop; implements retries, confirmation polling, batching, and caching.
+- **tools/** — validators and operational scripts; `tools/validate_mcp_e2e.py` is the main regression entry.
 
 ## **4) Data & contracts (top 3–5 only)**
-- **Item**: `{ id, typeName, name, control, parentId, URIs }` (device metadata from Director).
-- **Variable**: `{ varName, value }` (e.g., Roku `CURRENT_APP_ID`, lock `LockStatus`).
-- **Command**: named command invocation (`"ON"`, `"OFF"`, `"SET_LEVEL"`, `"UNLOCK"`, `"LaunchApp"`, etc.).
-- **Accepted vs confirmed**: “accepted” = Director acknowledged request; “confirmed” = reread shows desired state.
-- **Tool result shape**: tool results are JSON dicts (typically include `ok` plus details); avoid returning bare primitives.
+- **Item inventory** (Director): device/room metadata used for discovery and name resolution.
+- **Variables**: `{ varName, value }` snapshots used for confirmation/telemetry.
+- **Commands**: named invocations (e.g., `SET_LEVEL`, `RAMP_TO_LEVEL`, `UNLOCK`, `LaunchApp`).
+- **Tool results**: JSON dicts with `ok` + details; avoid returning bare primitives.
 
 ## **5) APIs (key endpoints/tools only)**
-- **MCP HTTP**: `GET /mcp/list`, `POST /mcp/call` (body: `{kind, name, args}`).
-- **Core discovery/diagnostics**: `ping`, `c4_server_info`, `c4_list_rooms`, `c4_list_devices(category)`.
-- **Low-level inspection**: `c4_item_variables`, `c4_item_commands`, `c4_item_bindings`, `c4_item_send_command`, `c4_debug_trace_command`.
-- **Rooms/media**: `c4_room_select_video_device`, `c4_room_list_commands`, `c4_room_send_command`, `c4_media_watch_launch_app`, `c4_media_roku_list_apps`, `c4_media_remote(_sequence)`, `c4_media_now_playing`, `c4_room_now_playing`, `c4_room_off`.
-- **Rooms/audio (Listen)**: `c4_room_listen_status` (discover sources), `c4_room_listen` / `c4_room_select_audio_device` (start Listen), `c4_room_now_playing` (best-effort room-scoped now playing).
-- **Macros/scheduler/announcements**: `c4_macro_list`, `c4_macro_execute_by_name`; `c4_scheduler_list`, `c4_scheduler_get`, `c4_scheduler_set_enabled` (best-effort); `c4_announcement_list`, `c4_announcement_execute_by_name`.
-- **Thermostats/lights/locks**: `c4_thermostat_get_state`, `c4_thermostat_set_target_f`; `c4_light_get_state`, `c4_light_set_level`, `c4_light_ramp`; `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`.
+- **MCP HTTP**: `GET /mcp/list`, `POST /mcp/call`.
+- **Discovery**: `c4_list_rooms`, `c4_list_devices(category)`, `resolve_room`, `resolve_device`.
+- **Lighting (fast path)**:
+	- `c4_light_set_by_name` — resolve + set `level`/`state` + optional ramp/confirm in one call.
+	- `c4_room_lights_set` — set all lights in a room (exclude/include lists, ramp, bounded concurrency, optional confirm).
+	- `c4_light_get_level`, `c4_light_set_level`, `c4_light_ramp`.
+	- Confirmation is best-effort and time-bounded, but now uses multiple signals (brightness + `LIGHT_STATE` when present) and returns richer diagnostics in `execute`: `confirm_reason`, `observed_state`, `confirm_trace`, and optional `confirm_fallback`.
+- **Scenes (fast path)**: `c4_scene_set_state_by_name` (SetState On/Off + best-effort confirm).
+- **Media**: `c4_media_watch_launch_app`, `c4_media_watch_launch_app_by_name`, `c4_media_remote(_sequence)`, `c4_media_roku_list_apps`.
+- **Locks/thermostats**: `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`; `c4_thermostat_get_state`, `c4_thermostat_set_target_f`.
+- **Debug/inspection**: `c4_item_variables`, `c4_item_commands`, `c4_item_bindings`, `c4_debug_trace_command`.
 
 ## **6) Coding conventions (must-follow rules)**
-- Gateway owns the only asyncio loop; **no async Control4 code in app.py**.
+- Gateway owns the asyncio loop; **no async Control4 code in app.py**.
 - **No pyControl4 imports outside control4_gateway.py**.
-- Adapter remains a **thin pass-through** (no business logic).
-- Every Director/network operation has **explicit timeouts** and returns structured failures.
-- **Do not change MCP tool names/signatures**; add new tools instead.
-- Preserve **accepted vs confirmed** semantics for stateful actions.
-- Dispatcher safety: tools may accept an arg named `name`; avoid keyword collisions in MCP call plumbing.
+- Adapter stays **passthrough-only**.
+- Every network/Director operation has **explicit timeouts** and structured failures.
+- Don’t break existing MCP tool names/signatures; add new tools instead.
 
 ## **7) Current priorities (Top 5)**
-1. Keep Roku watch+launch reliable (Watch selection + retries + confirm via `CURRENT_APP_ID`).
-2. Keep dispatcher/tool-call stability (no arg-name collisions; maintain tool registry correctness).
-3. Improve scheduler write reliability (more confirmed success, clearer diagnostics when not).
-4. Maintain safe write patterns (timeouts + confirmation + restore in validation scripts).
-5. Improve room-scoped audio telemetry (Listen + best-effort now-playing by room/device variables) and keep docs + tooling in sync after each debugging session.
+1. Make lighting actions fast: single-call by-name + room batching + confirm when feasible.
+2. Keep inventory caching safe and effective (no deadlocks; bounded TTL; predictable latency).
+3. Preserve strict layering (all Director I/O in gateway loop thread).
+4. Maintain write guardrails (dry-run options; clear planned vs executed behavior).
+5. Keep validators current (`tools/validate_mcp_e2e.py` as the baseline regression).
 
 ## **8) Open risks/unknowns (Top 5)**
-1. Driver state can be stale even when actions physically occur (locks especially).
-2. Scheduler writes are unreliable on some Director builds (400 “Timeout Modifying Scheduled Event” or 200 no-op); always check `confirmed`.
-3. Media visibility depends on room Watch/input state (actions can be accepted but not visible).
-4. Windows can run multiple `app.py` processes; wrong PID can yield missing tools or stale behavior.
-5. Director/driver variability across versions (variable names, endpoints, behavior).
+1. Driver variability: different variable names/behaviors across Control4 builds and drivers.
+2. “Accepted” commands may not reflect real-world state changes; confirmation is best-effort.
+3. Batch lighting can stress Director/mesh; concurrency needs tuning per site.
+4. Windows can run multiple `app.py` processes; stale process can expose stale tool registry.
+5. Some device types (locks/scheduler) can be flaky/stale at the Director API layer.
 
 ## **9) Links/paths to full docs**
 - docs/project_overview.md
+- docs/architecture.md
 - docs/context_pack.md
 - docs/project_spec.md
-- docs/architecture.md
 - app.py, control4_adapter.py, control4_gateway.py
-- tools/validate_mcp_e2e.py, tools/validate_scheduler_toggle.py
+- tools/validate_mcp_e2e.py

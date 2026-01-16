@@ -104,6 +104,8 @@ Troubleshooting:
 
 Then pass the discovered ids into tools like `c4_media_watch_launch_app` or the scripts in `tools/`.
 
+If you prefer name-based calls (no ids), use `c4_media_watch_launch_app_by_name`.
+
 ### Lighting scenes (best-effort)
 
 Control4 "scenes" vary by project. In many projects they show up as UI Button devices.

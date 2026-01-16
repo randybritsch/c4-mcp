@@ -4978,6 +4978,38 @@ class Control4Gateway:
 
         return False
 
+    async def _light_observe_async(self, device_id: int) -> dict[str, Any]:
+        fetched = await self._fetch_item_variables_list_async(int(device_id))
+        variables: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+
+        level: int | None = None
+        level_source: str | None = None
+        for name in ("Brightness Percent", "PRESET_LEVEL"):
+            v = self._get_var_value(variables, name)
+            li = self._coerce_int(v)
+            if li is not None:
+                level = max(0, min(100, int(li)))
+                level_source = str(name)
+                break
+
+        is_on: bool | None = None
+        state_source: str | None = None
+        v = self._get_var_value(variables, "LIGHT_STATE")
+        b = self._coerce_bool(v)
+        if b is not None:
+            is_on = bool(b)
+            state_source = "LIGHT_STATE"
+        elif level is not None:
+            is_on = bool(int(level) > 0)
+            state_source = f"infer:{level_source or 'level'}"
+
+        return {
+            "level": level,
+            "is_on": is_on,
+            "level_source": level_source,
+            "state_source": state_source,
+        }
+
     def light_get_state(self, device_id: int) -> bool:
         return bool(self._loop_thread.run(self._light_get_state_async(int(device_id)), timeout_s=10))
 
@@ -5030,10 +5062,18 @@ class Control4Gateway:
         tolerance = max(0, int(tolerance))
 
         before_level: int | None = None
+        before_state: bool | None = None
+        before_observed: dict[str, Any] | None = None
         try:
-            before_level = int(await self._light_get_level_async(device_id))
+            before_observed = await self._light_observe_async(device_id)
+            if before_observed.get("level") is not None:
+                before_level = int(before_observed.get("level"))
+            if before_observed.get("is_on") is not None:
+                before_state = bool(before_observed.get("is_on"))
         except Exception:
             before_level = None
+            before_state = None
+            before_observed = None
 
         if ramp_ms is not None:
             ramp_ms = max(0, int(ramp_ms))
@@ -5052,6 +5092,8 @@ class Control4Gateway:
             "command": cmd,
             "params": params,
             "before_level": before_level,
+            "before_state": before_state,
+            "before_observed": before_observed,
             "send": send_res,
         }
         if not ok:
@@ -5061,26 +5103,129 @@ class Control4Gateway:
             out["confirmed"] = None
             return out
 
+        target_is_on = bool(int(level) > 0)
         deadline = time.time() + confirm_timeout_s
-        last_level: int | None = None
         start = time.time()
-        while time.time() <= deadline:
-            try:
-                last_level = int(await self._light_get_level_async(device_id))
-            except Exception:
-                last_level = None
+        last_level: int | None = None
+        last_state: bool | None = None
+        last_observed: dict[str, Any] | None = None
 
-            if last_level is not None and abs(int(last_level) - int(level)) <= tolerance:
+        confirm_reason: str | None = None
+        confirm_trace: list[dict[str, Any]] = []
+        fallback: dict[str, Any] | None = None
+        fallback_attempted = False
+
+        def trace_push(o: dict[str, Any] | None) -> None:
+            if not isinstance(o, dict):
+                return
+            confirm_trace.append({
+                "t": round(time.time() - start, 3),
+                "level": (int(o.get("level")) if o.get("level") is not None else None),
+                "is_on": (bool(o.get("is_on")) if o.get("is_on") is not None else None),
+                "level_source": o.get("level_source"),
+                "state_source": o.get("state_source"),
+            })
+            if len(confirm_trace) > 6:
+                del confirm_trace[0]
+
+        def is_confirmed(observed: dict[str, Any] | None, elapsed_s: float) -> tuple[bool, str | None]:
+            if not isinstance(observed, dict):
+                return False, "observe_error"
+
+            lvl = observed.get("level")
+            st = observed.get("is_on")
+            li = (int(lvl) if lvl is not None else None)
+            sb = (bool(st) if st is not None else None)
+
+            # Primary: exact level match when the driver reports a usable level.
+            if li is not None and abs(int(li) - int(level)) <= tolerance:
+                return True, "level_match"
+
+            # If no state signal, we can't do better than level.
+            if sb is None:
+                return False, "level_mismatch"
+
+            # Secondary: on/off match. Useful for non-dimmable devices and drivers that don't expose brightness.
+            if sb == target_is_on:
+                if li is None:
+                    return True, "state_match_no_level"
+
+                # Some drivers (notably outlets) can report brightness stuck at 0 even when on.
+                # After a brief grace period, accept state match for ON commands when level remains 0.
+                if target_is_on and li == 0 and elapsed_s >= min(0.8, confirm_timeout_s * 0.35):
+                    return True, "state_match_level_stuck"
+
+                # For OFF, state is authoritative (level might lag).
+                if (not target_is_on) and elapsed_s >= min(0.3, confirm_timeout_s * 0.2):
+                    return True, "state_match_off"
+
+            return False, "state_mismatch"
+
+        while time.time() <= deadline:
+            elapsed = time.time() - start
+
+            try:
+                last_observed = await self._light_observe_async(device_id)
+            except Exception:
+                last_observed = None
+
+            trace_push(last_observed)
+            if isinstance(last_observed, dict):
+                if last_observed.get("level") is not None:
+                    try:
+                        last_level = int(last_observed.get("level"))
+                    except Exception:
+                        last_level = None
+                if last_observed.get("is_on") is not None:
+                    try:
+                        last_state = bool(last_observed.get("is_on"))
+                    except Exception:
+                        last_state = None
+
+            confirmed, confirm_reason = is_confirmed(last_observed, elapsed)
+            if confirmed:
                 out["confirmed"] = True
-                out["observed_level"] = int(last_level)
+                out["confirm_reason"] = confirm_reason
+                out["observed_level"] = (int(last_level) if last_level is not None else None)
+                out["observed_state"] = (bool(last_state) if last_state is not None else None)
+                out["observed"] = last_observed
+                out["confirm_trace"] = confirm_trace
                 out["confirm_elapsed_s"] = round(time.time() - start, 3)
+                if fallback is not None:
+                    out["confirm_fallback"] = fallback
                 return out
+
+            # One bounded fallback attempt for on/off devices: try ON/OFF commands if level-based control doesn't confirm.
+            if (
+                (not fallback_attempted)
+                and (elapsed >= (confirm_timeout_s * 0.5))
+                and (int(level) in (0, 100))
+            ):
+                fallback_attempted = True
+                cmds = (["OFF", "TURN_OFF"] if not target_is_on else ["ON", "TURN_ON"])
+                for c in cmds:
+                    try:
+                        fres = await self._item_send_command_async(device_id, c, {})
+                    except Exception as e:
+                        fres = {"ok": False, "error": str(e)}
+                    if fallback is None:
+                        fallback = {"attempted": True, "commands": [], "chosen": None}
+                    fallback["commands"].append({"command": c, "send": fres})
+                    if bool(fres.get("ok")):
+                        fallback["chosen"] = str(c)
+                        break
 
             await asyncio.sleep(poll_interval_s)
 
         out["confirmed"] = False
+        out["confirm_reason"] = (confirm_reason or "timeout")
         out["observed_level"] = (int(last_level) if last_level is not None else None)
+        out["observed_state"] = (bool(last_state) if last_state is not None else None)
+        out["observed"] = last_observed
+        out["confirm_trace"] = confirm_trace
         out["confirm_elapsed_s"] = round(time.time() - start, 3)
+        if fallback is not None:
+            out["confirm_fallback"] = fallback
         return out
 
     def light_set_level_ex(
