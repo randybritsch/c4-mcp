@@ -13,6 +13,7 @@ Usage:
   python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-id 6
   python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-id 6 --doit
   python tools/validate_listen.py --base-url http://127.0.0.1:3333 --room-id 6 --source-device-id 1772 --doit
+    python tools/validate_listen.py --base-url http://127.0.0.1:3333
 
 Auth:
 - If FLASK_MCP_AUTH_MODE=apikey, pass --api-key.
@@ -111,15 +112,75 @@ def _source_label(src: Any) -> str:
     return ""
 
 
+def _auto_pick_room_id(
+    *,
+    base_url: str,
+    timeout_s: float,
+    headers: Dict[str, str],
+    max_room_scan: int,
+    require_inactive: bool,
+) -> int | None:
+    rooms_raw = mcp_call(base_url, "c4_list_rooms", {}, timeout_s=timeout_s, headers=headers)
+    rooms = _unwrap(rooms_raw).get("rooms") if isinstance(_unwrap(rooms_raw), dict) else None
+    if not isinstance(rooms, list) or not rooms:
+        return None
+
+    scanned = 0
+    for room in rooms:
+        if scanned >= int(max_room_scan):
+            break
+        if not isinstance(room, dict):
+            continue
+        rid = room.get("id")
+        try:
+            room_id = int(rid)
+        except Exception:
+            continue
+
+        scanned += 1
+        try:
+            status_raw = mcp_call(
+                base_url,
+                "c4_room_listen_status",
+                {"room_id": room_id},
+                timeout_s=timeout_s,
+                headers=headers,
+            )
+        except Exception:
+            continue
+
+        status = _unwrap(status_raw)
+        if not isinstance(status, dict) or not status.get("ok"):
+            continue
+        listen = status.get("listen") if isinstance(status.get("listen"), dict) else {}
+        sources = listen.get("sources") if isinstance(listen.get("sources"), list) else []
+        if not sources:
+            continue
+
+        active = bool(listen.get("active"))
+        if require_inactive and active:
+            continue
+
+        return room_id
+
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate room Listen via MCP HTTP")
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:3333")
     parser.add_argument("--api-key", type=str, default=None)
     parser.add_argument("--timeout", type=float, default=25.0)
-    parser.add_argument("--room-id", type=int, required=True)
+    parser.add_argument("--room-id", type=int, required=False, default=None)
     parser.add_argument("--source-device-id", type=int, default=None)
     parser.add_argument("--confirm-timeout", type=float, default=10.0)
     parser.add_argument("--doit", action="store_true", help="Actually perform c4_room_listen + restore")
+    parser.add_argument(
+        "--max-room-scan",
+        type=int,
+        default=25,
+        help="When --room-id is omitted, scan up to this many rooms to find one with Listen sources.",
+    )
     parser.add_argument(
         "--force",
         action="store_true",
@@ -138,7 +199,20 @@ def main() -> int:
         headers["X-API-Key"] = str(args.api_key)
 
     base_url = str(args.base_url)
-    room_id = int(args.room_id)
+    room_id = int(args.room_id) if args.room_id is not None else None
+    if room_id is None:
+        picked = _auto_pick_room_id(
+            base_url=base_url,
+            timeout_s=float(args.timeout),
+            headers=headers,
+            max_room_scan=int(args.max_room_scan),
+            require_inactive=bool(args.doit) and not bool(args.force),
+        )
+        if picked is None:
+            print("ERROR: Could not auto-select a room. Provide --room-id explicitly.")
+            return 2
+        room_id = int(picked)
+        print(f"Auto-selected room_id={room_id}")
 
     before_raw = mcp_call(base_url, "c4_room_listen_status", {"room_id": room_id}, timeout_s=args.timeout, headers=headers)
     before = _unwrap(before_raw)

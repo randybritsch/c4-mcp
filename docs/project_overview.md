@@ -172,6 +172,11 @@ Control4 Director
 * `c4_debug_trace_command(device_id, command, params, ...)` (debug)
 * `c4_room_select_video_device(room_id, device_id, deselect)`
 
+**Watch diagnostics (read-only)**
+
+* `c4_room_watch_status(room_id)`
+* `c4_room_list_video_devices(room_id)`
+
 **Audio (Room-based / Listen)**
 
 * `c4_room_select_audio_device(room_id, source_device_id, deselect)`

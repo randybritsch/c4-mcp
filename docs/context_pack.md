@@ -2,7 +2,7 @@
 
 ## Mini executive summary (≤120 words)
 
-This project exposes Control4 home automation as stable MCP tools via a local Flask server. It enforces a strict 3-layer design: sync MCP/Flask entrypoints → sync adapter passthrough → async gateway that owns all Control4/Director I/O on a single background asyncio loop thread. The current focus is speed of “common actions”, especially lighting, by (1) caching Director item inventory with a short TTL (`C4_ITEMS_CACHE_TTL_S`) and (2) providing single-call, fast-path tools (`c4_light_set_by_name`, `c4_room_lights_set`) to reduce round trips. Write results are structured and use “accepted vs confirmed” semantics when confirmation is best-effort. The system also supports reliable Roku app launching (Watch selection + protocol-group broadcast + variable confirmation).
+This project exposes Control4 home automation as stable MCP tools via a local Flask server. It enforces a strict 3-layer design: sync MCP/Flask entrypoints → sync adapter passthrough → async gateway that owns all Control4/Director I/O on a single background asyncio loop thread. The system prioritizes fast “common actions” (especially lighting) by caching Director item inventory with a short TTL (`C4_ITEMS_CACHE_TTL_S`) and providing single-call fast-path tools (`c4_light_set_by_name`, `c4_room_lights_set`). Write results are structured and use “accepted vs confirmed” semantics (confirmation is polling-based and time-bounded). Media Watch flows (including Roku app launching) are supported and confirmed via device variables. Recent work also added read-only Watch diagnostics and improved validator ergonomics.
 
 ## Critical architecture (≤6 bullets)
 
@@ -22,6 +22,7 @@ This project exposes Control4 home automation as stable MCP tools via a local Fl
 - `docs/bootstrap_summary.md` — fast reload summary (keep aligned).
 - `docs/context_pack.md` — this file; kept current after sessions.
 - `tools/validate_mcp_e2e.py` — baseline regression entry (read-only by default).
+- `tools/validate_listen.py` — Listen validator; now supports auto-picking a safe room when `--room-id` is omitted.
 
 ## Interfaces / contracts that must not break
 
@@ -62,6 +63,11 @@ Keep tool names and signatures stable; add new tools instead of changing old one
 
 - `c4_room_select_video_device`, `c4_media_watch_launch_app`, `c4_media_watch_launch_app_by_name`, `c4_media_roku_list_apps`
 
+**Watch diagnostics (read-only)**
+
+- `c4_room_watch_status(room_id)`
+- `c4_room_list_video_devices(room_id)` (may return empty; depends on Director/UI config)
+
 ## Today’s objectives + acceptance criteria
 
 **Objective A — Validate lighting fast paths and batching**
@@ -78,6 +84,11 @@ Acceptance details for confirm:
 
 - Repeated name/device discovery is faster with `C4_ITEMS_CACHE_TTL_S` enabled.
 - No deadlocks: inventory calls must not wait on the gateway loop from inside the loop.
+
+**Objective C — Keep regressions easy to run**
+
+- `tools/validate_listen.py` can run with no args (dry-run) by auto-selecting a room with Listen sources.
+- `tools/validate_mcp_e2e.py` continues to pass against the local server (`--base-url http://127.0.0.1:3333`).
 
 ## Guardrails (must-follow)
 
@@ -99,14 +110,14 @@ Acceptance details for confirm:
 ```text
 Load context from docs/project_overview.md and docs/context_pack.md.
 
-Goal: validate lighting speed paths and inventory caching.
+Today’s goal: verify core MCP health + Watch/Listen diagnostics.
 
 Steps:
-1) Use c4_list_rooms to pick a room.
-2) Run c4_room_lights_set(room_name=<ROOM>, state="off", dry_run=true) and show the planned target list.
-3) Run c4_room_lights_set(room_name=<ROOM>, state="off", confirm=false, ramp_ms=0, concurrency=6) and report elapsed + failures.
-4) Pick one light by friendly name and run c4_light_set_by_name(name=<LIGHT>, state="on", confirm=true, confirm_timeout_s=8).
-5) Repeat step 4 twice and compare latency to confirm caching helps.
+1) Call c4_server_info and c4_list_rooms.
+2) Pick a known AV room (e.g., TV Room / Basement) and call c4_room_watch_status(room_id=<ID>).
+3) Call c4_room_list_video_devices(room_id=<ID>) and report visible/hidden counts (empty is acceptable if Director returns none).
+4) Pick a known Listen room and run tools/validate_listen.py (dry-run), then optionally tools/validate_listen.py --doit (only if listen.active=false and you can restore).
+5) Run tools/validate_mcp_e2e.py --base-url http://127.0.0.1:3333.
 
-Constraints: keep strict layering; do not change existing tool names/signatures; every call must have bounded timeouts; report accepted vs confirmed.
+Constraints: preserve strict layering; don’t change existing tool names/signatures; all calls must have bounded timeouts; for writes, report accepted vs confirmed and restore safely.
 ```
