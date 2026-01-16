@@ -89,3 +89,21 @@ Steps:
 
 Constraints: keep strict layering; no signature changes; add explicit timeouts; report accepted vs confirmed clearly.
 ```
+
+## New Chat Boot Prompt
+
+```text
+You are joining an ongoing software project. Load context strictly from the following pasted summaries and references.
+
+[Paste the latest BOOTSTRAP SUMMARY]
+[Paste the latest CONTEXT PACK]
+
+Your tasks:
+1) Acknowledge understanding of architecture and constraints
+2) Ask only the 1–2 highest leverage clarifying questions
+3) Begin executing on “Today’s objectives” using the Guardrails
+4) Before making changes that could break contracts, propose a minimal plan
+5) Proceed one step at a time, testing after each step
+
+Do NOT re-architect unless asked. Be concise and code-first.
+```

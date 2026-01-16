@@ -347,6 +347,29 @@ def light_ramp(device_id: int, level: int, time_ms: int) -> bool:
         return bool(gateway.light_ramp(int(device_id), int(level), int(time_ms)))  # type: ignore[misc]
     return False
 
+def shade_list(limit: int = 200) -> Json:
+    return gateway.shade_list(limit=int(limit))  # type: ignore[misc]
+
+def shade_get_state(device_id: int) -> Json:
+    return gateway.shade_get_state(int(device_id))  # type: ignore[misc]
+
+def shade_open(device_id: int, confirm_timeout_s: float = 6.0, dry_run: bool = False) -> Json:
+    return gateway.shade_open(int(device_id), confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))  # type: ignore[misc]
+
+def shade_close(device_id: int, confirm_timeout_s: float = 6.0, dry_run: bool = False) -> Json:
+    return gateway.shade_close(int(device_id), confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))  # type: ignore[misc]
+
+def shade_stop(device_id: int, dry_run: bool = False) -> Json:
+    return gateway.shade_stop(int(device_id), dry_run=bool(dry_run))  # type: ignore[misc]
+
+def shade_set_position(device_id: int, position: int, confirm_timeout_s: float = 8.0, dry_run: bool = False) -> Json:
+    return gateway.shade_set_position(
+        int(device_id),
+        int(position),
+        confirm_timeout_s=float(confirm_timeout_s),
+        dry_run=bool(dry_run),
+    )  # type: ignore[misc]
+
 
 # --------- Thermostats ---------
 

@@ -70,6 +70,13 @@ Optional filters (comma-separated tool names):
 - `C4_WRITE_ALLOWLIST=c4_light_set_level,c4_light_ramp` (only allow these write tools)
 - `C4_WRITE_DENYLIST=c4_lock_unlock,c4_lock_lock` (block these write tools)
 
+### Performance knobs
+
+Some tools rely on inventory scans (`get_all_items`) for name-based resolution and listing. You can speed these up with a small in-process cache:
+
+- `C4_ITEMS_CACHE_TTL_S=5` (default) caches the inventory for 5 seconds
+- `C4_ITEMS_CACHE_TTL_S=0` disables the cache
+
 ## Discover IDs
 
 Device and room ids are specific to your Control4 project. Use:
@@ -77,7 +84,37 @@ Device and room ids are specific to your Control4 project. Use:
 - `c4_list_rooms`
 - `c4_find_rooms` / `c4_resolve_room` (search by name)
 - `c4_list_devices` (by category)
+- `c4_list_devices` category: `shades` (best-effort discovery)
+- `c4_list_devices` category: `scenes` (best-effort; based on UI Buttons)
 - `c4_find_devices` / `c4_resolve_device` (search by name; optional category/room filters)
 - `c4_resolve` (resolve room + device together; device resolution can be scoped to the resolved room)
 
+### Shades / blinds (best-effort)
+
+If your project has shades/blinds, try:
+
+- `c4_shade_list`
+- `c4_shade_get_state` (returns `position` 0-100 when available)
+- `c4_shade_open` / `c4_shade_close` / `c4_shade_stop`
+- `c4_shade_set_position`
+
+Troubleshooting:
+- Use `c4_item_commands(device_id)` to see the exact command names your shade driver exposes.
+- Use `c4_item_variables(device_id)` to inspect which variable contains position/level.
+
 Then pass the discovered ids into tools like `c4_media_watch_launch_app` or the scripts in `tools/`.
+
+### Lighting scenes (best-effort)
+
+Control4 "scenes" vary by project. In many projects they show up as UI Button devices.
+
+Try:
+
+- `c4_scene_list` (alias of `c4_uibutton_list`)
+- `c4_scene_activate(device_id)` (alias of `c4_uibutton_activate`)
+- `c4_scene_activate_by_name(scene_name, room_name=...)` (best-effort resolver + activate)
+
+Troubleshooting:
+
+- Use `c4_item_commands(device_id)` to see which command(s) a given scene/button supports.
+- Read-only validator: `\.venv\Scripts\python.exe tools\validate_scenes.py --show-commands`

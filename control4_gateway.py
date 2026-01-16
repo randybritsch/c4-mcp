@@ -78,6 +78,16 @@ class Control4Gateway:
         self._director_token_time: float = 0.0
         self._controller_name: Optional[str] = None
 
+        # Item inventory caching: name resolution and list endpoints often call get_all_items().
+        # Director inventory rarely changes minute-to-minute; a small TTL reduces latency dramatically.
+        try:
+            self._items_cache_ttl_s = float(os.environ.get("C4_ITEMS_CACHE_TTL_S", "5"))
+        except Exception:
+            self._items_cache_ttl_s = 5.0
+        self._items_cache_lock = threading.Lock()
+        self._items_cache: list[dict[str, Any]] | None = None
+        self._items_cache_ts: float = 0.0
+
         # Some cloud lock drivers don't update Director variables reliably.
         # Track last *accepted* lock intent so tools can provide an estimate.
         self._last_lock_intent: dict[int, dict[str, Any]] = {}
@@ -107,6 +117,27 @@ class Control4Gateway:
             "intent": str(intent or "").strip().upper(),
             "seq": (execute or {}).get("json", {}).get("seq") if isinstance((execute or {}).get("json"), dict) else None,
         }
+
+    def _items_cache_get(self) -> list[dict[str, Any]] | None:
+        ttl = float(self._items_cache_ttl_s)
+        if ttl <= 0:
+            return None
+        with self._items_cache_lock:
+            if self._items_cache is None:
+                return None
+            age = time.time() - float(self._items_cache_ts)
+            if age < 0 or age > ttl:
+                return None
+            # Return a shallow copy to avoid accidental mutation by callers.
+            return list(self._items_cache)
+
+    def _items_cache_set(self, items: list[dict[str, Any]]) -> None:
+        ttl = float(self._items_cache_ttl_s)
+        if ttl <= 0:
+            return
+        with self._items_cache_lock:
+            self._items_cache = list(items)
+            self._items_cache_ts = time.time()
 
     # ---------- config / auth ----------
 
@@ -540,13 +571,26 @@ class Control4Gateway:
         self, device_id: int, command: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         device_id = int(device_id)
-        command = str(command or "").strip().upper()
-        if not command:
+        command_s = str(command or "").strip()
+        if not command_s:
             return {"ok": False, "device_id": device_id, "error": "command is required"}
 
         director = await self._director_async()
         uri = f"/api/v1/items/{device_id}/commands"
-        return await self._send_post_via_director(director, uri, command, params or {}, async_variable=False)
+        # Some drivers expose case-sensitive command names (e.g. "SetState").
+        # Prefer sending the command exactly as provided, then fallback to uppercase.
+        primary = await self._send_post_via_director(director, uri, command_s, params or {}, async_variable=False)
+        if primary.get("ok"):
+            return primary
+
+        cmd_upper = command_s.upper()
+        if cmd_upper != command_s:
+            secondary = await self._send_post_via_director(director, uri, cmd_upper, params or {}, async_variable=False)
+            if isinstance(secondary, dict):
+                secondary["fallback_from"] = command_s
+            return secondary
+
+        return primary
 
     async def _item_send_command_preserve_async(
         self, device_id: int, command: str, params: dict[str, Any] | None = None
@@ -1354,7 +1398,17 @@ class Control4Gateway:
         return []
 
     def get_all_items(self) -> list[dict[str, Any]]:
-        return self._loop_thread.run(self._get_all_items_async(), timeout_s=18)
+        cached = self._items_cache_get()
+        if cached is not None:
+            return cached
+
+        fetched = self._loop_thread.run(self._get_all_items_async(), timeout_s=18)
+        items: list[dict[str, Any]] = []
+        if isinstance(fetched, list):
+            items = [i for i in fetched if isinstance(i, dict)]
+
+        self._items_cache_set(items)
+        return items
 
     def list_rooms(self) -> list[dict[str, Any]]:
         items = self.get_all_items()
@@ -1473,6 +1527,9 @@ class Control4Gateway:
             # Locks may appear either as a lock proxy (control=lock) or as a relay-style door lock proxy.
             "locks": {"lock", "control4_relaysingle"},
             "thermostat": {"thermostatV2"},
+            # Scenes are typically represented as UI Button devices (proxy/control='uibutton').
+            # We treat this category specially below so it works across driver variance.
+            "scenes": set(),
             "media": {
                 "media_player",
                 "media_service",
@@ -1499,6 +1556,7 @@ class Control4Gateway:
 
         allowed_controls = category_controls.get(category) if category else None
         is_lock_category = category == "locks"
+        is_scene_category = category == "scenes"
 
         matches: list[dict[str, Any]] = []
         for i in items:
@@ -1510,7 +1568,16 @@ class Control4Gateway:
                 continue
 
             control = str(i.get("control") or "").lower()
-            if allowed_controls is not None:
+            if is_scene_category:
+                proxy_l = str(i.get("proxy") or "").lower()
+                name_l = str(i.get("name") or "").lower()
+                if not (
+                    proxy_l in {"uibutton", "voice-scene"}
+                    or control in {"uibutton", "voice-scene"}
+                    or "scene" in name_l
+                ):
+                    continue
+            elif allowed_controls is not None:
                 if control not in allowed_controls and not is_lock_category:
                     continue
                 if is_lock_category:
@@ -2381,6 +2448,281 @@ class Control4Gateway:
             }
 
         return self._loop_thread.run(_run(), timeout_s=float(confirm_timeout_s) + 12.0)
+
+    # ---------- Shades / Blinds (best-effort) ----------
+
+    @staticmethod
+    def _is_shade_like_item(item: dict[str, Any]) -> bool:
+        if not isinstance(item, dict) or item.get("typeName") != "device":
+            return False
+        proxy = str(item.get("proxy") or "").lower()
+        control = str(item.get("control") or "").lower()
+        cats = item.get("categories")
+        cat_strs: list[str] = []
+        if isinstance(cats, list):
+            cat_strs = [str(c).lower() for c in cats]
+        # Heuristic: match common names in proxy/control/categories
+        tokens = (proxy, control, " ".join(cat_strs))
+        return any(
+            any(t in s for t in ("shade", "blind", "drape", "curtain", "screen"))
+            for s in tokens
+        )
+
+    def shade_list(self, limit: int = 200) -> dict[str, Any]:
+        items = self.get_all_items()
+        limit = max(1, min(2000, int(limit)))
+        rooms_by_id = {
+            str(i.get("id")): i.get("name")
+            for i in items
+            if isinstance(i, dict) and i.get("typeName") == "room" and i.get("id") is not None
+        }
+
+        shades: list[dict[str, Any]] = []
+        for i in items:
+            if not isinstance(i, dict) or i.get("typeName") != "device":
+                continue
+            if not self._is_shade_like_item(i):
+                continue
+
+            room_id = i.get("roomId") or i.get("parentId")
+            resolved_room_name = i.get("roomName") or (rooms_by_id.get(str(room_id)) if room_id is not None else None)
+            shades.append(
+                {
+                    "id": str(i.get("id")),
+                    "name": i.get("name"),
+                    "roomId": (str(room_id) if room_id is not None else None),
+                    "roomName": resolved_room_name,
+                    "control": i.get("control"),
+                    "proxy": i.get("proxy"),
+                    "categories": i.get("categories") or [],
+                }
+            )
+
+        shades.sort(key=lambda d: ((d.get("roomName") or ""), (d.get("name") or "")))
+        return {"ok": True, "count": len(shades), "shades": shades[:limit]}
+
+    @staticmethod
+    def _shade_parse_position(variables: list[dict[str, Any]]) -> tuple[int | None, dict[str, Any] | None]:
+        # Prefer explicit names first, then fall back to heuristic search.
+        preferred = (
+            "CURRENT_POSITION",
+            "CurrentPosition",
+            "Position",
+            "POSITION",
+            "LEVEL",
+            "Level",
+            "SHADE_LEVEL",
+            "ShadeLevel",
+            "BLIND_LEVEL",
+            "BlindLevel",
+            "OPEN_PERCENT",
+            "Open Percent",
+            "OPENING",
+        )
+
+        def _coerce_percent(val: Any) -> int | None:
+            if val is None or isinstance(val, bool):
+                return None
+            if isinstance(val, (int, float)):
+                return max(0, min(100, int(val)))
+            s = str(val).strip()
+            if not s:
+                return None
+            # Strip common decorations like "%".
+            s = s.replace("%", "").strip()
+            try:
+                f = float(s)
+            except Exception:
+                return None
+            return max(0, min(100, int(round(f))))
+
+        # Preferred exact var names
+        for n in preferred:
+            for v in variables:
+                if not isinstance(v, dict):
+                    continue
+                vn = v.get("varName") or v.get("name")
+                if str(vn) == n:
+                    pos = _coerce_percent(v.get("value"))
+                    if pos is not None:
+                        return pos, {"varName": vn, "value": v.get("value")}
+
+        # Heuristic: look for any var with "position"/"level" and numeric value.
+        for v in variables:
+            if not isinstance(v, dict):
+                continue
+            vn = str(v.get("varName") or v.get("name") or "")
+            vn_l = vn.lower()
+            if not any(k in vn_l for k in ("position", "level", "open")):
+                continue
+            pos = _coerce_percent(v.get("value"))
+            if pos is not None:
+                return pos, {"varName": vn, "value": v.get("value")}
+
+        return None, None
+
+    async def _shade_get_state_async(self, device_id: int) -> dict[str, Any]:
+        fetched = await self._fetch_item_variables_list_async(int(device_id))
+        variables: list[dict[str, Any]] = fetched.get("variables") if isinstance(fetched.get("variables"), list) else []
+
+        pos, src = self._shade_parse_position(variables)
+        out: dict[str, Any] = {
+            "ok": bool(fetched.get("ok")),
+            "device_id": int(device_id),
+            "position": pos,
+            "source_var": src,
+            "source": fetched.get("source"),
+        }
+
+        if pos is not None:
+            out["is_open"] = pos > 0
+            out["is_closed"] = pos <= 0
+        return out
+
+    def shade_get_state(self, device_id: int) -> dict[str, Any]:
+        return self._loop_thread.run(self._shade_get_state_async(int(device_id)), timeout_s=12)
+
+    @staticmethod
+    def _shade_pick_command(commands: list[dict[str, Any]], candidates: list[str]) -> dict[str, Any] | None:
+        want = {str(c).strip().upper() for c in candidates if str(c).strip()}
+        for c in commands:
+            if not isinstance(c, dict):
+                continue
+            cmd = str(c.get("command") or "").strip().upper()
+            if cmd in want:
+                return c
+        return None
+
+    @staticmethod
+    def _shade_pick_param_name(cmd: dict[str, Any]) -> str | None:
+        params = cmd.get("params")
+        if not isinstance(params, list) or not params:
+            return None
+        names = [str(p.get("name") or "") for p in params if isinstance(p, dict) and p.get("name")]
+        upper = [n.upper() for n in names]
+        for preferred in ("LEVEL", "POSITION", "PERCENT", "VALUE"):
+            if preferred in upper:
+                return names[upper.index(preferred)]
+        # If only one param, use it.
+        if len(names) == 1:
+            return names[0]
+        return None
+
+    async def _shade_send_command_best_effort_async(
+        self,
+        device_id: int,
+        intent: str,
+        position: int | None = None,
+        confirm_timeout_s: float = 6.0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        device_id = int(device_id)
+        intent_l = str(intent or "").strip().lower()
+        if intent_l not in {"open", "close", "stop", "set"}:
+            return {"ok": False, "device_id": device_id, "error": "intent must be one of: open, close, stop, set"}
+
+        target_pos = None
+        if intent_l == "set":
+            if position is None:
+                return {"ok": False, "device_id": device_id, "error": "position is required for intent=set"}
+            target_pos = max(0, min(100, int(position)))
+
+        before = await self._shade_get_state_async(device_id)
+
+        cmds_payload = await self._item_get_commands_async(device_id)
+        cmds = cmds_payload.get("commands") if isinstance(cmds_payload, dict) else None
+        cmd_list: list[dict[str, Any]] = cmds if isinstance(cmds, list) else []
+
+        planned: dict[str, Any] = {"command": None, "params": {}}
+
+        if intent_l == "open":
+            chosen = self._shade_pick_command(cmd_list, ["OPEN", "UP", "RAISE"])
+            planned["command"] = (chosen.get("command") if chosen else "OPEN")
+        elif intent_l == "close":
+            chosen = self._shade_pick_command(cmd_list, ["CLOSE", "DOWN", "LOWER"])
+            planned["command"] = (chosen.get("command") if chosen else "CLOSE")
+        elif intent_l == "stop":
+            chosen = self._shade_pick_command(cmd_list, ["STOP", "HALT"])
+            planned["command"] = (chosen.get("command") if chosen else "STOP")
+        else:
+            chosen = self._shade_pick_command(cmd_list, ["SET_LEVEL", "SET_POSITION", "GO_TO_POSITION", "SET"])
+            planned["command"] = (chosen.get("command") if chosen else "SET_LEVEL")
+            param_name = self._shade_pick_param_name(chosen) if chosen else "LEVEL"
+            if not param_name:
+                param_name = "LEVEL"
+            planned["params"] = {str(param_name): int(target_pos)}
+
+        if bool(dry_run):
+            return {
+                "ok": True,
+                "device_id": device_id,
+                "intent": intent_l,
+                "dry_run": True,
+                "planned": planned,
+                "before": before,
+                "commands_source": cmds_payload.get("source") if isinstance(cmds_payload, dict) else None,
+            }
+
+        exec_result = await self._item_send_command_async(device_id, str(planned.get("command") or ""), planned.get("params") or {})
+        accepted = bool(exec_result.get("ok"))
+
+        # Confirm (best-effort): position might be unavailable depending on driver.
+        confirmed = False
+        after = None
+        deadline = time.time() + float(confirm_timeout_s)
+        while time.time() < deadline:
+            after = await self._shade_get_state_async(device_id)
+            ap = after.get("position")
+            if intent_l == "open" and isinstance(ap, int) and ap >= 95:
+                confirmed = True
+                break
+            if intent_l == "close" and isinstance(ap, int) and ap <= 5:
+                confirmed = True
+                break
+            if intent_l == "set" and isinstance(ap, int) and target_pos is not None and abs(int(ap) - int(target_pos)) <= 2:
+                confirmed = True
+                break
+            if intent_l == "stop":
+                # No reliable generic confirmation for stop.
+                break
+            await asyncio.sleep(0.25)
+
+        return {
+            "ok": accepted,
+            "device_id": device_id,
+            "intent": intent_l,
+            "position": target_pos,
+            "accepted": accepted,
+            "confirmed": confirmed,
+            "planned": planned,
+            "before": before,
+            "after": after,
+            "execute": exec_result,
+        }
+
+    def shade_open(self, device_id: int, confirm_timeout_s: float = 6.0, dry_run: bool = False) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._shade_send_command_best_effort_async(int(device_id), "open", None, float(confirm_timeout_s), bool(dry_run)),
+            timeout_s=float(confirm_timeout_s) + 12.0,
+        )
+
+    def shade_close(self, device_id: int, confirm_timeout_s: float = 6.0, dry_run: bool = False) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._shade_send_command_best_effort_async(int(device_id), "close", None, float(confirm_timeout_s), bool(dry_run)),
+            timeout_s=float(confirm_timeout_s) + 12.0,
+        )
+
+    def shade_stop(self, device_id: int, dry_run: bool = False) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._shade_send_command_best_effort_async(int(device_id), "stop", None, 0.0, bool(dry_run)),
+            timeout_s=12.0,
+        )
+
+    def shade_set_position(self, device_id: int, position: int, confirm_timeout_s: float = 8.0, dry_run: bool = False) -> dict[str, Any]:
+        return self._loop_thread.run(
+            self._shade_send_command_best_effort_async(int(device_id), "set", int(position), float(confirm_timeout_s), bool(dry_run)),
+            timeout_s=float(confirm_timeout_s) + 12.0,
+        )
 
     # ---------- Motion sensors (best-effort; mostly ContactState-based) ----------
 

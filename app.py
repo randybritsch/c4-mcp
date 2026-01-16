@@ -97,6 +97,12 @@ from control4_adapter import (
     room_listen,
     room_listen_status,
     room_now_playing,
+    shade_close,
+    shade_get_state,
+    shade_list,
+    shade_open,
+    shade_set_position,
+    shade_stop,
 )
 
 # ---------- App / Gateway ----------
@@ -200,6 +206,8 @@ _WRITE_TOOL_NAMES = {
     "c4_room_select_audio_device",
     "c4_room_listen",
     "c4_uibutton_activate",
+    "c4_scene_activate",
+    "c4_scene_activate_by_name",
     # Media
     "c4_media_send_command",
     "c4_media_remote",
@@ -243,6 +251,8 @@ def _is_write_tool(tool_name: str) -> bool:
             "c4_light_set_",
             "c4_light_ramp",
             "c4_lock_",
+            "c4_shade_",
+            "c4_scene_",
             "c4_thermostat_set_",
             "c4_media_remote",
             "c4_media_send_",
@@ -714,6 +724,64 @@ def c4_scene_activate_tool(device_id: str, command: str | None = None, dry_run: 
     return c4_uibutton_activate_tool(device_id=device_id, command=command, dry_run=bool(dry_run))
 
 
+@Mcp.tool(
+    name="c4_scene_activate_by_name",
+    description=(
+        "Resolve and activate a scene by name (best-effort). Uses UI Button devices as a proxy for scenes. "
+        "Optionally scope the search by room_name."
+    ),
+)
+def c4_scene_activate_by_name_tool(
+    scene_name: str,
+    room_name: str | None = None,
+    require_unique: bool = True,
+    include_candidates: bool = True,
+    command: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    resolved_room_id: int | None = None
+    resolved_room_name: str | None = None
+
+    if room_name is not None and str(room_name).strip():
+        rr = resolve_room(
+            str(room_name),
+            require_unique=bool(require_unique),
+            include_candidates=bool(include_candidates),
+        )
+        if not isinstance(rr, dict) or not rr.get("ok"):
+            return {"ok": False, "error": "could not resolve room", "details": rr}
+        try:
+            resolved_room_id = int(rr.get("room_id"))
+        except Exception:
+            resolved_room_id = None
+        resolved_room_name = str(rr.get("name")) if rr.get("name") is not None else None
+
+    rd = resolve_device(
+        str(scene_name),
+        category="scenes",
+        room_id=resolved_room_id,
+        require_unique=bool(require_unique),
+        include_candidates=bool(include_candidates),
+    )
+    if not isinstance(rd, dict) or not rd.get("ok"):
+        return {"ok": False, "error": "could not resolve scene", "details": rd}
+
+    device_id = rd.get("device_id")
+    if device_id is None:
+        return {"ok": False, "error": "resolve_device returned no device_id", "details": rd}
+
+    exec_res = uibutton_activate(int(device_id), (str(command) if command is not None else None), bool(dry_run))
+    return {
+        "ok": bool(exec_res.get("ok")) if isinstance(exec_res, dict) else True,
+        "scene_name": str(scene_name),
+        "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
+        "room_name": resolved_room_name,
+        "device_id": str(device_id),
+        "resolve": rd,
+        "execute": exec_res,
+    }
+
+
 # ---- Contacts / Sensors (best-effort) ----
 
 
@@ -1160,7 +1228,7 @@ def c4_outlet_set_power_tool(device_id: str, on: bool, level_on: int = 100) -> d
     return {"ok": True, "device_id": str(device_id), "on": bool(on), "level": int(level), "state": bool(state)}
 
 
-@Mcp.tool(name="c4_list_devices", description="List Control4 devices by category (lights, locks, thermostat, media).")
+@Mcp.tool(name="c4_list_devices", description="List Control4 devices by category (lights, locks, thermostat, media, scenes).")
 def c4_list_devices(category: str) -> dict:
     category = (category or "").lower().strip()
 
@@ -1169,6 +1237,10 @@ def c4_list_devices(category: str) -> dict:
         # Locks may appear either as a lock proxy (control=lock) or as a relay-style door lock proxy.
         "locks": {"lock", "control4_relaysingle"},
         "thermostat": {"thermostatV2"},
+        # Shades vary wildly by driver; this bucket is discovered by proxy/control/category heuristics.
+        "shades": set(),
+        # Scenes are usually exposed as UI Button devices.
+        "scenes": set(),
         "media": {
             "media_player",
             "media_service",
@@ -1209,8 +1281,29 @@ def c4_list_devices(category: str) -> dict:
         is_lock_category = category == "locks" and isinstance(categories, list) and any(
             str(c).lower() == "locks" for c in categories
         )
-        if control not in allowed and not is_lock_category:
-            continue
+        if category == "shades":
+            proxy_l = str(i.get("proxy") or "").lower()
+            control_l = str(control or "").lower()
+            cat_l = [str(c).lower() for c in categories] if isinstance(categories, list) else []
+            if not (
+                any(t in proxy_l for t in ("shade", "blind", "drape", "curtain", "screen"))
+                or any(t in control_l for t in ("shade", "blind", "drape", "curtain", "screen"))
+                or any(any(t in c for t in ("shade", "blind", "drape", "curtain", "screen")) for c in cat_l)
+            ):
+                continue
+        elif category == "scenes":
+            proxy_l = str(i.get("proxy") or "").lower()
+            control_l = str(control or "").lower()
+            name_l = str(i.get("name") or "").lower()
+            if not (
+                proxy_l in {"uibutton", "voice-scene"}
+                or control_l in {"uibutton", "voice-scene"}
+                or "scene" in name_l
+            ):
+                continue
+        else:
+            if control not in allowed and not is_lock_category:
+                continue
 
         room_id = i.get("roomId")
         parent_id = i.get("parentId")
@@ -1231,10 +1324,54 @@ def c4_list_devices(category: str) -> dict:
     return {"ok": True, "category": category, "devices": devices}
 
 
+# ---- Shades ----
+
+
+@Mcp.tool(name="c4_shade_list", description="List shade/blind-like devices (best-effort discovery).")
+def c4_shade_list_tool(limit: int = 200) -> dict:
+    return shade_list(int(limit))
+
+
+@Mcp.tool(name="c4_shade_get_state", description="Get shade/blind state (best-effort). Returns position 0-100 when available.")
+def c4_shade_get_state_tool(device_id: str) -> dict:
+    return shade_get_state(int(device_id))
+
+
+@Mcp.tool(
+    name="c4_shade_open",
+    description="Open/raise a shade/blind (best-effort). Returns accepted/confirmed semantics when position is available.",
+)
+def c4_shade_open_tool(device_id: str, confirm_timeout_s: float = 6.0, dry_run: bool = False) -> dict:
+    return shade_open(int(device_id), confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))
+
+
+@Mcp.tool(
+    name="c4_shade_close",
+    description="Close/lower a shade/blind (best-effort). Returns accepted/confirmed semantics when position is available.",
+)
+def c4_shade_close_tool(device_id: str, confirm_timeout_s: float = 6.0, dry_run: bool = False) -> dict:
+    return shade_close(int(device_id), confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))
+
+
+@Mcp.tool(name="c4_shade_stop", description="Stop shade/blind movement (best-effort).")
+def c4_shade_stop_tool(device_id: str, dry_run: bool = False) -> dict:
+    return shade_stop(int(device_id), dry_run=bool(dry_run))
+
+
+@Mcp.tool(
+    name="c4_shade_set_position",
+    description=(
+        "Set shade/blind position to 0-100 (best-effort). Uses available item commands when possible and confirms by reading position when available."
+    ),
+)
+def c4_shade_set_position_tool(device_id: str, position: int, confirm_timeout_s: float = 8.0, dry_run: bool = False) -> dict:
+    return shade_set_position(int(device_id), int(position), confirm_timeout_s=float(confirm_timeout_s), dry_run=bool(dry_run))
+
+
 @Mcp.tool(
     name="c4_find_devices",
     description=(
-        "Find devices by name (case-insensitive, fuzzy). Optional filters: category in {lights, locks, thermostat, media} and room_id."
+        "Find devices by name (case-insensitive, fuzzy). Optional filters: category in {lights, locks, thermostat, media, scenes, shades} and room_id."
     ),
 )
 def c4_find_devices_tool(
@@ -1257,7 +1394,7 @@ def c4_find_devices_tool(
 @Mcp.tool(
     name="c4_resolve_device",
     description=(
-        "Resolve a device name to a single device_id (best-effort). Optional filters: category and room_id. Returns candidates when ambiguous."
+        "Resolve a device name to a single device_id (best-effort). Optional filters: category (lights, locks, thermostat, media, scenes, shades) and room_id. Returns candidates when ambiguous."
     ),
 )
 def c4_resolve_device_tool(
