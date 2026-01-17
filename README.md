@@ -283,6 +283,12 @@ This repo includes a small shim, `claude_stdio_server.py`, that adapts Claude's 
 
 - File: `%APPDATA%\Claude\claude_desktop_config.json`
 
+Security note: avoid pasting your Control4 password directly into the Claude Desktop config file.
+Prefer one of these safer options:
+
+- Put credentials in a local `config.json` in this repo (gitignored), and only keep non-secret settings in Claude's config.
+- Or set `C4_USERNAME` / `C4_PASSWORD` as OS environment variables, and omit them from Claude's config.
+
 Add an MCP server entry like this (edit paths + env vars):
 
 ```json
@@ -294,8 +300,6 @@ Add an MCP server entry like this (edit paths + env vars):
 			"cwd": "C:\\Users\\YOUR_USER\\c4-mcp",
 			"env": {
 				"C4_HOST": "192.168.1.2",
-				"C4_USERNAME": "you@example.com",
-				"C4_PASSWORD": "your-password",
 				"C4_WRITE_GUARDRAILS": "true",
 				"C4_WRITES_ENABLED": "false",
 				"C4_DIRECTOR_TIMEOUT_S": "30",
@@ -305,6 +309,8 @@ Add an MCP server entry like this (edit paths + env vars):
 	}
 }
 ```
+
+If you use `config.json` for credentials, copy `config.example.json` to `config.json` and set `host`, `username`, and `password` there.
 
 3) Restart Claude Desktop.
 
