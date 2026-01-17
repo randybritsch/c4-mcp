@@ -2,6 +2,13 @@
 
 Control4 MCP Server (Flask) exposing Control4 automation as MCP tools.
 
+## Security / publishing note (read this)
+
+This project talks to your Control4 system using credentials (and often a local controller IP).
+
+- Never commit real credentials. Keep `config.json` local-only (it is ignored by `.gitignore`).
+- If you accidentally committed credentials at any point, rotate them immediately and rewrite git history before making the repo public.
+
 ## Python version note (important)
 
 This project depends on `flask-mcp-server`, which in turn depends on `pydantic`/`pydantic-core`.
@@ -86,7 +93,8 @@ If you already have the server running and only want to run validators:
 
 Claude Desktop launches MCP servers over **STDIO** (it starts a subprocess and speaks JSON-RPC over stdin/stdout).
 
-This repo can run in that mode via `flask-mcp-server`'s built-in stdio server, as long as you use a supported Python version.
+Claude Desktop uses the official MCP method surface (`initialize`, `tools/list`, `tools/call`).
+This repo includes a small shim, `claude_stdio_server.py`, that adapts Claude's method surface to the existing Flask MCP tool registry.
 
 1) Create your venv using Python 3.12 (recommended; 3.13 also works):
 
@@ -105,14 +113,16 @@ Add an MCP server entry like this (edit paths + env vars):
 	"mcpServers": {
 		"c4-mcp": {
 			"command": "C:\\Users\\YOUR_USER\\c4-mcp\\.venv\\Scripts\\python.exe",
-			"args": ["mcp_cli.py", "serve-stdio", "--module", "app"],
+			"args": ["C:\\Users\\YOUR_USER\\c4-mcp\\claude_stdio_server.py"],
 			"cwd": "C:\\Users\\YOUR_USER\\c4-mcp",
 			"env": {
 				"C4_HOST": "192.168.1.2",
 				"C4_USERNAME": "you@example.com",
 				"C4_PASSWORD": "your-password",
 				"C4_WRITE_GUARDRAILS": "true",
-				"C4_WRITES_ENABLED": "false"
+				"C4_WRITES_ENABLED": "false",
+				"C4_DIRECTOR_TIMEOUT_S": "30",
+				"C4_GET_ALL_ITEMS_TIMEOUT_S": "75"
 			}
 		}
 	}
@@ -126,6 +136,13 @@ If everything is wired up correctly, Claude should show the `c4-mcp` tools as av
 Notes:
 - All non-protocol logging must go to **stderr**; this repo's logging defaults to stderr.
 - If you want to enable write tools, flip `C4_WRITES_ENABLED` to `true` (guardrails still apply).
+
+### Troubleshooting timeouts
+
+If listing rooms/devices times out on first run, increase these (Claude config `env` or your shell env):
+
+- `C4_DIRECTOR_TIMEOUT_S` (per Director request timeout)
+- `C4_GET_ALL_ITEMS_TIMEOUT_S` (overall inventory fetch timeout)
 
 ### Optional: write guardrails (recommended for safety)
 
