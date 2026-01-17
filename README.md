@@ -81,6 +81,20 @@ At the time of writing, **Python 3.14 will not work out-of-the-box on Windows** 
 
 Use **Python 3.12** (recommended) or another version with `pydantic-core` wheels available.
 
+## Easy install (almost one command)
+
+If you have **Node.js + npm** installed, you can bootstrap the Python venv + dependencies with one command:
+
+- `npm run setup`
+
+Then:
+
+- Start HTTP server: `npm run start`
+- Start STDIO server (Claude-style): `npm run start:stdio`
+- Run end-to-end checks: `npm run e2e`
+
+This is just a convenience wrapper around the existing Python setup steps (it creates `.venv` and installs `requirements.txt`).
+
 ## Setup
 
 This project is intended to work with any Control4 system. Nothing in the server is hard-coded to a specific home.
@@ -111,6 +125,77 @@ macOS / Linux (bash/zsh):
 or
 
 - A local config file (not committed): copy `config.example.json` to `config.json` and fill in values.
+
+## VS Code setup (recommended)
+
+1) Install VS Code extensions
+
+- **Python** (ms-python.python)
+- **Pylance** (ms-python.vscode-pylance)
+
+2) Open the repo folder in VS Code
+
+- File → Open Folder… → select this repo.
+
+3) Create/select a virtual environment
+
+Option A (VS Code UI):
+
+- `Ctrl+Shift+P` → **Python: Create Environment** → choose `venv` → select your Python 3.12 interpreter.
+
+Option B (terminal):
+
+- `python -m venv .venv`
+- Activate it (see Setup section above)
+- `Ctrl+Shift+P` → **Python: Select Interpreter** → choose `.venv`
+
+4) Install dependencies
+
+- `python -m pip install -r requirements.txt`
+
+5) Provide Control4 config while developing
+
+- **Config file**: copy `config.example.json` → `config.json` (kept local-only; ignored by git)
+
+or
+
+- **Environment variables**: set `C4_HOST`, `C4_USERNAME`, `C4_PASSWORD`
+
+Tip (VS Code-friendly): create a local `.env` file in the repo root (ignored by git) and use it from a debug config.
+
+6) Run the server
+
+- VS Code Terminal: `python app.py`
+
+7) Optional: Debug with F5
+
+Create a local `.vscode/launch.json` (this repo ignores `.vscode/` by default) like:
+
+```json
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "c4-mcp (HTTP server)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/app.py",
+			"console": "integratedTerminal",
+			"justMyCode": true,
+			"envFile": "${workspaceFolder}/.env"
+		},
+		{
+			"name": "c4-mcp (STDIO server)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/claude_stdio_server.py",
+			"console": "integratedTerminal",
+			"justMyCode": true,
+			"envFile": "${workspaceFolder}/.env"
+		}
+	]
+}
+```
 
 ### First-time setup (recommended)
 

@@ -1,0 +1,13 @@
+{
+  "name": "c4-mcp",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Control4 MCP server (Python) - npm wrapper for easy setup/run",
+  "license": "MIT",
+  "scripts": {
+    "setup": "node tools/bootstrap.mjs",
+    "start": "node tools/run_python.mjs app.py",
+    "start:stdio": "node tools/run_python.mjs claude_stdio_server.py",
+    "e2e": "node tools/run_python.mjs tools/run_e2e.py"
+  }
+}
