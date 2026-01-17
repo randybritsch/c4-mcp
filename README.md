@@ -1,6 +1,24 @@
 # c4-mcp
 
-Control4 MCP Server (Flask) exposing Control4 automation as MCP tools.
+Turn your Control4 system into a **Model Context Protocol (MCP)** toolset, so any MCP-capable client (Claude Desktop, custom agents, scripts) can **query rooms/devices** and **safely run automations**.
+
+[![CI](https://github.com/randybritsch/c4-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/randybritsch/c4-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/randybritsch/c4-mcp)](LICENSE)
+
+## Why this is cool
+
+- **Works with real MCP clients**: HTTP transport for dev/scripts + **STDIO JSON-RPC** for clients like **Claude Desktop**.
+- **Safe-by-default controls**: optional write guardrails, read-only mode, and allow/deny lists for state-changing tools.
+- **Session memory for follow-ups**: enables natural multi-step flows like “turn on the basement lights… now dim those lights”.
+- **Smarter “lights” semantics**: room-based lighting ops avoid accidentally targeting fans/heaters/outlets.
+- **One-command validation**: an end-to-end runner exercises HTTP + STDIO so you can ship changes with confidence.
+- **Tunable performance**: inventory caching + env-configurable timeouts for slower Control4 projects.
+
+## What you can do
+
+- Discover rooms/devices by name, category, and room (plus resolvers for “best-effort” name-based calls).
+- Activate scenes, control shades, query variables/commands, and (optionally) change state (lights/locks/thermostat/media).
+- Use it as a local “home automation brain” for chat + agents without hard-coding your project’s device IDs.
 
 ## Security / publishing note (read this)
 
