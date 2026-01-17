@@ -20,6 +20,26 @@ Turn your Control4 system into a **Model Context Protocol (MCP)** toolset, so an
 - Activate scenes, control shades, query variables/commands, and (optionally) change state (lights/locks/thermostat/media).
 - Use it as a local “home automation brain” for chat + agents without hard-coding your project’s device IDs.
 
+## Example prompts (copy/paste)
+
+These work well in MCP clients like Claude Desktop (the client will call tools under the hood):
+
+```text
+List all rooms.
+
+Show me the lights in the Basement.
+
+Turn on the basement lights.
+
+Now dim those lights to 30%.
+
+Activate the "Movie Time" scene in the Living Room.
+
+Which doors are currently unlocked?
+```
+
+Tip: If you run with `C4_WRITE_GUARDRAILS=true` and `C4_WRITES_ENABLED=false`, you’ll get a safe read-only experience until you explicitly enable writes.
+
 ## Security / publishing note (read this)
 
 This project talks to your Control4 system using credentials (and often a local controller IP).
