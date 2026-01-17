@@ -1955,6 +1955,71 @@ class Control4Gateway:
             out["candidates"] = matches
         return out
 
+    def _is_real_light_device_item(self, item: dict[str, Any]) -> bool:
+        """Best-effort filter so "lights" excludes obvious non-light loads.
+
+        Control4 drivers sometimes expose non-light loads as lighting-capable controls.
+        This method tries to avoid toggling devices that look like fans/heaters/outlets
+        unless the name/categories strongly suggest the load is actually a light.
+
+        This is heuristic; callers may allow explicit overrides (e.g., include-by-name).
+        """
+
+        control_l = str(item.get("control") or "").lower()
+        proxy_l = str(item.get("proxy") or "").lower()
+
+        # Strong signal: explicit fan proxy/control.
+        if proxy_l == "fan" or control_l == "fan":
+            return False
+
+        name_n = self._norm_search_text(str(item.get("name") or ""))
+        cats = item.get("categories")
+        cat_n = " ".join([self._norm_search_text(str(c)) for c in cats]) if isinstance(cats, list) else ""
+
+        positive_tokens = {
+            "light",
+            "lights",
+            "lamp",
+            "lamps",
+            "chandelier",
+            "sconce",
+            "pendant",
+            "fixture",
+            "recessed",
+            "downlight",
+            "spot",
+            "accent",
+        }
+        negative_phrases = (
+            "space heater",
+            "baseboard heater",
+        )
+        negative_tokens = {
+            "fan",
+            "exhaust",
+            "vent",
+            "heater",
+            "radiator",
+            "fireplace",
+            "outlet",
+            "plug",
+            "receptacle",
+        }
+
+        name_tokens = set(name_n.split(" ")) if name_n else set()
+        has_positive = bool(name_tokens & positive_tokens) or ("light" in cat_n) or ("lighting" in cat_n)
+        has_negative = bool(name_tokens & negative_tokens) or any(p in name_n for p in negative_phrases)
+
+        # If it looks like a fan/heater/outlet and doesn't look like a light, treat it as non-light.
+        if has_negative and not has_positive:
+            return False
+
+        # Switched outlets/modules are ambiguous; only count them as "lights" when they look like lights.
+        if control_l in {"outlet_light", "outlet_module_v2"}:
+            return bool(has_positive)
+
+        return True
+
     def find_devices(
         self,
         search: str | None = None,
@@ -2007,6 +2072,9 @@ class Control4Gateway:
         is_lock_category = category == "locks"
         is_scene_category = category == "scenes"
         is_alarm_category = category == "alarm"
+        is_lights_category = category == "lights"
+
+        # Note: real-light filtering is applied below via _is_real_light_device_item().
 
         matches: list[dict[str, Any]] = []
         for i in items:
@@ -2056,6 +2124,8 @@ class Control4Gateway:
                     # In lock category, accept either explicit lock control or relay single.
                     if control not in allowed_controls and str(i.get("proxy") or "").lower() != "lock":
                         continue
+                if is_lights_category and not self._is_real_light_device_item(i):
+                    continue
 
             name_i = str(i.get("name") or "")
             score = self._score_match(search, name_i) if search else 1
@@ -6083,6 +6153,11 @@ class Control4Gateway:
 
             control = str(it.get("control") or "").lower()
             if control not in allowed_controls:
+                continue
+
+            # Unless the caller explicitly included specific names, avoid toggling
+            # non-light loads that happen to present as lighting-capable controls.
+            if not include and not self._is_real_light_device_item(it):
                 continue
 
             name = str(it.get("name") or "")
