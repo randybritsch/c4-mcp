@@ -72,6 +72,16 @@ Notes:
 - Start server: `python app.py`
 - Verify MCP is up: `GET http://127.0.0.1:3333/mcp/list`
 
+## End-to-end validation (one command)
+
+This starts the HTTP server in **read-only guardrails mode**, runs the HTTP validator suite, runs both STDIO validators, and then stops the server.
+
+- `\.venv\Scripts\python.exe tools\run_e2e.py`
+
+If you already have the server running and only want to run validators:
+
+- `\.venv\Scripts\python.exe tools\run_e2e.py --no-server --base-url http://127.0.0.1:3333`
+
 ## Claude Desktop (MCP stdio) setup (Windows)
 
 Claude Desktop launches MCP servers over **STDIO** (it starts a subprocess and speaks JSON-RPC over stdin/stdout).

@@ -24,6 +24,7 @@ import os
 import sys
 import traceback
 from typing import Any, Dict, Optional
+import uuid
 
 
 def _eprint(msg: str) -> None:
@@ -69,10 +70,32 @@ def _wrap_tool_result(value: Any) -> dict[str, Any]:
     }
 
 
+def _wrap_tool_error(message: str, data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    if data is not None:
+        try:
+            details = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+            message = f"{message}\n\n{details}"
+        except Exception:
+            pass
+    return {
+        "content": [{"type": "text", "text": message}],
+        "isError": True,
+    }
+
+
+def _reset_session_id() -> str:
+    sid = str(uuid.uuid4())
+    os.environ["C4_SESSION_ID"] = sid
+    return sid
+
+
 def main() -> int:
     # Import app.py for side effects: it registers all @Mcp.tool functions.
     # This must happen before accessing default_registry.
     import app  # noqa: F401
+
+    # Pull guardrail helpers from app.py so STDIO is also safe-by-default.
+    from app import _is_write_tool, _write_allowed, _write_guardrails_enabled, _writes_enabled
 
     from flask_mcp_server.registry import default_registry
 
@@ -83,6 +106,9 @@ def main() -> int:
 
     _eprint("Claude STDIO shim starting (c4-mcp)")
     _eprint(f"Registered tools: {len(default_registry.tools)}")
+
+    session_id = _reset_session_id()
+    _eprint(f"Session id: {session_id}")
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -101,6 +127,8 @@ def main() -> int:
                 continue
 
             if method == "initialize":
+                # Treat initialize as the start of a new client session.
+                session_id = _reset_session_id()
                 # Be permissive; echo back a protocol version and minimal capabilities.
                 _send_result(
                     request_id,
@@ -111,7 +139,7 @@ def main() -> int:
                             "resources": {},
                             "prompts": {},
                         },
-                        "serverInfo": server_info,
+                        "serverInfo": {**server_info, "session_id": session_id},
                     },
                 )
                 continue
@@ -137,16 +165,26 @@ def main() -> int:
                     continue
 
                 try:
-                    value = default_registry.call_tool(name, **arguments)
+                    # Respect write guardrails in STDIO (HTTP middleware does not apply here).
+                    if _write_guardrails_enabled() and _is_write_tool(str(name)):
+                        if not _writes_enabled():
+                            _send_result(
+                                request_id,
+                                _wrap_tool_error(
+                                    "Writes are disabled (set C4_WRITES_ENABLED=true or disable C4_WRITE_GUARDRAILS).",
+                                    {"tool": str(name)},
+                                ),
+                            )
+                            continue
+                        allowed, why = _write_allowed(str(name))
+                        if not allowed:
+                            _send_result(request_id, _wrap_tool_error(f"Write not allowed: {why}", {"tool": str(name)}))
+                            continue
+
+                    value = default_registry.call_tool(str(name), **arguments)
                     _send_result(request_id, _wrap_tool_result(value))
                 except Exception as e:
-                    _send_result(
-                        request_id,
-                        {
-                            "content": [{"type": "text", "text": f"Tool error: {e}"}],
-                            "isError": True,
-                        },
-                    )
+                    _send_result(request_id, _wrap_tool_error(f"Tool error: {e}"))
                 continue
 
             if method == "resources/list":

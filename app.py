@@ -12,12 +12,14 @@ import sys
 import time
 import uuid
 
-from flask import Flask, jsonify, request, g
+from flask import Flask, jsonify, request, g, has_request_context
 from werkzeug.exceptions import HTTPException
 from flask_mcp_server import Mcp, mount_mcp
 from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
 
 import flask_mcp_server
+
+from session_memory import SessionStore, extract_lights_from_call, is_last_lights_token
 
 from control4_adapter import (
     gateway as adapter_gateway,
@@ -188,6 +190,52 @@ def _env_csv(name: str) -> list[str]:
     return [p for p in parts if p]
 
 
+# ---------- Session memory (in-process, per client session when possible) ----------
+
+_SESSION_STORE = SessionStore(
+    max_sessions=int(os.getenv("C4_SESSION_MAX", "200") or "200"),
+    ttl_s=float(os.getenv("C4_SESSION_TTL_S", str(2 * 60 * 60)) or str(2 * 60 * 60)),
+)
+
+_PROCESS_SESSION_ID = str(os.getenv("C4_SESSION_ID") or "").strip() or str(uuid.uuid4())
+os.environ.setdefault("C4_SESSION_ID", _PROCESS_SESSION_ID)
+
+
+def _current_session_id(explicit: str | None = None) -> str:
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+
+    # HTTP clients can supply a stable session id header.
+    if has_request_context():
+        for hdr in ("X-Session-Id", "X-MCP-Session-Id", "X-MCP-Session", "X-C4-Session"):
+            v = request.headers.get(hdr)
+            if v and str(v).strip():
+                return str(v).strip()
+
+    # STDIO clients can set this once at process start (Claude shim does this on initialize).
+    v = os.getenv("C4_SESSION_ID")
+    if v and str(v).strip():
+        return str(v).strip()
+
+    return _PROCESS_SESSION_ID
+
+
+def _remember_tool_call(tool_name: str, args: dict | None, result: Any) -> None:
+    try:
+        sid = _current_session_id(None)
+        mem = _SESSION_STORE.get(sid, create=True)
+        mem.last_tool = str(tool_name or "")
+        mem.last_tool_args = dict(args or {})
+        mem.last_tool_at_s = time.time()
+
+        lights = extract_lights_from_call(str(tool_name or ""), dict(args or {}), result)
+        if lights:
+            mem.add_last_lights(lights, window_s=5.0)
+    except Exception:
+        # Never let memory tracking break tools.
+        return
+
+
 # Best-effort classification of tools that mutate state.
 # This list is intentionally conservative; you can refine over time.
 _WRITE_TOOL_NAMES = {
@@ -199,6 +247,7 @@ _WRITE_TOOL_NAMES = {
     "c4_light_ramp",
     "c4_light_set_by_name",
     "c4_room_lights_set",
+    "c4_lights_set_last",
     # Locks
     "c4_lock_lock",
     "c4_lock_unlock",
@@ -266,9 +315,16 @@ def _is_write_tool(tool_name: str) -> bool:
             "c4_set_",
             "c4_light_set_",
             "c4_light_ramp",
-            "c4_lock_",
-            "c4_shade_",
-            "c4_scene_",
+            # Locks: avoid blocking read-only tools like c4_lock_get_state.
+            "c4_lock_set_",
+            # Shades: avoid blocking read-only tools like c4_shade_list/get_state.
+            "c4_shade_open",
+            "c4_shade_close",
+            "c4_shade_stop",
+            "c4_shade_set_",
+            # Scenes/UI buttons: avoid blocking read-only list tools.
+            "c4_scene_activate",
+            "c4_scene_set_",
             "c4_thermostat_set_",
             "c4_media_remote",
             "c4_media_send_",
@@ -305,6 +361,7 @@ def _write_allowed(tool_name: str) -> tuple[bool, str | None]:
 def _c4_before_request() -> None:
     g._c4_start = time.perf_counter()
     g.request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    g.session_id = _current_session_id(None)
 
     # Opt-in: allow operators to run the server in a safe, read-only mode.
     # This is enforced at the HTTP boundary so we don't have to thread flags through tool code.
@@ -373,6 +430,7 @@ def _c4_before_request() -> None:
 def _c4_after_request(resp):
     try:
         resp.headers["X-Request-Id"] = getattr(g, "request_id", "")
+        resp.headers["X-Session-Id"] = getattr(g, "session_id", "")
 
         start = getattr(g, "_c4_start", None)
         duration_ms = None
@@ -463,6 +521,107 @@ def _handle_any_exception(e: Exception):
 @Mcp.tool(name="ping", description="Health check tool to verify the MCP server is reachable.")
 def ping() -> dict:
     return {"ok": True}
+
+
+@Mcp.tool(
+    name="c4_memory_get",
+    description=(
+        "Return this server's in-process session memory for the current MCP client session. "
+        "For HTTP clients, provide/echo a stable X-Session-Id header to persist context."
+    ),
+)
+def c4_memory_get_tool(session_id: str | None = None) -> dict:
+    sid = _current_session_id(session_id)
+    mem = _SESSION_STORE.get(sid, create=True)
+    return {"ok": True, "session_id": sid, "memory": mem.snapshot()}
+
+
+@Mcp.tool(
+    name="c4_memory_clear",
+    description=(
+        "Clear this server's in-process session memory for the current MCP client session. "
+        "Useful if the model got confused about what 'those lights' refers to."
+    ),
+)
+def c4_memory_clear_tool(session_id: str | None = None) -> dict:
+    sid = _current_session_id(session_id)
+    _SESSION_STORE.clear(sid)
+    return {"ok": True, "session_id": sid, "cleared": True}
+
+
+@Mcp.tool(
+    name="c4_lights_get_last",
+    description=(
+        "Return the last referenced light devices in this session (for follow-ups like 'turn off those lights')."
+    ),
+)
+def c4_lights_get_last_tool(session_id: str | None = None) -> dict:
+    sid = _current_session_id(session_id)
+    mem = _SESSION_STORE.get(sid, create=True)
+    return {"ok": True, "session_id": sid, "count": len(mem.last_lights), "lights": list(mem.last_lights)}
+
+
+@Mcp.tool(
+    name="c4_lights_set_last",
+    description=(
+        "Set the state/level of the last referenced lights in this session (the safe way to implement 'those lights'). "
+        "Provide exactly one of: state ('on'/'off') or level (0-100)."
+    ),
+)
+def c4_lights_set_last_tool(
+    state: str | None = None,
+    level: int | None = None,
+    ramp_ms: int | None = None,
+    session_id: str | None = None,
+) -> dict:
+    if (state is None) == (level is None):
+        return {"ok": False, "error": "provide exactly one of: state or level"}
+
+    target_level: int
+    if state is not None:
+        s = str(state or "").strip().lower()
+        if s not in {"on", "off"}:
+            return {"ok": False, "error": "state must be 'on' or 'off'"}
+        target_level = 100 if s == "on" else 0
+    else:
+        target_level = int(level)  # type: ignore[arg-type]
+        if target_level < 0 or target_level > 100:
+            return {"ok": False, "error": "level must be 0-100"}
+
+    sid = _current_session_id(session_id)
+    mem = _SESSION_STORE.get(sid, create=True)
+    if not mem.last_lights:
+        return {"ok": False, "error": "no remembered lights in this session yet", "session_id": sid}
+
+    results: list[dict] = []
+    for row in list(mem.last_lights):
+        did = row.get("device_id")
+        if did is None:
+            continue
+        try:
+            did_i = int(did)
+        except Exception:
+            continue
+        try:
+            if ramp_ms is not None:
+                rr = light_ramp(int(did_i), int(target_level), int(ramp_ms))
+                results.append({"device_id": did_i, "ok": True, "ramped": True, "result": rr, "name": row.get("name")})
+            else:
+                rr = light_set_level(int(did_i), int(target_level))
+                results.append({"device_id": did_i, "ok": True, "state": bool(rr), "name": row.get("name")})
+        except Exception as e:
+            results.append({"device_id": did_i, "ok": False, "error": repr(e), "name": row.get("name")})
+
+    out = {
+        "ok": all(r.get("ok") is True for r in results),
+        "session_id": sid,
+        "count": len(results),
+        "target_level": int(target_level),
+        "ramp_ms": (int(ramp_ms) if ramp_ms is not None else None),
+        "results": results,
+    }
+    _remember_tool_call("c4_lights_set_last", {"state": state, "level": level, "ramp_ms": ramp_ms}, out)
+    return out
 
 
 @Mcp.tool(
@@ -2330,15 +2489,21 @@ def c4_thermostat_set_target_f_tool(
 @Mcp.tool(name="c4_light_get_state", description="Get current on/off state of a Control4 light.")
 def c4_light_get_state_tool(device_id: str) -> dict:
     state = light_get_state(int(device_id))
-    return {"ok": True, "device_id": str(device_id), "state": bool(state)}
+    out = {"ok": True, "device_id": str(device_id), "state": bool(state)}
+    _remember_tool_call("c4_light_get_state", {"device_id": str(device_id)}, out)
+    return out
 
 
 @Mcp.tool(name="c4_light_get_level", description="Get current brightness level (0-100) of a Control4 light.")
 def c4_light_get_level_tool(device_id: str) -> dict:
     result = light_get_level(int(device_id))
     if isinstance(result, int):
-        return {"ok": True, "device_id": str(device_id), "level": result}
-    return {"ok": True, "device_id": str(device_id), "variables": result}
+        out = {"ok": True, "device_id": str(device_id), "level": result}
+        _remember_tool_call("c4_light_get_level", {"device_id": str(device_id)}, out)
+        return out
+    out = {"ok": True, "device_id": str(device_id), "variables": result}
+    _remember_tool_call("c4_light_get_level", {"device_id": str(device_id)}, out)
+    return out
 
 
 @Mcp.tool(name="c4_light_set_level", description="Set a Control4 light level (0-100).")
@@ -2346,8 +2511,15 @@ def c4_light_set_level_tool(device_id: str, level: int) -> dict:
     level = int(level)
     if level < 0 or level > 100:
         return {"ok": False, "error": "level must be 0-100"}
+
+    # Convenience: allow passing a token like "__last_lights__" to apply to remembered lights.
+    if is_last_lights_token(device_id):
+        return c4_lights_set_last_tool(level=int(level))
+
     state = light_set_level(int(device_id), level)
-    return {"ok": True, "device_id": str(device_id), "level": level, "state": bool(state)}
+    out = {"ok": True, "device_id": str(device_id), "level": level, "state": bool(state)}
+    _remember_tool_call("c4_light_set_level", {"device_id": device_id, "level": level}, out)
+    return out
 
 
 @Mcp.tool(name="c4_light_ramp", description="Ramp a Control4 light to a level over time_ms.")
@@ -2358,8 +2530,14 @@ def c4_light_ramp_tool(device_id: str, level: int, time_ms: int) -> dict:
         return {"ok": False, "error": "level must be 0-100"}
     if time_ms < 0:
         return {"ok": False, "error": "time_ms must be >= 0"}
+
+    if is_last_lights_token(device_id):
+        return c4_lights_set_last_tool(level=int(level), ramp_ms=int(time_ms))
+
     state = light_ramp(int(device_id), level, time_ms)
-    return {"ok": True, "device_id": str(device_id), "level": level, "time_ms": time_ms, "state": bool(state)}
+    out = {"ok": True, "device_id": str(device_id), "level": level, "time_ms": time_ms, "state": bool(state)}
+    _remember_tool_call("c4_light_ramp", {"device_id": device_id, "level": level, "time_ms": time_ms}, out)
+    return out
 
 
 @Mcp.tool(
@@ -2464,7 +2642,7 @@ def c4_light_set_by_name_tool(
     )
 
     ok = bool(exec_res.get("ok")) if isinstance(exec_res, dict) else bool(exec_res)
-    return {
+    out = {
         "ok": ok,
         "device_name": str(device_name),
         "room_id": (str(resolved_room_id) if resolved_room_id is not None else None),
@@ -2473,6 +2651,18 @@ def c4_light_set_by_name_tool(
         "resolve": rd,
         "execute": exec_res,
     }
+    _remember_tool_call(
+        "c4_light_set_by_name",
+        {
+            "device_name": device_name,
+            "level": level,
+            "state": state,
+            "room_name": room_name,
+            "room_id": room_id,
+        },
+        out,
+    )
+    return out
 
 
 @Mcp.tool(
@@ -2575,13 +2765,27 @@ def c4_room_lights_set_tool(
         dry_run=False,
     )
     ok = bool(exec_res.get("ok")) if isinstance(exec_res, dict) else bool(exec_res)
-    return {
+    out = {
         "ok": ok,
         "room_id": str(resolved_room_id),
         "room_name": resolved_room_name,
         "planned": planned,
         "execute": exec_res,
     }
+    _remember_tool_call(
+        "c4_room_lights_set",
+        {
+            "room_id": room_id,
+            "room_name": room_name,
+            "level": level,
+            "state": state,
+            "exclude_names": exclude_names,
+            "include_names": include_names,
+            "ramp_ms": ramp_ms,
+        },
+        out,
+    )
+    return out
 
 
 # ---- Locks ----

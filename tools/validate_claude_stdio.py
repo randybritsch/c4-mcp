@@ -60,6 +60,8 @@ def main() -> int:
         tools = (responses[2].get("result") or {}).get("tools") or []
         if not any(t.get("name") == "ping" for t in tools if isinstance(t, dict)):
             raise RuntimeError("tools/list did not include ping")
+        if not any(t.get("name") == "c4_memory_get" for t in tools if isinstance(t, dict)):
+            raise RuntimeError("tools/list did not include c4_memory_get (session memory)")
 
         if 3 not in responses or "error" in responses[3]:
             raise RuntimeError(f"tools/call failed: {responses.get(3)}\n{stderr}")

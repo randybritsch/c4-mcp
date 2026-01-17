@@ -87,6 +87,8 @@ def main() -> int:
             raise RuntimeError("mcp.list returned no tools")
         if "ping" not in tools:
             raise RuntimeError("mcp.list did not include expected tool: ping")
+        if "c4_memory_get" not in tools:
+            raise RuntimeError("mcp.list did not include expected tool: c4_memory_get")
 
         if not resp2:
             raise RuntimeError(f"No response for ping call. stderr=\n{stderr}")
