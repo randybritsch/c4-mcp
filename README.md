@@ -74,6 +74,25 @@ This project talks to your Control4 system using credentials (and often a local 
 - Never commit real credentials. Keep `config.json` local-only (it is ignored by `.gitignore`).
 - If you accidentally committed credentials at any point, rotate them immediately and rewrite git history before making the repo public.
 
+## Registry metadata
+
+This section is meant to be **copy/paste-friendly** for MCP registries and "server list" directories.
+
+- **Name**: `c4-mcp`
+- **Category**: Home Automation / Control4
+- **Repo**: https://github.com/randybritsch/c4-mcp
+- **License**: MIT
+- **Transports**:
+  - **STDIO (JSON-RPC)**: `claude_stdio_server.py` (for Claude Desktop and other stdio-based MCP clients)
+  - **HTTP**: `app.py` (binds to `http://127.0.0.1:3333`; endpoints: `/mcp/list`, `/mcp/call`)
+- **Configuration / secrets**:
+  - Recommended: set `C4_CONFIG_PATH` to a local `config.json` that contains `host`, `username`, `password` (keep this file gitignored)
+  - Optional: set `C4_HOST` (non-secret) to override `host` from `config.json`
+  - Optional: set `C4_USERNAME`/`C4_PASSWORD` (secret) via OS env vars (must be provided together)
+- **Safety defaults (recommended)**:
+  - For read-only-by-default runs: `C4_WRITE_GUARDRAILS=true` + `C4_WRITES_ENABLED=false`
+  - Optional filters: `C4_WRITE_ALLOWLIST` / `C4_WRITE_DENYLIST`
+
 ## Python version note (important)
 
 This project depends on `flask-mcp-server`, which in turn depends on `pydantic`/`pydantic-core`.
