@@ -85,6 +85,8 @@ Use **Python 3.12** (recommended) or another version with `pydantic-core` wheels
 
 If you have **Node.js + npm** installed, you can bootstrap the Python venv + dependencies with one command:
 
+- Install Node.js (includes npm): https://nodejs.org/
+
 - `npm run setup`
 
 Then:
