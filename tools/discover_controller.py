@@ -232,7 +232,7 @@ def _choose_best(cands: List[Candidate]) -> Optional[Candidate]:
     return cands[0]
 
 
-def _load_or_create_config(path: Path) -> dict:
+def _load_or_create_config(path: Path, *, allow_missing_credentials: bool = False) -> dict:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
@@ -244,6 +244,11 @@ def _load_or_create_config(path: Path) -> dict:
     pw = (os.environ.get("C4_PASSWORD") or os.environ.get("CONTROL4_PASSWORD") or "").strip()
 
     if not user or not pw:
+        if allow_missing_credentials:
+            # Allow writing just the discovered host as a convenience.
+            # Users can provide credentials via env vars or fill them in later.
+            return {"host": "", "username": user, "password": pw}
+
         raise RuntimeError(
             "config.json does not exist and username/password are not set in env vars. "
             "Set C4_USERNAME and C4_PASSWORD (or CONTROL4_*) to create a config automatically."
@@ -315,10 +320,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.write:
         cfg_path = Path(args.config_path)
-        cfg = _load_or_create_config(cfg_path)
+        cfg = _load_or_create_config(cfg_path, allow_missing_credentials=True)
         cfg["host"] = best.ip
         _write_config(cfg_path, cfg)
         print(f"\nWrote host to: {cfg_path}")
+
+        if not (str(cfg.get("username") or "").strip() and str(cfg.get("password") or "").strip()):
+            print(
+                "Note: username/password were not set. Provide credentials via env vars (C4_USERNAME/C4_PASSWORD) "
+                "or fill them into config.json before running the server.",
+                file=sys.stderr,
+            )
 
     return 0
 
