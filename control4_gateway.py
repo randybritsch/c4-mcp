@@ -66,6 +66,81 @@ class Config:
     password: str
 
 
+def config_diagnostics(cfg_path: Optional[str] = None) -> dict[str, Any]:
+    """Return config/credential diagnostics without raising.
+
+    This is used for user experience (e.g., Claude Desktop logs / info tools)
+    so the server can start and report what is missing.
+    """
+
+    env_host = (os.environ.get("C4_HOST") or os.environ.get("CONTROL4_HOST") or "").strip()
+    env_user = (os.environ.get("C4_USERNAME") or os.environ.get("CONTROL4_USERNAME") or "").strip()
+    env_pass = (os.environ.get("C4_PASSWORD") or os.environ.get("CONTROL4_PASSWORD") or "").strip()
+
+    env_cfg = (os.environ.get("C4_CONFIG_PATH") or os.environ.get("CONTROL4_CONFIG_PATH") or "").strip()
+    path = Path(cfg_path or env_cfg) if (cfg_path or env_cfg) else Path(__file__).with_name("config.json")
+
+    file_host = ""
+    file_user = ""
+    file_pass = ""
+    file_error: str | None = None
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                file_host = str(data.get("host", "")).strip()
+                file_user = str(data.get("username", "")).strip()
+                file_pass = str(data.get("password", "")).strip()
+            else:
+                file_error = "config file JSON is not an object"
+        except Exception as e:
+            file_error = f"{e.__class__.__name__}: {e}"
+
+    env_creds_partial = bool(env_user or env_pass) and not (env_user and env_pass)
+
+    host = env_host or file_host
+    username = env_user or file_user
+    password = env_pass or file_pass
+
+    missing: list[str] = []
+    if not host:
+        missing.append("host")
+    if not username:
+        missing.append("username")
+    if not password:
+        missing.append("password")
+
+    return {
+        "ok_to_connect": (len(missing) == 0) and (not env_creds_partial) and (file_error is None),
+        "path": str(path),
+        "path_source": ("arg" if cfg_path else ("env" if env_cfg else "default")),
+        "file_exists": bool(path.exists()),
+        "file_error": file_error,
+        "env": {
+            "has_host": bool(env_host),
+            "has_username": bool(env_user),
+            "has_password": bool(env_pass),
+            "credentials_partial": env_creds_partial,
+            "has_config_path": bool(env_cfg),
+        },
+        "effective": {
+            "has_host": bool(host),
+            "has_username": bool(username),
+            "has_password": bool(password),
+            "missing": missing,
+            "host_source": ("env" if env_host else ("file" if file_host else "none")),
+            "credentials_source": ("env" if (env_user and env_pass) else ("file" if (file_user and file_pass) else "none")),
+        },
+        "next_steps": {
+            "recommended": "Set C4_CONFIG_PATH to a config.json with host/username/password.",
+            "alternatives": [
+                "Set C4_HOST (or CONTROL4_HOST) and set BOTH C4_USERNAME and C4_PASSWORD.",
+                "Copy config.example.json to config.json and fill it in.",
+            ],
+        },
+    }
+
+
 class Control4Gateway:
     """
     Sync facade for Flask/MCP tools.

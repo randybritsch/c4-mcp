@@ -632,6 +632,8 @@ def c4_lights_set_last_tool(
     ),
 )
 def c4_server_info_tool() -> dict:
+    from control4_gateway import config_diagnostics
+
     reg = getattr(flask_mcp_server, "default_registry", None)
     tools_dict = None
     if reg is not None:
@@ -656,6 +658,7 @@ def c4_server_info_tool() -> dict:
             "has_media_now_playing": "c4_media_now_playing" in tool_names,
             "sample_tools": tool_names[:50],
         },
+        "control4_config": config_diagnostics(),
     }
 
 

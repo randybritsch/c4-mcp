@@ -193,6 +193,7 @@ def main() -> int:
     from app import _is_write_tool, _write_allowed, _write_guardrails_enabled, _writes_enabled
 
     from flask_mcp_server.registry import default_registry
+    from control4_gateway import config_diagnostics
 
     server_info = {
         "name": "c4-mcp",
@@ -222,6 +223,21 @@ def main() -> int:
     except Exception:
         pass
     _eprint(f"Registered tools: {len(default_registry.tools)}")
+
+    # Friendly startup warning for common misconfiguration.
+    # Do NOT crash; just tell the user what to fix (Claude logs stderr).
+    try:
+        diag = config_diagnostics()
+        if not bool(diag.get("ok_to_connect")):
+            eff = (diag.get("effective") or {}) if isinstance(diag, dict) else {}
+            missing = eff.get("missing") if isinstance(eff, dict) else None
+            missing_s = ",".join(missing) if isinstance(missing, list) else "unknown"
+            _eprint("WARNING: Control4 config is incomplete; tools that talk to Director will fail until fixed.")
+            _eprint(f"WARNING: Missing: {missing_s}")
+            _eprint(f"WARNING: Config path: {diag.get('path')}")
+            _eprint("WARNING: Fix by setting C4_CONFIG_PATH to a valid config.json, or set C4_HOST + BOTH C4_USERNAME/C4_PASSWORD.")
+    except Exception:
+        pass
 
     session_id = _reset_session_id()
     _eprint(f"Session id: {session_id}")
@@ -309,6 +325,20 @@ def main() -> int:
                     msg = str(e).strip()
                     if not msg:
                         msg = f"{e.__class__.__name__}"
+
+                    msg_low = msg.lower()
+                    if (
+                        "missing control4 host" in msg_low
+                        or "missing control4 credentials" in msg_low
+                        or "invalid config file" in msg_low
+                        or "incomplete control4 credentials" in msg_low
+                    ):
+                        msg = (
+                            "Setup required: "
+                            + msg
+                            + "\n\nFix: set C4_CONFIG_PATH to a config.json with host/username/password, "
+                            + "or set C4_HOST + BOTH C4_USERNAME and C4_PASSWORD."
+                        )
                     _eprint(f"Tool error in {name}: {msg}")
                     _eprint(traceback.format_exc())
                     _send_result(request_id, _wrap_tool_error(f"Tool error: {msg}"))
