@@ -40,6 +40,33 @@ Which doors are currently unlocked?
 
 Tip: If you run with `C4_WRITE_GUARDRAILS=true` and `C4_WRITES_ENABLED=false`, you’ll get a safe read-only experience until you explicitly enable writes.
 
+## Direct HTTP examples (no MCP client required)
+
+If you’re not using an MCP client yet, you can still call the server directly.
+
+List tools:
+
+- `GET http://127.0.0.1:3333/mcp/list`
+
+Call a tool (example: list rooms):
+
+PowerShell:
+
+```powershell
+$base = 'http://127.0.0.1:3333'
+Invoke-RestMethod -Method Post -Uri ($base + '/mcp/call') -ContentType 'application/json' -Body (
+	@{ tool = 'c4_list_rooms'; args = @{} } | ConvertTo-Json -Depth 10
+)
+```
+
+curl:
+
+```bash
+curl -s http://127.0.0.1:3333/mcp/call \
+	-H "Content-Type: application/json" \
+	-d '{"tool":"c4_list_rooms","args":{}}'
+```
+
 ## Security / publishing note (read this)
 
 This project talks to your Control4 system using credentials (and often a local controller IP).
