@@ -10,11 +10,14 @@ Turn your Control4 system into a **Model Context Protocol (MCP)** toolset, so an
 ## Why this is cool
 
 - **Works with real MCP clients**: HTTP transport for dev/scripts + **STDIO JSON-RPC** for clients like **Claude Desktop**.
+- **One integration point for many clients**: use the same toolset from Claude Desktop, scripts, or your own agents without rewriting Control4 logic.
+- **Structured tool schemas = fewer mistakes**: explicit inputs/outputs (room/device IDs, levels, setpoints, etc.) reduce ambiguity vs. prompt-only automations.
 - **Safe-by-default controls**: optional write guardrails, read-only mode, and allow/deny lists for state-changing tools.
 - **Session memory for follow-ups**: enables natural multi-step flows like “turn on the basement lights… now dim those lights”.
 - **Smarter “lights” semantics**: room-based lighting ops avoid accidentally targeting fans/heaters/outlets.
 - **One-command validation**: an end-to-end runner exercises HTTP + STDIO so you can ship changes with confidence.
 - **Tunable performance**: inventory caching + env-configurable timeouts for slower Control4 projects.
+- **Credentials stay local**: keep `config.json` on your machine (gitignored) and choose local-only STDIO or LAN HTTP based on your risk tolerance.
 
 ## What you can do
 
