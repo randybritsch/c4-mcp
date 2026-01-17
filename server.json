@@ -1,0 +1,121 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.randybritsch/c4-mcp",
+  "title": "Control4",
+  "description": "Local Control4 home automation MCP server (lights, locks, thermostats, media).",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/randybritsch/c4-mcp",
+  "repository": {
+    "url": "https://github.com/randybritsch/c4-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "c4-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "C4_CONFIG_PATH",
+          "description": "Path to a local config.json containing host/username/password.",
+          "format": "filepath",
+          "placeholder": "C:/path/to/config.json"
+        },
+        {
+          "name": "C4_HOST",
+          "description": "Control4 Director/Controller IP or hostname (overrides config host).",
+          "placeholder": "192.168.1.2"
+        },
+        {
+          "name": "C4_USERNAME",
+          "description": "Control4 account email (must be paired with C4_PASSWORD if set).",
+          "isSecret": true,
+          "placeholder": "you@example.com"
+        },
+        {
+          "name": "C4_PASSWORD",
+          "description": "Control4 account password (must be paired with C4_USERNAME if set).",
+          "isSecret": true
+        },
+        {
+          "name": "C4_DIRECTOR_TIMEOUT_S",
+          "description": "Per-request timeout (seconds) for Director API calls.",
+          "default": "20",
+          "placeholder": "30"
+        },
+        {
+          "name": "C4_GET_ALL_ITEMS_TIMEOUT_S",
+          "description": "Overall timeout (seconds) for full inventory fetches used by list/resolve operations.",
+          "default": "60",
+          "placeholder": "75"
+        },
+        {
+          "name": "C4_ITEMS_CACHE_TTL_S",
+          "description": "Inventory cache TTL (seconds). Use 0 to disable caching.",
+          "default": "5",
+          "placeholder": "5"
+        },
+        {
+          "name": "C4_STDIO_TOOL_MODE",
+          "description": "STDIO only: tool catalog mode. Use 'compact' to reduce tools/list payload size for clients like Claude Desktop; use 'all' to expose every tool.",
+          "default": "all",
+          "choices": [
+            "compact",
+            "all"
+          ]
+        },
+        {
+          "name": "C4_STDIO_TOOL_ALLOWLIST",
+          "description": "STDIO only: comma-separated allowlist of tool names to expose in tools/list. Overrides C4_STDIO_TOOL_MODE when set.",
+          "placeholder": "ping,c4_find_devices,c4_light_set_by_name"
+        },
+        {
+          "name": "C4_STDIO_TOOL_DENYLIST",
+          "description": "STDIO only: comma-separated denylist of tool names to hide from tools/list.",
+          "placeholder": "c4_item_send_command"
+        },
+        {
+          "name": "C4_STDIO_DEBUG",
+          "description": "STDIO only: when true, log JSON-RPC recv/sent diagnostics to stderr for troubleshooting.",
+          "default": "false",
+          "choices": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "C4_WRITES_ENABLED",
+          "description": "Enable state-changing tools (true/false).",
+          "default": "false",
+          "choices": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "C4_WRITE_GUARDRAILS",
+          "description": "Apply write allow/deny guardrails (recommended).",
+          "default": "true",
+          "choices": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "C4_WRITE_ALLOWLIST",
+          "description": "Comma-separated allowlist of write tool names.",
+          "placeholder": "c4_light_set_by_name,c4_lock_lock_by_name"
+        },
+        {
+          "name": "C4_WRITE_DENYLIST",
+          "description": "Comma-separated denylist of write tool names.",
+          "placeholder": "c4_lock_unlock_by_name"
+        }
+      ]
+    }
+  ]
+}

@@ -7,8 +7,22 @@ from control4_gateway import Control4Gateway
 
 Json = Dict[str, Any]
 
-# Single shared gateway instance for the process
-gateway = Control4Gateway()
+class _LazyGateway:
+    def __init__(self) -> None:
+        self._gateway: Control4Gateway | None = None
+
+    def _get(self) -> Control4Gateway:
+        if self._gateway is None:
+            self._gateway = Control4Gateway()
+        return self._gateway
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
+# Single shared gateway instance for the process (lazy so imports don't fail when
+# config/credentials aren't set yet; tools will error on first actual use).
+gateway = _LazyGateway()
 
 
 # --------- Core passthroughs ---------

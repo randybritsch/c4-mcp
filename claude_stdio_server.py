@@ -10,7 +10,7 @@ different method surface (mcp.list / mcp.call). This shim adapts Claude's
 protocol to the existing tool registry built in app.py.
 
 Run (for Claude):
-    .\.venv\Scripts\python.exe claude_stdio_server.py
+    .venv\\Scripts\\python.exe claude_stdio_server.py
 
 Notes:
 - All logs go to stderr (stdout is reserved for JSON-RPC responses).
@@ -27,12 +27,91 @@ from typing import Any, Dict, Optional
 import uuid
 
 
+def _debug_enabled() -> bool:
+    v = os.getenv("C4_STDIO_DEBUG")
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _eprint(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _dprint(msg: str) -> None:
+    if _debug_enabled():
+        _eprint(msg)
+
+
 def _json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, default=str)
+    # Keep stdout strictly ASCII-safe JSON so Windows host encodings
+    # (cp1252/etc) can't break JSON-RPC with UnicodeEncodeError.
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"), default=str)
+
+
+def _parse_csv_env(name: str) -> list[str]:
+    v = os.getenv(name)
+    if not v:
+        return []
+    parts = [p.strip() for p in v.replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
+
+def _tool_mode() -> str:
+    # all: expose every tool (large tools/list)
+    # compact: expose a curated high-level set (best for Claude Desktop stability)
+    v = (os.getenv("C4_STDIO_TOOL_MODE") or "all").strip().lower()
+    return v if v in {"all", "compact"} else "all"
+
+
+def _compact_allowlist() -> set[str]:
+    # Curated, high-level tools intended to cover common usage without sending
+    # a massive schema payload in tools/list.
+    return {
+        "ping",
+        "c4_server_info",
+        "c4_find_rooms",
+        "c4_find_devices",
+        "c4_resolve",
+        "c4_resolve_room",
+        "c4_resolve_device",
+        "c4_list_rooms",
+        "c4_list_devices",
+        "c4_light_set_by_name",
+        "c4_room_lights_set",
+        "c4_lights_get_last",
+        "c4_lights_set_last",
+        "c4_lock_set_by_name",
+        "c4_scene_activate_by_name",
+        "c4_scene_set_state_by_name",
+        "c4_macro_execute_by_name",
+        "c4_announcement_execute_by_name",
+        "c4_media_watch_launch_app_by_name",
+        "c4_room_list_commands",
+        "c4_room_send_command",
+        "c4_tv_watch_by_name",
+        "c4_tv_remote",
+        "c4_thermostat_set_target_f",
+        "c4_shade_set_position",
+        "c4_alarm_set_mode",
+    }
+
+
+def _select_tools(all_tools: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    # Optional explicit allow/deny lists.
+    allow = set(_parse_csv_env("C4_STDIO_TOOL_ALLOWLIST"))
+    deny = set(_parse_csv_env("C4_STDIO_TOOL_DENYLIST"))
+
+    if not allow and _tool_mode() == "compact":
+        allow = _compact_allowlist()
+
+    items: list[tuple[str, dict[str, Any]]] = sorted(all_tools.items())
+    if allow:
+        items = [(name, t) for (name, t) in items if name in allow]
+    if deny:
+        items = [(name, t) for (name, t) in items if name not in deny]
+
+    return [_tool_to_mcp(t) for _, t in items]
 
 
 def _send_result(request_id: Any, result: Any) -> None:
@@ -51,11 +130,27 @@ def _send_error(request_id: Any, code: int, message: str, data: Optional[dict[st
 
 
 def _tool_to_mcp(tool: Dict[str, Any]) -> dict[str, Any]:
-    return {
+    description = (tool.get("description") or "").strip()
+    if description:
+        # Keep tools/list responses reasonably small; Claude does not need full docstrings here.
+        description = description.replace("\r\n", "\n")
+        if "\n\n" in description:
+            description = description.split("\n\n", 1)[0].strip()
+        if len(description) > 320:
+            description = description[:317].rstrip() + "..."
+
+    mcp_tool: dict[str, Any] = {
         "name": tool.get("name"),
-        "description": tool.get("description") or "",
+        "description": description,
         "inputSchema": tool.get("input_schema") or {"type": "object", "properties": {}},
     }
+
+    # Newer MCP clients (including Claude Desktop) may expect outputSchema.
+    output_schema = tool.get("output_schema")
+    if isinstance(output_schema, dict) and output_schema:
+        mcp_tool["outputSchema"] = output_schema
+
+    return mcp_tool
 
 
 def _wrap_tool_result(value: Any) -> dict[str, Any]:
@@ -104,7 +199,28 @@ def main() -> int:
         "version": os.getenv("C4_VERSION", "dev"),
     }
 
+    # Best-effort: if stdout is text-mode and reconfigurable, prefer UTF-8.
+    # (We still emit ASCII-safe JSON via ensure_ascii=True.)
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     _eprint("Claude STDIO shim starting (c4-mcp)")
+    _eprint(f"Debug enabled: {_debug_enabled()}")
+    try:
+        _eprint(f"stdout encoding: {getattr(sys.stdout, 'encoding', None)}")
+    except Exception:
+        pass
+    try:
+        _eprint(f"argv: {sys.argv}")
+        _eprint(f"cwd: {os.getcwd()}")
+        _eprint(f"tool_mode: {_tool_mode()}")
+        _eprint(f"allowlist size: {len(_parse_csv_env('C4_STDIO_TOOL_ALLOWLIST'))}")
+        _eprint(f"denylist size: {len(_parse_csv_env('C4_STDIO_TOOL_DENYLIST'))}")
+    except Exception:
+        pass
     _eprint(f"Registered tools: {len(default_registry.tools)}")
 
     session_id = _reset_session_id()
@@ -122,6 +238,8 @@ def main() -> int:
             method = req.get("method")
             params = req.get("params") or {}
 
+            _dprint(f"recv id={request_id} method={method}")
+
             # JSON-RPC notifications: no id => no response.
             if request_id is None:
                 continue
@@ -135,13 +253,15 @@ def main() -> int:
                     {
                         "protocolVersion": params.get("protocolVersion") or "2024-11-05",
                         "capabilities": {
-                            "tools": {},
-                            "resources": {},
-                            "prompts": {},
+                            "experimental": {},
+                            "tools": {"listChanged": False},
+                            "resources": {"subscribe": False, "listChanged": False},
+                            "prompts": {"listChanged": False},
                         },
                         "serverInfo": {**server_info, "session_id": session_id},
                     },
                 )
+                _dprint(f"sent initialize result id={request_id}")
                 continue
 
             if method in ("notifications/initialized", "initialized"):
@@ -150,8 +270,9 @@ def main() -> int:
                 continue
 
             if method == "tools/list":
-                tools = [_tool_to_mcp(t) for _, t in sorted(default_registry.tools.items())]
+                tools = _select_tools(default_registry.tools)
                 _send_result(request_id, {"tools": tools})
+                _dprint(f"sent tools/list result id={request_id} tools={len(tools)}")
                 continue
 
             if method == "tools/call":
@@ -195,10 +316,12 @@ def main() -> int:
 
             if method == "resources/list":
                 _send_result(request_id, {"resources": []})
+                _dprint(f"sent resources/list result id={request_id}")
                 continue
 
             if method == "prompts/list":
                 _send_result(request_id, {"prompts": []})
+                _dprint(f"sent prompts/list result id={request_id}")
                 continue
 
             # Unknown method

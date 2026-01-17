@@ -3080,5 +3080,9 @@ def _patch_mcp_registry_name_collisions() -> None:
 _patch_mcp_registry_name_collisions()
 
 
-if __name__ == "__main__":
+def main() -> None:
     app.run(host="127.0.0.1", port=3333, debug=False, use_reloader=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

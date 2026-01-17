@@ -19,7 +19,8 @@ def main() -> int:
     python_exe = os.path.join(repo_root, ".venv", "Scripts", "python.exe")
     server_py = os.path.join(repo_root, "claude_stdio_server.py")
 
-    cmd = [python_exe, server_py]
+    # Run unbuffered to better match Claude Desktop behavior on Windows.
+    cmd = [python_exe, "-u", server_py]
     requests = [
         {
             "jsonrpc": "2.0",
@@ -44,9 +45,17 @@ def main() -> int:
     ]
     input_text = "\n".join(json.dumps(r) for r in requests) + "\n"
 
+    env = os.environ.copy()
+    # Ensure tests don't fail due to inherited tool filtering.
+    # This validator is specifically validating the Claude method surface, not tool-filter policy.
+    env["C4_STDIO_TOOL_MODE"] = "all"
+    env.pop("C4_STDIO_TOOL_ALLOWLIST", None)
+    env.pop("C4_STDIO_TOOL_DENYLIST", None)
+
     proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
+        env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

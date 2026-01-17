@@ -1,5 +1,7 @@
 # c4-mcp
 
+<!-- mcp-name: io.github.randybritsch/c4-mcp -->
+
 Turn your Control4 system into a **Model Context Protocol (MCP)** toolset, so any MCP-capable client (Claude Desktop, custom agents, scripts) can **query rooms/devices** and **safely run automations**.
 
 [![CI](https://github.com/randybritsch/c4-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/randybritsch/c4-mcp/actions/workflows/ci.yml)
@@ -36,6 +38,28 @@ Now dim those lights to 30%.
 Activate the "Movie Time" scene in the Living Room.
 
 Which doors are currently unlocked?
+```
+
+## Advanced prompts (hard in the stock Control4 app UI)
+
+These are examples of the kind of *cross-device*, *conditional*, and *multi-step* requests that are awkward (or not possible) to do purely in the standard Control4 app UI without building custom automation logic elsewhere.
+
+Note: prompts that *change state* (lights/locks/thermostat/media) require `C4_WRITES_ENABLED=true`. Read-only prompts (inventory/status/reporting) work fine with the safe default `C4_WRITES_ENABLED=false`.
+
+```text
+Run a “Good Night” sweep: turn off all lights except Hallway (10%), lock all exterior doors, set Downstairs thermostat to 68°F, then report what succeeded/failed.
+
+If any door is unlocked, lock it — but do NOT lock the Garage door.
+
+Find anything in the Basement that is currently on (lights, outlets), list it, then turn off everything except the dehumidifier outlet.
+
+I’m leaving: turn off all AV devices, activate the “Away” scene, and confirm the house is secured (all locks locked).
+
+The Basement lights are on — tell me which specific loads are on and turn off only the ones that are above 50%.
+
+Compare the Living Room lights vs. Kitchen lights: which room is brighter right now? Then set them to match.
+
+Do a safety check: list any unlocked doors, any lights left on in the Basement, and the current thermostat setpoints for each zone.
 ```
 
 Tip: If you run with `C4_WRITE_GUARDRAILS=true` and `C4_WRITES_ENABLED=false`, you’ll get a safe read-only experience until you explicitly enable writes.
@@ -99,6 +123,19 @@ This project depends on `flask-mcp-server`, which in turn depends on `pydantic`/
 At the time of writing, **Python 3.14 will not work out-of-the-box on Windows** because `pydantic-core` does not ship wheels for it yet.
 
 Use **Python 3.12** (recommended) or another version with `pydantic-core` wheels available.
+
+## Install from PyPI (recommended for most users)
+
+If you just want to use the server (not hack on the repo), you can install it from PyPI:
+
+- `python -m pip install c4-mcp`
+
+Then run either transport:
+
+- STDIO (for Claude Desktop / stdio MCP clients): `c4-mcp`
+- HTTP (for scripts / curl / local dev): `c4-mcp-http`
+
+You still need to provide Control4 config via `C4_CONFIG_PATH` (recommended) or `C4_HOST`/`C4_USERNAME`/`C4_PASSWORD`.
 
 ## Easy install (almost one command)
 
@@ -269,7 +306,7 @@ This starts the HTTP server in **read-only guardrails mode**, runs the HTTP vali
 
 Windows (PowerShell):
 
-- `\.venv\Scripts\python.exe tools\run_e2e.py`
+- `.\.venv\Scripts\python.exe tools\run_e2e.py`
 
 macOS / Linux (bash/zsh):
 
@@ -279,7 +316,7 @@ If you already have the server running and only want to run validators:
 
 Windows (PowerShell):
 
-- `\.venv\Scripts\python.exe tools\run_e2e.py --no-server --base-url http://127.0.0.1:3333`
+- `.\.venv\Scripts\python.exe tools\run_e2e.py --no-server --base-url http://127.0.0.1:3333`
 
 macOS / Linux (bash/zsh):
 
@@ -295,7 +332,7 @@ This repo includes a small shim, `claude_stdio_server.py`, that adapts Claude's 
 1) Create your venv using Python 3.12 (recommended; 3.13 also works):
 
 - `py -3.12 -m venv .venv`
-- `\.\.venv\Scripts\Activate.ps1`
+- `.\.venv\Scripts\Activate.ps1`
 - `python -m pip install -r requirements.txt`
 
 2) Edit Claude Desktop config:
@@ -318,9 +355,12 @@ Add an MCP server entry like this (edit paths + optional env vars):
 	"mcpServers": {
 		"c4-mcp": {
 			"command": "C:\\Users\\YOUR_USER\\c4-mcp\\.venv\\Scripts\\python.exe",
-			"args": ["C:\\Users\\YOUR_USER\\c4-mcp\\claude_stdio_server.py"],
+			"args": ["-u", "C:\\Users\\YOUR_USER\\c4-mcp\\claude_stdio_server.py"],
 			"cwd": "C:\\Users\\YOUR_USER\\c4-mcp",
 			"env": {
+				"PYTHONUTF8": "1",
+				"PYTHONIOENCODING": "utf-8",
+				"C4_STDIO_TOOL_MODE": "compact",
 				"C4_CONFIG_PATH": "C:\\Users\\YOUR_USER\\c4-mcp\\config.json",
 				"C4_WRITE_GUARDRAILS": "true",
 				"C4_WRITES_ENABLED": "false",
@@ -332,7 +372,26 @@ Add an MCP server entry like this (edit paths + optional env vars):
 }
 ```
 
+Notes:
+- `-u` is recommended on Windows so STDIO JSON-RPC responses are not buffered.
+- `C4_STDIO_TOOL_MODE=compact` keeps `tools/list` small and avoids Claude Desktop choking on a huge tool catalog. Set it to `all` to expose everything.
+
+If Claude fails to start the server and you see an error like:
+
+`python.exe: can't open file '...\\AnthropicClaude\\...\\mcp_cli.py': [Errno 2] No such file or directory`
+
+it means Claude is trying to resolve a **relative path** from its own install directory.
+Fix by using **absolute paths** for scripts in `args` and keeping `cwd` set to the repo root.
+
+Tip: set `C4_STDIO_DEBUG=true` in the Claude config `env` to log each JSON-RPC request/response to the Claude MCP log.
+
 If you use `config.json` for credentials, copy `config.example.json` to `config.json` and set `host`, `username`, and `password` there.
+
+If Claude starts the server but tool calls fail and you see an error like:
+
+`RuntimeError: Invalid config file '...\\config.json': username/password must be non-empty (or provide C4_USERNAME/C4_PASSWORD env vars)`
+
+then your `config.json` has blank credentials. Fix by filling in `username`/`password` in `config.json` or setting `C4_USERNAME` and `C4_PASSWORD` in the Claude config `env` (they must be provided together).
 
 Optional (non-secret) env vars you can add to Claude's config if needed:
 
@@ -357,11 +416,11 @@ If listing rooms/devices times out on first run, increase these (Claude config `
 
 ### Optional: write guardrails (recommended for safety)
 
-By default, tools that change state (locks, lights, thermostat, media remote, etc.) are allowed.
-If you want a **read-only** server unless explicitly enabled, set:
+By default, tools that change state (locks, lights, thermostat, media remote, etc.) are **blocked** unless you explicitly enable writes.
+If you want an extra safety layer (recommended), set:
 
 - `C4_WRITE_GUARDRAILS=true` (turns on enforcement)
-- `C4_WRITES_ENABLED=true` (allows write tools)
+- `C4_WRITES_ENABLED=false` (keep write tools blocked; flip to `true` when you actually want writes)
 
 Optional filters (comma-separated tool names):
 
@@ -417,4 +476,4 @@ Try:
 Troubleshooting:
 
 - Use `c4_item_commands(device_id)` to see which command(s) a given scene/button supports.
-- Read-only validator: `\.venv\Scripts\python.exe tools\validate_scenes.py --show-commands`
+- Read-only validator: `.\.venv\Scripts\python.exe tools\validate_scenes.py --show-commands`
