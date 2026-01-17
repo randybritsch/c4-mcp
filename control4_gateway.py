@@ -51,7 +51,12 @@ class AsyncLoopThread:
 
     def run(self, coro, timeout_s: float | None = None) -> Any:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=timeout_s)
+        try:
+            return fut.result(timeout=timeout_s)
+        except FuturesTimeoutError as e:
+            # concurrent.futures.TimeoutError has an empty string message by default;
+            # raise something that is useful for tool callers.
+            raise RuntimeError(f"Timeout waiting for async operation (timeout={timeout_s}s)") from e
 
 
 @dataclass(frozen=True)
@@ -73,14 +78,40 @@ class Control4Gateway:
         cfg_path: Optional[str] = None,
         token_ttl_s: int = 3600,
         auth_timeout_s: float = 10.0,
-        director_timeout_s: float = 8.0,
+        director_timeout_s: float = 20.0,
         http_timeout_s: float = 6.0,
     ) -> None:
         self._cfg = self._load_config(cfg_path)
-        self._token_ttl_s = int(token_ttl_s)
-        self._auth_timeout_s = float(auth_timeout_s)
-        self._director_timeout_s = float(director_timeout_s)
-        self._http_timeout_s = float(http_timeout_s)
+
+        # Allow runtime tuning from env (useful for Claude Desktop STDIO where
+        # the first inventory fetch can be slower than typical request/response flows).
+        def _env_float(name: str, default: float) -> float:
+            raw = os.environ.get(name)
+            if raw is None or not str(raw).strip():
+                return float(default)
+            try:
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        def _env_int(name: str, default: int) -> int:
+            raw = os.environ.get(name)
+            if raw is None or not str(raw).strip():
+                return int(default)
+            try:
+                return int(float(raw))
+            except Exception:
+                return int(default)
+
+        self._token_ttl_s = _env_int("C4_TOKEN_TTL_S", int(token_ttl_s))
+        self._auth_timeout_s = _env_float("C4_AUTH_TIMEOUT_S", float(auth_timeout_s))
+        self._director_timeout_s = _env_float("C4_DIRECTOR_TIMEOUT_S", float(director_timeout_s))
+        self._http_timeout_s = _env_float("C4_HTTP_TIMEOUT_S", float(http_timeout_s))
+        # Overall sync wrapper timeout for fetching full inventory.
+        self._get_all_items_timeout_s = _env_float(
+            "C4_GET_ALL_ITEMS_TIMEOUT_S",
+            max(18.0, float(self._director_timeout_s) + 15.0),
+        )
 
         self._loop_thread = AsyncLoopThread()
         self._loop_thread.start()
@@ -1628,7 +1659,9 @@ class Control4Gateway:
         if cached is not None:
             return cached
 
-        fetched = self._loop_thread.run(self._get_all_items_async(), timeout_s=18)
+        # Inventory fetch is sometimes slow on first connect; allow a more generous
+        # timeout than per-call director_timeout_s.
+        fetched = self._loop_thread.run(self._get_all_items_async(), timeout_s=float(self._get_all_items_timeout_s))
         items: list[dict[str, Any]] = []
         if isinstance(fetched, list):
             items = [i for i in fetched if isinstance(i, dict)]

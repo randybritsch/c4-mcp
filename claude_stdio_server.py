@@ -1,4 +1,4 @@
-"""Claude Desktop STDIO MCP server shim.
+r"""Claude Desktop STDIO MCP server shim.
 
 Why: Claude Desktop speaks the official MCP JSON-RPC method names like:
 - initialize
@@ -10,7 +10,7 @@ different method surface (mcp.list / mcp.call). This shim adapts Claude's
 protocol to the existing tool registry built in app.py.
 
 Run (for Claude):
-  .\.venv\Scripts\python.exe claude_stdio_server.py
+    .\.venv\Scripts\python.exe claude_stdio_server.py
 
 Notes:
 - All logs go to stderr (stdout is reserved for JSON-RPC responses).
@@ -184,7 +184,13 @@ def main() -> int:
                     value = default_registry.call_tool(str(name), **arguments)
                     _send_result(request_id, _wrap_tool_result(value))
                 except Exception as e:
-                    _send_result(request_id, _wrap_tool_error(f"Tool error: {e}"))
+                    # concurrent.futures.TimeoutError often has an empty message.
+                    msg = str(e).strip()
+                    if not msg:
+                        msg = f"{e.__class__.__name__}"
+                    _eprint(f"Tool error in {name}: {msg}")
+                    _eprint(traceback.format_exc())
+                    _send_result(request_id, _wrap_tool_error(f"Tool error: {msg}"))
                 continue
 
             if method == "resources/list":

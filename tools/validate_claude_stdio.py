@@ -29,6 +29,18 @@ def main() -> int:
         },
         {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "ping", "arguments": {}}},
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "c4_find_rooms", "arguments": {"search": "basement", "limit": 10}},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "c4_find_devices", "arguments": {"category": "lights", "limit": 50}},
+        },
     ]
     input_text = "\n".join(json.dumps(r) for r in requests) + "\n"
 
@@ -42,7 +54,7 @@ def main() -> int:
     )
 
     try:
-        stdout, stderr = proc.communicate(input=input_text, timeout=20)
+        stdout, stderr = proc.communicate(input=input_text, timeout=35)
         responses = {}
         for line in (stdout or "").splitlines():
             try:
@@ -65,6 +77,22 @@ def main() -> int:
 
         if 3 not in responses or "error" in responses[3]:
             raise RuntimeError(f"tools/call failed: {responses.get(3)}\n{stderr}")
+
+        # Smoke-test real inventory calls. Claude often uses these first.
+        for rid in (4, 5):
+            if rid not in responses:
+                raise RuntimeError(f"missing response id={rid}\n{stderr}")
+            if "error" in responses[rid]:
+                raise RuntimeError(f"tools/call id={rid} failed: {responses.get(rid)}\n{stderr}")
+
+            # Claude-style tools/call responses are wrapped as { result: { content:[{text:...}], isError: bool } }
+            wrapped = (responses[rid].get("result") or {})
+            if wrapped.get("isError") is True:
+                content = wrapped.get("content") or []
+                text = None
+                if isinstance(content, list) and content and isinstance(content[0], dict):
+                    text = content[0].get("text")
+                raise RuntimeError(f"tools/call id={rid} returned isError=true: {text or wrapped}\n{stderr}")
 
         print("OK: Claude-style initialize/tools/list/tools/call works")
         return 0
