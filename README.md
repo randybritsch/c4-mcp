@@ -289,7 +289,10 @@ Prefer one of these safer options:
 - Put credentials in a local `config.json` in this repo (gitignored), and only keep non-secret settings in Claude's config.
 - Or set `C4_USERNAME` / `C4_PASSWORD` as OS environment variables, and omit them from Claude's config.
 
-Add an MCP server entry like this (edit paths + env vars):
+Recommended Claude-side config: set **only** `C4_CONFIG_PATH` (pointing at your local `config.json`) and keep all secrets out of Claude Desktop.
+If you set `C4_USERNAME`/`C4_PASSWORD` via env vars, they must be provided together.
+
+Add an MCP server entry like this (edit paths + optional env vars):
 
 ```json
 {
@@ -299,7 +302,7 @@ Add an MCP server entry like this (edit paths + env vars):
 			"args": ["C:\\Users\\YOUR_USER\\c4-mcp\\claude_stdio_server.py"],
 			"cwd": "C:\\Users\\YOUR_USER\\c4-mcp",
 			"env": {
-				"C4_HOST": "192.168.1.2",
+				"C4_CONFIG_PATH": "C:\\Users\\YOUR_USER\\c4-mcp\\config.json",
 				"C4_WRITE_GUARDRAILS": "true",
 				"C4_WRITES_ENABLED": "false",
 				"C4_DIRECTOR_TIMEOUT_S": "30",
@@ -311,6 +314,12 @@ Add an MCP server entry like this (edit paths + env vars):
 ```
 
 If you use `config.json` for credentials, copy `config.example.json` to `config.json` and set `host`, `username`, and `password` there.
+
+Optional (non-secret) env vars you can add to Claude's config if needed:
+
+- `C4_CONFIG_PATH`: point to a `config.json` stored elsewhere
+
+To change the Director host, edit `config.json` (recommended) or point `C4_CONFIG_PATH` at a different config file.
 
 3) Restart Claude Desktop.
 

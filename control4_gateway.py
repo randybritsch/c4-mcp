@@ -188,42 +188,48 @@ class Control4Gateway:
         env_user = (os.environ.get("C4_USERNAME") or os.environ.get("CONTROL4_USERNAME") or "").strip()
         env_pass = (os.environ.get("C4_PASSWORD") or os.environ.get("CONTROL4_PASSWORD") or "").strip()
 
-        if env_host or env_user or env_pass:
-            missing = [
-                k
-                for k, v in {
-                    "C4_HOST": env_host,
-                    "C4_USERNAME": env_user,
-                    "C4_PASSWORD": env_pass,
-                }.items()
-                if not v
-            ]
-            if missing:
-                raise RuntimeError(
-                    "Incomplete Control4 config from environment. Missing: "
-                    + ", ".join(missing)
-                    + ". Provide all three env vars (or none)."
-                )
-            return Config(host=env_host, username=env_user, password=env_pass)
+        # Env var overrides are supported, but credentials must be provided as a pair.
+        # This allows safe use-cases like setting only C4_HOST (non-secret) while keeping
+        # credentials in config.json.
+        if (env_user or env_pass) and not (env_user and env_pass):
+            raise RuntimeError(
+                "Incomplete Control4 credentials from environment. Provide both C4_USERNAME and C4_PASSWORD (or neither)."
+            )
 
         env_cfg = (os.environ.get("C4_CONFIG_PATH") or os.environ.get("CONTROL4_CONFIG_PATH") or "").strip()
         path = Path(cfg_path or env_cfg) if (cfg_path or env_cfg) else Path(__file__).with_name("config.json")
-        if not path.exists():
+
+        file_host = ""
+        file_user = ""
+        file_pass = ""
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                file_host = str(data.get("host", "")).strip()
+                file_user = str(data.get("username", "")).strip()
+                file_pass = str(data.get("password", "")).strip()
+            except Exception as e:
+                raise RuntimeError(f"Invalid config file {str(path)!r}: expected keys host/username/password") from e
+
+        host = env_host or file_host
+        username = env_user or file_user
+        password = env_pass or file_pass
+
+        if not host:
             raise RuntimeError(
-                "Missing Control4 config. Set env vars C4_HOST/C4_USERNAME/C4_PASSWORD, "
-                "or create config.json (or set C4_CONFIG_PATH)."
+                "Missing Control4 host. Set C4_HOST (or CONTROL4_HOST), or create config.json with a non-empty 'host'."
             )
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-        try:
-            host = str(data["host"]).strip()
-            username = str(data["username"]).strip()
-            password = str(data["password"]).strip()
-        except Exception as e:
-            raise RuntimeError(f"Invalid config file {str(path)!r}: expected keys host/username/password") from e
-
-        if not host or not username or not password:
-            raise RuntimeError(f"Invalid config file {str(path)!r}: host/username/password must be non-empty")
+        if not username or not password:
+            if not path.exists():
+                raise RuntimeError(
+                    "Missing Control4 credentials. Provide C4_USERNAME/C4_PASSWORD (or CONTROL4_*), or create config.json with username/password."
+                )
+            # If env credentials weren't supplied, be explicit that the file is incomplete.
+            if not (env_user and env_pass):
+                raise RuntimeError(f"Invalid config file {str(path)!r}: username/password must be non-empty (or provide C4_USERNAME/C4_PASSWORD env vars)")
+            raise RuntimeError(
+                "Missing Control4 credentials after applying environment overrides. Provide C4_USERNAME/C4_PASSWORD (both) or ensure config.json has username/password."
+            )
 
         return Config(host=host, username=username, password=password)
 
