@@ -89,10 +89,16 @@ This project is intended to work with any Control4 system. Nothing in the server
 
 This repo uses `requirements.txt` as the source of truth.
 
-PowerShell (recommended):
+Windows (PowerShell):
 
 - `python -m venv .venv`
 - `.\.venv\Scripts\Activate.ps1`
+- `python -m pip install -r requirements.txt`
+
+macOS / Linux (bash/zsh):
+
+- `python3 -m venv .venv`
+- `source .venv/bin/activate`
 - `python -m pip install -r requirements.txt`
 
 2) Provide Control4 connection config via either:
@@ -108,12 +114,19 @@ or
 
 ### First-time setup (recommended)
 
-If you're setting this up for the first time and don't know your controller IP yet, this is the quickest flow (PowerShell):
+If you're setting this up for the first time and don't know your controller IP yet, this is the quickest flow:
 
 1) Set credentials for discovery + server login:
 
+Windows (PowerShell):
+
 - `$env:C4_USERNAME = "you@example.com"`
 - `$env:C4_PASSWORD = "your-password"`
+
+macOS / Linux (bash/zsh):
+
+- `export C4_USERNAME="you@example.com"`
+- `export C4_PASSWORD="your-password"`
 
 2) Auto-discover the controller IP and write it to `config.json`:
 
@@ -148,11 +161,23 @@ Notes:
 
 This starts the HTTP server in **read-only guardrails mode**, runs the HTTP validator suite, runs both STDIO validators, and then stops the server.
 
+Windows (PowerShell):
+
 - `\.venv\Scripts\python.exe tools\run_e2e.py`
+
+macOS / Linux (bash/zsh):
+
+- `./.venv/bin/python tools/run_e2e.py`
 
 If you already have the server running and only want to run validators:
 
+Windows (PowerShell):
+
 - `\.venv\Scripts\python.exe tools\run_e2e.py --no-server --base-url http://127.0.0.1:3333`
+
+macOS / Linux (bash/zsh):
+
+- `./.venv/bin/python tools/run_e2e.py --no-server --base-url http://127.0.0.1:3333`
 
 ## Claude Desktop (MCP stdio) setup (Windows)
 
