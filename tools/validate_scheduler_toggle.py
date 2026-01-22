@@ -89,6 +89,16 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # Scheduler writes are intentionally gated behind an explicit opt-in.
+    # This validator can toggle real schedules; require the operator to opt-in.
+    if args.doit:
+        v = str(os.environ.get("C4_SCHEDULER_WRITES_ENABLED", "")).strip().lower()
+        if v not in {"1", "true", "yes", "y", "on"}:
+            print(
+                "Refusing to toggle scheduler events: set C4_SCHEDULER_WRITES_ENABLED=true to opt in (or run without --doit for dry-run)."
+            )
+            return 3
+
     lst = scheduler_list(args.search)
     events = lst.get("events") if isinstance(lst, dict) else None
     if not isinstance(events, list):
@@ -138,6 +148,9 @@ def main() -> int:
         return 0
 
     t1 = scheduler_set_enabled(eid, desired, dry_run=False)
+    if isinstance(t1, dict) and t1.get("error") == "scheduler_writes_disabled":
+        print("Server refused scheduler write:", t1.get("details"))
+        return 3
     print("Toggle result:", {k: t1.get(k) for k in ("ok", "accepted", "confirmed", "event_id", "enabled")})
     if not t1.get("accepted") or not t1.get("confirmed"):
         attempts = t1.get("attempts") if isinstance(t1, dict) else None
@@ -165,6 +178,9 @@ def main() -> int:
     if not args.no_restore:
         print(f"Restoring enabled={orig_enabled}")
         t2 = scheduler_set_enabled(eid, bool(orig_enabled), dry_run=False)
+        if isinstance(t2, dict) and t2.get("error") == "scheduler_writes_disabled":
+            print("Server refused scheduler restore:", t2.get("details"))
+            return 3
         print("Restore result:", {k: t2.get(k) for k in ("ok", "accepted", "confirmed", "event_id", "enabled")})
         if not t2.get("accepted") or not t2.get("confirmed"):
             attempts = t2.get("attempts") if isinstance(t2, dict) else None

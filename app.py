@@ -343,6 +343,11 @@ def _writes_enabled() -> bool:
     return _env_truthy("C4_WRITES_ENABLED", default=False)
 
 
+def _scheduler_writes_enabled() -> bool:
+    # Scheduler Agent writes are intentionally gated separately from general writes.
+    return _env_truthy("C4_SCHEDULER_WRITES_ENABLED", default=False)
+
+
 def _write_allowed(tool_name: str) -> tuple[bool, str | None]:
     deny = {s.lower() for s in _env_csv("C4_WRITE_DENYLIST")}
     allow = {s.lower() for s in _env_csv("C4_WRITE_ALLOWLIST")}
@@ -1368,6 +1373,16 @@ def c4_scheduler_list_commands_tool() -> dict:
     ),
 )
 def c4_scheduler_set_enabled_tool(event_id: int, enabled: bool, dry_run: bool = False) -> dict:
+    if not bool(dry_run) and not _scheduler_writes_enabled():
+        return {
+            "ok": False,
+            "error": "scheduler_writes_disabled",
+            "details": "Scheduler Agent writes are disabled. Set C4_SCHEDULER_WRITES_ENABLED=true to allow c4_scheduler_set_enabled.",
+            "event_id": int(event_id),
+            "enabled": bool(enabled),
+            "dry_run": bool(dry_run),
+        }
+
     result = scheduler_set_enabled(int(event_id), bool(enabled), bool(dry_run))
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 

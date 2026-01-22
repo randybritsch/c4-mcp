@@ -64,3 +64,35 @@ Expose Control4 home automation as **safe, local MCP tools** (HTTP + STDIO) so M
 - app.py, claude_stdio_server.py, control4_adapter.py, control4_gateway.py
 - server.json, pyproject.toml
 - tools/run_e2e.py
+
+---
+
+## From-scratch runbook (Windows, PowerShell)
+
+These are the most reliable steps to avoid “is the server running?” and PowerShell JSON-shape issues.
+
+1) Bootstrap and run end-to-end (recommended)
+
+- `npm run setup`
+- `npm run e2e`
+
+`tools/run_e2e.py` starts `app.py` in safe-by-default mode (guardrails on, writes off), waits for `/mcp/list`, then runs HTTP + STDIO validators and writes logs under `./logs/`.
+
+2) Manual HTTP smoke test (correct payloads)
+
+- List tools: `GET http://127.0.0.1:3333/mcp/list`
+- Call a tool: `POST http://127.0.0.1:3333/mcp/call` with body `{"kind":"tool","name":"c4_list_rooms","args":{}}`
+
+PowerShell note: `/mcp/list` returns a tool *map*; count tools via:
+
+- `($r.tools.PSObject.Properties.Count)`
+
+3) Avoid multiple instances
+
+- Check port: `Test-NetConnection 127.0.0.1 -Port 3333 | Select-Object TcpTestSucceeded`
+- Prefer starting the server via `tools/run_e2e.py` (it manages lifecycle + logs)
+
+4) Scheduler safety
+
+- Even if you enable writes for lights/locks, **Scheduler Agent writes stay disabled by default**.
+- `c4_scheduler_set_enabled` requires `C4_SCHEDULER_WRITES_ENABLED=true`.

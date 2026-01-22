@@ -4134,6 +4134,20 @@ class Control4Gateway:
         return self._loop_thread.run(_run(), timeout_s=12)
 
     def scheduler_set_enabled(self, event_id: int, enabled: bool, dry_run: bool = False) -> dict[str, Any]:
+        # Safety: Scheduler Agent writes are high-impact and easy to invoke accidentally
+        # (e.g., via LLM tool selection when writes are enabled for lights/locks).
+        # Require an explicit opt-in separate from the general C4_WRITES_ENABLED flag.
+        if not bool(dry_run):
+            v = str(os.environ.get("C4_SCHEDULER_WRITES_ENABLED", "")).strip().lower()
+            if v not in {"1", "true", "yes", "y", "on"}:
+                return {
+                    "ok": False,
+                    "error": "scheduler_writes_disabled",
+                    "details": "Scheduler Agent writes are disabled. Set C4_SCHEDULER_WRITES_ENABLED=true to allow c4_scheduler_set_enabled.",
+                    "event_id": int(event_id),
+                    "enabled": bool(enabled),
+                }
+
         eid = int(event_id)
         if eid <= 0:
             return {"ok": False, "error": "event_id must be a positive integer"}

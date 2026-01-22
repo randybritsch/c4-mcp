@@ -292,6 +292,9 @@ Python dependencies are pinned in `requirements.txt`.
 * **Scheduler writes are best-effort; confirm via reread**
   → Some Director builds return 400 “Timeout Modifying Scheduled Event” or 200 no-op responses; tools must report accepted vs confirmed.
 
+* **Scheduler safety: never touch schedules from lighting**
+  → Scheduler Agent writes are gated behind an explicit opt-in (`C4_SCHEDULER_WRITES_ENABLED=true`) so turning lights on/off cannot disable schedules.
+
 * **MCP dispatch guards against arg-name collisions**
   → Tools may accept an argument named `name`; MCP registry call plumbing is patched to avoid `TypeError: got multiple values for argument 'name'`.
 

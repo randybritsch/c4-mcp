@@ -82,7 +82,7 @@ PowerShell:
 ```powershell
 $base = 'http://127.0.0.1:3333'
 Invoke-RestMethod -Method Post -Uri ($base + '/mcp/call') -ContentType 'application/json' -Body (
-	@{ tool = 'c4_list_rooms'; args = @{} } | ConvertTo-Json -Depth 10
+	@{ kind = 'tool'; name = 'c4_list_rooms'; args = @{} } | ConvertTo-Json -Depth 10
 )
 ```
 
@@ -91,8 +91,49 @@ curl:
 ```bash
 curl -s http://127.0.0.1:3333/mcp/call \
 	-H "Content-Type: application/json" \
-	-d '{"tool":"c4_list_rooms","args":{}}'
+	-d '{"kind":"tool","name":"c4_list_rooms","args":{}}'
 ```
+
+### PowerShell tips (Windows)
+
+**1) `/mcp/list` returns a tool *map* (not an array).**
+
+In PowerShell, `tools` is a `PSCustomObject` where each property name is a tool name.
+
+```powershell
+$r = Invoke-RestMethod -Method Get -Uri 'http://127.0.0.1:3333/mcp/list' -TimeoutSec 10
+$toolNames = $r.tools.PSObject.Properties.Name | Sort-Object
+"tools_count=$($r.tools.PSObject.Properties.Count)"
+$toolNames | Select-Object -First 25
+```
+
+**2) Quick start/stop on Windows (detached, logs captured).**
+
+This avoids confusion around multiple terminals / Ctrl+C and makes it easy to inspect server logs.
+
+```powershell
+# Safe-by-default: guardrails on, writes off
+$env:C4_WRITE_GUARDRAILS='true'
+$env:C4_WRITES_ENABLED='false'
+$env:PYTHONUTF8='1'
+
+New-Item -ItemType Directory -Force -Path logs | Out-Null
+$p = Start-Process -FilePath .\.venv\Scripts\python.exe -ArgumentList @('app.py') -PassThru -WindowStyle Hidden `
+  -RedirectStandardOutput 'logs\http_server_out.txt' -RedirectStandardError 'logs\http_server_err.txt'
+$p.Id | Set-Content -Encoding ascii 'logs\http_server.pid'
+"started_pid=$($p.Id)"
+
+# Sanity check
+Test-NetConnection 127.0.0.1 -Port 3333 | Select-Object TcpTestSucceeded
+```
+
+Stop it later:
+
+```powershell
+Stop-Process -Id (Get-Content .\logs\http_server.pid)
+```
+
+If `/mcp/list` hangs or errors, check `logs/http_server_err.txt`.
 
 ## Security / publishing note (read this)
 
@@ -119,6 +160,7 @@ This section is meant to be **copy/paste-friendly** for MCP registries and "serv
 - **Safety defaults (recommended)**:
   - For read-only-by-default runs: `C4_WRITE_GUARDRAILS=true` + `C4_WRITES_ENABLED=false`
   - Optional filters: `C4_WRITE_ALLOWLIST` / `C4_WRITE_DENYLIST`
+	- Scheduler Agent writes are additionally gated: `c4_scheduler_set_enabled` requires `C4_SCHEDULER_WRITES_ENABLED=true`
 
 ## Python version note (important)
 
