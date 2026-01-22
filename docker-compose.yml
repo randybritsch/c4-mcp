@@ -1,0 +1,24 @@
+services:
+  c4-mcp:
+    build: .
+    container_name: c4-mcp
+    restart: unless-stopped
+    ports:
+      - "3333:3333"
+    environment:
+      # LAN-only: bind to all interfaces, then restrict with Synology firewall.
+      - C4_BIND_HOST=0.0.0.0
+      - C4_PORT=3333
+
+      # Safety defaults
+      - C4_WRITE_GUARDRAILS=true
+      - C4_WRITES_ENABLED=false
+      # Scheduler writes remain off unless explicitly opted-in
+      # - C4_SCHEDULER_WRITES_ENABLED=true
+
+      # Optional performance
+      # - C4_ITEMS_CACHE_TTL_S=3
+
+    volumes:
+      # Provide your real config file from the NAS filesystem.
+      - ./config.json:/app/config.json:ro

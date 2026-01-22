@@ -135,6 +135,34 @@ Stop-Process -Id (Get-Content .\logs\http_server.pid)
 
 If `/mcp/list` hangs or errors, check `logs/http_server_err.txt`.
 
+## Hosting on a NAS (Synology) — LAN only
+
+The HTTP server is designed to run locally. To run it on a NAS and reach it from other machines on your LAN:
+
+- Bind to all interfaces with `C4_BIND_HOST=0.0.0.0` (default is localhost-only).
+- Keep it LAN-only using Synology firewall rules (recommended) or a VPN (for remote access later).
+
+### Docker (recommended on Synology)
+
+This repo includes a `Dockerfile` and `docker-compose.yml`.
+
+On Synology (Container Manager), run a compose project that:
+
+- Publishes port `3333` to your LAN.
+- Mounts your real `config.json` (keep credentials off git).
+- Keeps writes off by default: `C4_WRITES_ENABLED=false`.
+
+`docker-compose.yml` already sets `C4_BIND_HOST=0.0.0.0`.
+
+LAN-only note: do **not** expose port 3333 to the internet. Use Synology Firewall to allow only your LAN subnet (e.g. `192.168.0.0/16`) to reach TCP 3333.
+
+### Host/port env vars
+
+- `C4_BIND_HOST` (default `127.0.0.1`)
+- `C4_PORT` (default `3333`)
+
+Example (LAN): `C4_BIND_HOST=0.0.0.0` and `C4_PORT=3333`
+
 ## Security / publishing note (read this)
 
 This project talks to your Control4 system using credentials (and often a local controller IP).
@@ -152,7 +180,7 @@ This section is meant to be **copy/paste-friendly** for MCP registries and "serv
 - **License**: MIT
 - **Transports**:
   - **STDIO (JSON-RPC)**: `claude_stdio_server.py` (for Claude Desktop and other stdio-based MCP clients)
-  - **HTTP**: `app.py` (binds to `http://127.0.0.1:3333`; endpoints: `/mcp/list`, `/mcp/call`)
+	- **HTTP**: `app.py` (defaults to `http://127.0.0.1:3333`; override with `C4_BIND_HOST`/`C4_PORT`; endpoints: `/mcp/list`, `/mcp/call`)
 - **Configuration / secrets**:
   - Recommended: set `C4_CONFIG_PATH` to a local `config.json` that contains `host`, `username`, `password` (keep this file gitignored)
   - Optional: set `C4_HOST` (non-secret) to override `host` from `config.json`

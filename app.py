@@ -3099,7 +3099,14 @@ _patch_mcp_registry_name_collisions()
 
 
 def main() -> None:
-    app.run(host="127.0.0.1", port=3333, debug=False, use_reloader=False, threaded=True)
+    host = (os.getenv("C4_BIND_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    port_raw = (os.getenv("C4_PORT") or "3333").strip() or "3333"
+    try:
+        port = int(port_raw)
+    except Exception:
+        port = 3333
+
+    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
