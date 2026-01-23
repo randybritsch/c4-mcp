@@ -26,6 +26,11 @@ Rules:
 - **HTTP MCP:** `GET /mcp/list`, `POST /mcp/call`
 - **STDIO MCP:** JSON-RPC shim (`claude_stdio_server.py`) for clients like Claude Desktop
 
+## Integration boundary
+
+- `c4-mcp` is a standalone service: clients integrate only via HTTP or STDIO.
+- `c4-mcp-app` (and similar apps) should treat `c4-mcp` as an external dependency and configure the base URL (no shared code required).
+
 ## Performance & safety primitives
 
 - **Inventory caching:** Director item inventory is cached for a short TTL (`C4_ITEMS_CACHE_TTL_S`) to speed name/room resolution.

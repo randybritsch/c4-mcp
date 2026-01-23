@@ -20,5 +20,6 @@ services:
       # - C4_ITEMS_CACHE_TTL_S=3
 
     volumes:
-      # Provide your real config file from the NAS filesystem.
+      # Provide your real Control4 credentials file.
+      # Create it locally by copying config.example.json -> config.json (this repo ignores config.json).
       - ./config.json:/app/config.json:ro

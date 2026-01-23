@@ -67,6 +67,18 @@ Do a safety check: list any unlocked doors, any lights left on in the Basement, 
 
 Tip: If you run with `C4_WRITE_GUARDRAILS=true` and `C4_WRITES_ENABLED=false`, you’ll get a safe read-only experience until you explicitly enable writes.
 
+## Ambiguity & disambiguation (recommended)
+
+Name-based tools can legitimately return **multiple matches** (e.g., “Basement” might match several rooms). In that case, `c4-mcp` returns a structured failure with an **ambiguous** marker and a candidate list.
+
+Recommended client pattern:
+
+1) Call the name-based tool with `include_candidates=true` (or accept the default if the tool always includes them).
+2) If the response indicates ambiguity, show the candidates to the user and let them pick.
+3) Re-call the tool with `require_unique=true` and a more specific scope (e.g., `room_id` / `room_name`, or exact `device_name`).
+
+This is how higher-level apps can support natural commands like “turn on the basement lights” while still being deterministic and safe.
+
 ## Direct HTTP examples (no MCP client required)
 
 If you’re not using an MCP client yet, you can still call the server directly.
@@ -75,12 +87,18 @@ List tools:
 
 - `GET http://127.0.0.1:3333/mcp/list`
 
+Synology/Compose note:
+
+- Inside Docker/Compose, `c4-mcp` commonly listens on `:3333`.
+- On the NAS/LAN, it’s often published as host port `:3334` → container `:3333`.
+	- Example: `GET http://<NAS_IP>:3334/mcp/list`
+
 Call a tool (example: list rooms):
 
 PowerShell:
 
 ```powershell
-$base = 'http://127.0.0.1:3333'
+$base = 'http://127.0.0.1:3333'  # or: http://<NAS_IP>:3334
 Invoke-RestMethod -Method Post -Uri ($base + '/mcp/call') -ContentType 'application/json' -Body (
 	@{ kind = 'tool'; name = 'c4_list_rooms'; args = @{} } | ConvertTo-Json -Depth 10
 )
@@ -152,9 +170,28 @@ On Synology (Container Manager), run a compose project that:
 - Mounts your real `config.json` (keep credentials off git).
 - Keeps writes off by default: `C4_WRITES_ENABLED=false`.
 
+Before you start the compose project, create your local config file:
+
+- Copy `config.example.json` → `config.json` and fill in values (this repo ignores `config.json`).
+
 `docker-compose.yml` already sets `C4_BIND_HOST=0.0.0.0`.
 
 LAN-only note: do **not** expose port 3333 to the internet. Use Synology Firewall to allow only your LAN subnet (e.g. `192.168.0.0/16`) to reach TCP 3333.
+
+#### Troubleshooting Synology builds
+
+If Container Manager fails with an error like:
+
+`unable to prepare context: unable to evaluate symlinks in Dockerfile path: lstat /volume1/...`
+
+That means Docker cannot find or access the folder you selected as the **build context** (the folder that should contain your `Dockerfile` and source code).
+
+Fix:
+
+- Put the repo files on the NAS under a real shared-folder path, e.g. `/volume1/docker/c4-mcp/`.
+- Ensure that folder contains at least: `Dockerfile`, `docker-compose.yml`, `requirements.txt`, `app.py`, and the Python modules.
+- In Container Manager, create the Compose project using that exact folder as the project path (don’t point it at just `/volume1/docker/` unless the files are actually there).
+- If your shared folder isn’t on `volume1`, use the correct volume (e.g. `/volume2/...`).
 
 ### Host/port env vars
 
@@ -169,6 +206,13 @@ This project talks to your Control4 system using credentials (and often a local 
 
 - Never commit real credentials. Keep `config.json` local-only (it is ignored by `.gitignore`).
 - If you accidentally committed credentials at any point, rotate them immediately and rewrite git history before making the repo public.
+
+### Public GitHub checklist (do this before you publish)
+
+- Ensure `config.json` is not in git history. At minimum it should not be tracked in your current tree.
+	- Quick check: `git ls-files config.json` should return nothing.
+	- If it was ever committed: rotate your Control4 password and rewrite history (e.g., `git filter-repo`), then force-push.
+- Prefer `C4_CONFIG_PATH` (pointing to a file outside the repo) for the safest setup.
 
 ## Registry metadata
 

@@ -344,7 +344,7 @@ Python dependencies are pinned in `requirements.txt`.
 ### End-to-end
 
 * MCP client → Flask → Adapter → Gateway → Director
-* Scripted validator: `tools/validate_mcp_e2e.py` (read-only by default; write tests gated by flags)
+* Scripted validator: `tools/run_e2e.py` (runs HTTP + STDIO suites; read-only by default; write tests gated by flags)
 * Scheduler toggle validator: `tools/validate_scheduler_toggle.py` (defaults to dry-run; supports toggle+restore)
 
 ### Coverage goals
@@ -363,7 +363,7 @@ Python dependencies are pinned in `requirements.txt`.
 
 ### Configuration
 
-* `config.json`:
+* `config.json` (create locally from `config.example.json`; gitignored):
 
   * `host`
   * `username`
@@ -380,7 +380,7 @@ PowerShell (recommended):
 
 ### Secrets
 
-* Never committed
+* Never committed (rotate + rewrite history if ever committed)
 * Rotated manually
 
 ### Alerts / SLIs
