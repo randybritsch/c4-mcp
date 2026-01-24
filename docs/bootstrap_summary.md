@@ -11,13 +11,14 @@ Expose Control4 home automation as **safe-by-default MCP tools** over **HTTP** a
 - **Single asyncio loop thread** in `control4_gateway.py` performs all Control4 I/O (cloud auth + Director calls).
 - **Inventory caching**: short TTL caching speeds room/device resolution and list calls (`C4_ITEMS_CACHE_TTL_S`).
 - **Safety gates**: writes are disabled by default; allow/deny lists constrain state-changing tools.
+- **Session context (HTTP + STDIO)**: lightweight per-session memory keyed by `X-Session-Id` (or equivalent in STDIO mode) enables follow-ups like “turn it back on” via `c4_lights_set_last`.
 
 **3) Key modules and roles (bullet list)**
 - `app.py`: HTTP server + MCP tool registration + request middleware and guardrails.
 - `claude_stdio_server.py`: STDIO MCP shim (stdout JSON-RPC only; stderr logs); supports tool filtering modes.
 - `control4_adapter.py`: sync facade used by the tool layer (keeps request handlers simple).
 - `control4_gateway.py`: async Control4 orchestration (timeouts, caching, confirmation polling, driver quirks).
-- `session_memory.py`: lightweight session memory for follow-ups (e.g., “dim those lights”).
+- `session_memory.py`: lightweight session memory for follow-ups + “last lights” helpers (e.g., `c4_lights_get_last`, `c4_lights_set_last`).
 - `tools/`: validators and diagnostics (`run_e2e.py`, protocol validators, inspectors).
 
 **4) Data & contracts (top 3–5 only)**
@@ -25,6 +26,7 @@ Expose Control4 home automation as **safe-by-default MCP tools** over **HTTP** a
 - Tool catalog contract: `GET /mcp/list` returns a **map** of tool name → JSON schema (PowerShell: use `tools.PSObject.Properties`).
 - Control4 “items/variables/commands” shapes returned from Director (driver-dependent; best-effort).
 - Ambiguity/disambiguation: name-based resolvers can return multiple candidates (client should re-call with a refined scope).
+- Session keying: clients should pass a stable `X-Session-Id` per device/user session to preserve follow-up context across calls.
 
 **5) APIs (key endpoints only)**
 - HTTP: `GET /mcp/list`, `POST /mcp/call` (default `http://127.0.0.1:3333`).

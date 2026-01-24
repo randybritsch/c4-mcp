@@ -19,7 +19,7 @@ from flask_mcp_server.http_integrated import mw_auth, mw_cors, mw_ratelimit
 
 import flask_mcp_server
 
-from session_memory import SessionStore, extract_lights_from_call, is_last_lights_token
+from session_memory import SessionStore, extract_lights_from_call, extract_tv_from_call, is_last_lights_token
 
 from control4_adapter import (
     gateway as adapter_gateway,
@@ -231,6 +231,10 @@ def _remember_tool_call(tool_name: str, args: dict | None, result: Any) -> None:
         lights = extract_lights_from_call(str(tool_name or ""), dict(args or {}), result)
         if lights:
             mem.add_last_lights(lights, window_s=5.0)
+
+        tv = extract_tv_from_call(str(tool_name or ""), dict(args or {}), result)
+        if tv:
+            mem.set_last_tv(tv)
     except Exception:
         # Never let memory tracking break tools.
         return
@@ -564,6 +568,37 @@ def c4_lights_get_last_tool(session_id: str | None = None) -> dict:
     sid = _current_session_id(session_id)
     mem = _SESSION_STORE.get(sid, create=True)
     return {"ok": True, "session_id": sid, "count": len(mem.last_lights), "lights": list(mem.last_lights)}
+
+
+@Mcp.tool(
+    name="c4_tv_get_last",
+    description=(
+        "Return the last referenced TV/media room context in this session (for follow-ups like 'turn off the TV')."
+    ),
+)
+def c4_tv_get_last_tool(session_id: str | None = None) -> dict:
+    sid = _current_session_id(session_id)
+    mem = _SESSION_STORE.get(sid, create=True)
+    return {"ok": True, "session_id": sid, "tv": dict(mem.last_tv or {})}
+
+
+@Mcp.tool(
+    name="c4_tv_off_last",
+    description=(
+        "Turn off the last referenced TV/media room in this session (safe follow-up for commands like 'turn off the TV')."
+    ),
+)
+def c4_tv_off_last_tool(confirm_timeout_s: float = 10.0, session_id: str | None = None) -> dict:
+    sid = _current_session_id(session_id)
+    mem = _SESSION_STORE.get(sid, create=True)
+    room_id = mem.last_tv.get("room_id") if isinstance(mem.last_tv, dict) else None
+    if room_id is None:
+        return {"ok": False, "error": "no remembered TV/media room in this session yet", "session_id": sid}
+
+    result = room_off(int(room_id), float(confirm_timeout_s))
+    out = result if isinstance(result, dict) else {"ok": True, "result": result}
+    _remember_tool_call("c4_tv_off_last", {"confirm_timeout_s": confirm_timeout_s}, out)
+    return out
 
 
 @Mcp.tool(
@@ -1890,7 +1925,33 @@ def c4_tv_list_tool() -> dict:
 )
 def c4_tv_remote_tool(room_id: str, button: str, press: str | None = None) -> dict:
     result = room_remote(int(room_id), str(button or ""), press)
-    return result if isinstance(result, dict) else {"ok": True, "result": result}
+    out = result if isinstance(result, dict) else {"ok": True, "result": result}
+    _remember_tool_call(
+        "c4_tv_remote",
+        {"room_id": room_id, "button": button, "press": press},
+        out,
+    )
+    return out
+
+
+@Mcp.tool(
+    name="c4_tv_remote_last",
+    description=(
+        "Send a room-level remote command to the last referenced TV/media room in this session. "
+        "Use this for follow-ups like 'turn down the volume' (button='volume_down') or 'mute it' (button='mute')."
+    ),
+)
+def c4_tv_remote_last_tool(button: str, press: str | None = None, session_id: str | None = None) -> dict:
+    sid = _current_session_id(session_id)
+    mem = _SESSION_STORE.get(sid, create=True)
+    room_id = mem.last_tv.get("room_id") if isinstance(mem.last_tv, dict) else None
+    if room_id is None:
+        return {"ok": False, "error": "no remembered TV/media room in this session yet", "session_id": sid}
+
+    result = room_remote(int(room_id), str(button or ""), press)
+    out = result if isinstance(result, dict) else {"ok": True, "result": result}
+    _remember_tool_call("c4_tv_remote_last", {"button": button, "press": press}, out)
+    return out
 
 
 @Mcp.tool(
@@ -1902,7 +1963,13 @@ def c4_tv_remote_tool(room_id: str, button: str, press: str | None = None) -> di
 )
 def c4_tv_watch_tool(room_id: str, source_device_id: str, deselect: bool = False) -> dict:
     result = room_select_video_device(int(room_id), int(source_device_id), bool(deselect))
-    return result if isinstance(result, dict) else {"ok": True, "result": result}
+    out = result if isinstance(result, dict) else {"ok": True, "result": result}
+    _remember_tool_call(
+        "c4_tv_watch",
+        {"room_id": room_id, "source_device_id": source_device_id, "deselect": deselect},
+        out,
+    )
+    return out
 
 
 @Mcp.tool(
@@ -1936,6 +2003,68 @@ def c4_tv_watch_by_name_tool(
             include_candidates=bool(include_candidates),
         )
         if not isinstance(rr, dict) or not rr.get("ok"):
+            # If the room name is ambiguous, try to narrow it using the desired source device.
+            # Example: "Roku in the basement" where "basement" matches many rooms but only one
+            # room has a Roku video source.
+            if (
+                isinstance(rr, dict)
+                and str(rr.get("error") or "").lower() == "ambiguous"
+                and bool(require_unique)
+                and str(source_device_name or "").strip()
+            ):
+                raw = rr.get("matches") if isinstance(rr.get("matches"), list) else rr.get("candidates")
+                candidates = list(raw or [])
+
+                viable: list[dict] = []
+                for c in candidates:
+                    if not isinstance(c, dict):
+                        continue
+                    try:
+                        cid = int(c.get("room_id"))
+                    except Exception:
+                        continue
+
+                    # Check whether the requested source can be resolved inside that room.
+                    try:
+                        rd_try = resolve_device(
+                            str(source_device_name or ""),
+                            category="media",
+                            room_id=cid,
+                            require_unique=True,
+                            include_candidates=False,
+                        )
+                    except Exception:
+                        rd_try = None
+
+                    if isinstance(rd_try, dict) and rd_try.get("ok") and rd_try.get("device_id") is not None:
+                        viable.append(c)
+
+                if len(viable) == 1:
+                    try:
+                        resolved_room_id = int(viable[0].get("room_id"))
+                    except Exception:
+                        resolved_room_id = None
+
+                    if resolved_room_id is not None:
+                        rr = {
+                            "ok": True,
+                            "room_id": str(resolved_room_id),
+                            "name": str(viable[0].get("name") or ""),
+                            "match_type": "device_scoped",
+                        }
+                    else:
+                        return {"ok": False, "error": "could not resolve room", "details": rr}
+                elif len(viable) > 1:
+                    rr2 = dict(rr)
+                    rr2["details"] = (
+                        f"Multiple rooms could match '{room_name}' and contain a '{source_device_name}' source."
+                    )
+                    rr2["candidates"] = viable if bool(include_candidates) else []
+                    rr2["matches"] = viable
+                    return {"ok": False, "error": "could not resolve room", "details": rr2}
+                else:
+                    return {"ok": False, "error": "could not resolve room", "details": rr}
+
             return {"ok": False, "error": "could not resolve room", "details": rr}
         try:
             resolved_room_id = int(rr.get("room_id"))
@@ -1979,7 +2108,7 @@ def c4_tv_watch_by_name_tool(
         }
 
     result = room_select_video_device(int(resolved_room_id), int(source_device_id), bool(deselect))
-    return {
+    out = {
         "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
         "planned": planned,
         "room_name": str(room_name or ""),
@@ -1989,6 +2118,17 @@ def c4_tv_watch_by_name_tool(
         "resolve_source": rd,
         "result": result,
     }
+    _remember_tool_call(
+        "c4_tv_watch_by_name",
+        {
+            "room_name": room_name,
+            "source_device_name": source_device_name,
+            "room_id": room_id,
+            "deselect": deselect,
+        },
+        out,
+    )
+    return out
 
 
 @Mcp.tool(
@@ -2060,6 +2200,104 @@ def c4_room_listen_by_name_tool(
             include_candidates=bool(include_candidates),
         )
         if not isinstance(rr, dict) or not rr.get("ok"):
+            # If the room name is ambiguous, try to narrow it using the desired Listen source.
+            # Example: "Play Spotify in the basement" where "basement" matches many rooms but
+            # only one basement room exposes the requested Listen source.
+            if (
+                isinstance(rr, dict)
+                and str(rr.get("error") or "").lower() == "ambiguous"
+                and bool(require_unique)
+                and str(source_device_name or "").strip()
+            ):
+                raw = rr.get("matches") if isinstance(rr.get("matches"), list) else rr.get("candidates")
+                candidates = list(raw or [])
+
+                viable: list[dict] = []
+                for c in candidates:
+                    if not isinstance(c, dict):
+                        continue
+                    try:
+                        cid = int(c.get("room_id"))
+                    except Exception:
+                        continue
+
+                    # Probe listen sources for that candidate room.
+                    try:
+                        ls_raw_try = room_listen_status(int(cid))
+                        ls_try = ls_raw_try if isinstance(ls_raw_try, dict) else {"ok": True, "result": ls_raw_try}
+                        listen_try = ls_try.get("listen") if isinstance(ls_try.get("listen"), dict) else {}
+                        sources_try = listen_try.get("sources") if isinstance(listen_try.get("sources"), list) else []
+                    except Exception:
+                        sources_try = []
+
+                    source_rows_try: list[dict] = []
+                    for s in sources_try:
+                        if not isinstance(s, dict):
+                            continue
+                        sid = None
+                        for k in ("deviceid", "deviceId", "id"):
+                            if s.get(k) is None:
+                                continue
+                            try:
+                                sid = int(s.get(k))
+                                break
+                            except Exception:
+                                continue
+                        if sid is None or sid <= 0:
+                            continue
+                        label = None
+                        for k in ("name", "label", "display", "title"):
+                            v = s.get(k)
+                            if isinstance(v, str) and v.strip():
+                                label = v.strip()
+                                break
+                        source_rows_try.append({"id": int(sid), "name": str(label or sid)})
+
+                    if not source_rows_try:
+                        continue
+
+                    # Use the same safe name resolver; if it resolves uniquely in this room, it's viable.
+                    try:
+                        resolved_try = resolve_named_candidates(
+                            str(source_device_name or ""),
+                            source_rows_try,
+                            entity="listen_source",
+                            name_key="name",
+                            id_key="id",
+                            max_candidates=10,
+                        )
+                    except Exception:
+                        resolved_try = None
+
+                    if isinstance(resolved_try, dict) and resolved_try.get("ok") and resolved_try.get("id") is not None:
+                        viable.append(c)
+
+                if len(viable) == 1:
+                    try:
+                        resolved_room_id = int(viable[0].get("room_id"))
+                    except Exception:
+                        resolved_room_id = None
+
+                    if resolved_room_id is not None:
+                        rr = {
+                            "ok": True,
+                            "room_id": str(resolved_room_id),
+                            "name": str(viable[0].get("name") or ""),
+                            "match_type": "listen_source_scoped",
+                        }
+                    else:
+                        return {"ok": False, "error": "could not resolve room", "details": rr}
+                elif len(viable) > 1:
+                    rr2 = dict(rr)
+                    rr2["details"] = (
+                        f"Multiple rooms could match '{room_name}' and contain a '{source_device_name}' Listen source."
+                    )
+                    rr2["candidates"] = viable if bool(include_candidates) else []
+                    rr2["matches"] = viable
+                    return {"ok": False, "error": "could not resolve room", "details": rr2}
+                else:
+                    return {"ok": False, "error": "could not resolve room", "details": rr}
+
             return {"ok": False, "error": "could not resolve room", "details": rr}
         try:
             resolved_room_id = int(rr.get("room_id"))
@@ -2266,7 +2504,13 @@ def c4_media_watch_launch_app(device_id: str, app: str, room_id: str | None = No
     rid = int(room_id) if room_id is not None and str(room_id).strip() else None
     result = media_watch_launch_app(int(device_id), str(app or ""), room_id=rid, pre_home=bool(pre_home))
     if not isinstance(result, dict):
-        return {"ok": True, "result": result}
+        out = {"ok": True, "result": result}
+        _remember_tool_call(
+            "c4_media_watch_launch_app",
+            {"device_id": device_id, "app": app, "room_id": room_id, "pre_home": pre_home},
+            out,
+        )
+        return out
 
     # Add a small, consistent summary for LLM/tool consumers.
     watch = result.get("watch") if isinstance(result.get("watch"), dict) else {}
@@ -2323,6 +2567,11 @@ def c4_media_watch_launch_app(device_id: str, app: str, room_id: str | None = No
         pass
 
     result["summary"] = summary
+    _remember_tool_call(
+        "c4_media_watch_launch_app",
+        {"device_id": device_id, "app": app, "room_id": room_id, "pre_home": pre_home},
+        result,
+    )
     return result
 
 
@@ -2360,6 +2609,66 @@ def c4_media_watch_launch_app_by_name_tool(
             include_candidates=bool(include_candidates),
         )
         if not isinstance(rr, dict) or not rr.get("ok"):
+            # If the room name is ambiguous, try to narrow it using the requested media device.
+            # Example: "Launch Netflix on Roku in the basement".
+            if (
+                isinstance(rr, dict)
+                and str(rr.get("error") or "").lower() == "ambiguous"
+                and bool(require_unique)
+                and str(device_name or "").strip()
+            ):
+                raw = rr.get("matches") if isinstance(rr.get("matches"), list) else rr.get("candidates")
+                candidates = list(raw or [])
+
+                viable: list[dict] = []
+                for c in candidates:
+                    if not isinstance(c, dict):
+                        continue
+                    try:
+                        cid = int(c.get("room_id"))
+                    except Exception:
+                        continue
+
+                    try:
+                        rd_try = resolve_device(
+                            str(device_name or ""),
+                            category="media",
+                            room_id=cid,
+                            require_unique=True,
+                            include_candidates=False,
+                        )
+                    except Exception:
+                        rd_try = None
+
+                    if isinstance(rd_try, dict) and rd_try.get("ok") and rd_try.get("device_id") is not None:
+                        viable.append(c)
+
+                if len(viable) == 1:
+                    try:
+                        resolved_room_id = int(viable[0].get("room_id"))
+                    except Exception:
+                        resolved_room_id = None
+
+                    if resolved_room_id is not None:
+                        rr = {
+                            "ok": True,
+                            "room_id": str(resolved_room_id),
+                            "name": str(viable[0].get("name") or ""),
+                            "match_type": "device_scoped",
+                        }
+                    else:
+                        return {"ok": False, "error": "could not resolve room", "details": rr}
+                elif len(viable) > 1:
+                    rr2 = dict(rr)
+                    rr2["details"] = (
+                        f"Multiple rooms could match '{room_name}' and contain a '{device_name}' media device."
+                    )
+                    rr2["candidates"] = viable if bool(include_candidates) else []
+                    rr2["matches"] = viable
+                    return {"ok": False, "error": "could not resolve room", "details": rr2}
+                else:
+                    return {"ok": False, "error": "could not resolve room", "details": rr}
+
             return {"ok": False, "error": "could not resolve room", "details": rr}
         try:
             resolved_room_id = int(rr.get("room_id"))
@@ -2426,6 +2735,23 @@ def c4_media_watch_launch_app_by_name_tool(
             res["resolve_room"] = rr
         if resolved_room_name is not None and res.get("room_id") is not None:
             res["room_name"] = resolved_room_name
+
+        remember_payload = dict(res)
+        if remember_payload.get("room_id") is None and resolved_room_id is not None:
+            remember_payload["room_id"] = str(resolved_room_id)
+            if resolved_room_name is not None:
+                remember_payload["room_name"] = resolved_room_name
+        _remember_tool_call(
+            "c4_media_watch_launch_app_by_name",
+            {
+                "device_name": device_name,
+                "app": app,
+                "room_name": room_name,
+                "room_id": room_id,
+                "pre_home": pre_home,
+            },
+            remember_payload,
+        )
 
     return res if isinstance(res, dict) else {"ok": ok, "result": res, "planned": planned, "resolve": rd}
 

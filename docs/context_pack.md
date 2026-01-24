@@ -1,128 +1,87 @@
-# CONTEXT PACK — Control4 MCP Server (Jan 2026)
+# Context Pack — c4-mcp (Control4 MCP Server)
+
+**Last Updated:** January 23, 2026
 
 ## Mini executive summary (≤120 words)
 
-This project exposes Control4 home automation as stable MCP tools via a local Flask server. It enforces a strict 3-layer design: sync MCP/Flask entrypoints → sync adapter passthrough → async gateway that owns all Control4/Director I/O on a single background asyncio loop thread. The system prioritizes fast “common actions” (especially lighting) by caching Director item inventory with a short TTL (`C4_ITEMS_CACHE_TTL_S`) and providing single-call fast-path tools (`c4_light_set_by_name`, `c4_room_lights_set`). Write results are structured and use “accepted vs confirmed” semantics (confirmation is polling-based and time-bounded). Media Watch flows (including Roku app launching) are supported and confirmed via device variables. Recent work also added read-only Watch diagnostics and improved validator ergonomics.
+c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP and STDIO. It enforces strict layering: sync tool handlers (`app.py`) → sync facade (`control4_adapter.py`) → async gateway (`control4_gateway.py`) that owns all Director I/O on a single background asyncio loop thread (avoids async deadlocks and flaky behavior). It’s optimized for “common actions” with short-TTL item caching (`C4_ITEMS_CACHE_TTL_S`) and fast-path tools like `c4_light_set_by_name` and `c4_room_lights_set`. Writes remain gated/guardrailed and confirmations are best-effort and time-bounded. Lightweight per-session memory keyed by `X-Session-Id` enables follow-ups like “turn it back on” via `c4_lights_get_last` / `c4_lights_set_last`.
 
 ## Critical architecture (≤6 bullets)
 
-- Three strict layers: `app.py` (sync MCP tools) → `control4_adapter.py` (sync passthrough) → `control4_gateway.py` (async gateway).
-- Gateway owns exactly one background asyncio loop thread; all Control4 I/O runs only on that loop.
-- No pyControl4 imports outside `control4_gateway.py`.
-- Inventory caching: `/api/v1/items` reads are cached with short TTL for fast name/room resolution.
-- Fast paths: prefer “resolve + execute + optional confirm” in one MCP call for latency.
-- Write semantics: report accepted vs confirmed; confirmations are polling-based and time-bounded.
+- Strict layers: `app.py` → `control4_adapter.py` → `control4_gateway.py`.
+- All Control4 I/O runs only on the gateway’s single asyncio loop thread.
+- No pyControl4 imports/calls outside `control4_gateway.py`.
+- Cache Director item inventory with a short TTL for fast resolution (`C4_ITEMS_CACHE_TTL_S`).
+- Write semantics are bounded: “accepted vs confirmed” with time-bounded polling.
+- Session context is keyed by `X-Session-Id` (HTTP) to support follow-ups.
 
-## Current working set (3–7 files)
+## Current working set (3–7 files/modules)
 
-- `app.py` — MCP tool surface + validation/guardrails.
-- `control4_adapter.py` — sync wrappers only; no business logic.
-- `control4_gateway.py` — async orchestration: caching, batching, confirmation polling.
-- `docs/project_overview.md` — single source of truth for architecture/tool surface.
-- `docs/bootstrap_summary.md` — fast reload summary (keep aligned).
-- `docs/context_pack.md` — this file; kept current after sessions.
-- `tools/validate_mcp_e2e.py` — baseline regression entry (read-only by default).
-- `tools/validate_listen.py` — Listen validator; now supports auto-picking a safe room when `--room-id` is omitted.
-- `tools/validate_alarm.py` — alarm/security validator; safe when no alarm panel exists.
+- `app.py` — MCP tool surface, validation, guardrails, transport glue.
+- `control4_gateway.py` — async orchestration: timeouts, caching, confirmations, driver quirks.
+- `session_memory.py` — session-scoped memory and “last lights” helpers.
+- `tools/run_e2e.py` — fast regression runner (HTTP + STDIO coverage).
+- `tools/validate_http_session_memory.py` — validates `X-Session-Id` memory behavior.
+- `docs/project_overview.md` — source of truth for architecture/tool surface.
 
-## Interfaces / contracts that must not break
+## Interfaces/contracts that must not break
 
-Keep tool names and signatures stable; add new tools instead of changing old ones.
+**Transports**
 
-**Core discovery/inspection**
+- HTTP discovery: `GET /mcp/list`
+- HTTP execution: `POST /mcp/call` body `{ "kind": "tool", "name": "<tool>", "args": { ... } }`
+- Session header: `X-Session-Id: <stable-id>` (clients should keep this stable per device/user session)
 
-- `ping`, `c4_server_info`
-- `c4_list_rooms`, `c4_list_devices(category)`
-- `c4_item_variables(device_id)`, `c4_item_commands(device_id)`, `c4_item_bindings(device_id)`
+**Tool surface (stability rule)**
 
-**Lighting (speed-critical)**
+- Do not rename or change existing tool signatures; add new tools instead.
+- Follow-up memory tools (required for “turn it back on” style commands): `c4_lights_get_last`, `c4_lights_set_last`.
 
-- `c4_light_set_by_name` (fast-path)
-- `c4_room_lights_set` (fast-path batch)
-- `c4_light_get_level`, `c4_light_set_level`, `c4_light_ramp`
+## Today’s objectives and acceptance criteria
 
-**Lighting confirmation diagnostics (non-breaking additions)**
+**Objective A — Keep follow-ups reliable (session memory)**
 
-- Fast-path write tools return an `execute` object that may include:
-	- `before_level`, `before_state`, `before_observed`
-	- `observed_level`, `observed_state`, `observed`
-	- `confirm_reason` (e.g., `level_match`, `state_match_no_level`, `timeout`)
-	- `confirm_trace` (short time-series of observations)
-	- `confirm_fallback` (records any best-effort ON/OFF fallback attempts)
+- Memory is scoped by `X-Session-Id` and survives multiple sequential tool calls.
+- `c4_lights_set_last` applies the prior target deterministically for the same session.
 
-**Scenes/macros/scheduler**
+**Objective B — Prevent hangs and deadlocks**
 
-- `c4_scene_set_state_by_name` (fast-path)
-- `c4_macro_execute_by_name`
-- `c4_scheduler_set_enabled` (best-effort; always re-read to confirm)
+- Every tool has explicit timeouts; no unbounded polling loops.
+- Inventory/cache operations never deadlock the gateway loop.
 
-**Locks**
+**Objective C — Maintain fast, safe lighting UX**
 
-- `c4_lock_get_state`, `c4_lock_unlock`, `c4_lock_lock`, `c4_lock_set_by_name`
+- `c4_light_set_by_name` and `c4_room_lights_set` stay fast via caching and resolve+execute fast paths.
+- With confirmation enabled, results remain time-bounded and clearly report confirmed/not-confirmed.
 
-**Alarm / Security (best-effort)**
+## Guardrails (from conventions)
 
-- `c4_alarm_list`, `c4_alarm_get_state`, `c4_alarm_set_mode`
+- Preserve layering; never call Director/pyControl4 from `app.py`.
+- All Control4 I/O must run on the gateway’s asyncio loop thread.
+- Never commit secrets; `config.json` is local-only and gitignored.
+- Keep all writes safe-by-default and time-bounded; prefer dry-run where appropriate.
+- Preserve tool names/signatures; contracts evolve by addition.
 
-**Media (Roku watch+launch)**
+## Links/paths for deeper docs
 
-- `c4_room_select_video_device`, `c4_media_watch_launch_app`, `c4_media_watch_launch_app_by_name`, `c4_media_roku_list_apps`
-
-**Watch diagnostics (read-only)**
-
-- `c4_room_watch_status(room_id)`
-- `c4_room_list_video_devices(room_id)` (may return empty; depends on Director/UI config)
-
-## Today’s objectives + acceptance criteria
-
-**Objective A — Validate lighting fast paths and batching**
-
-- `c4_light_set_by_name` sets a named light to a target `level` or `state` in one call.
-- With `confirm=true`, results show a bounded confirm loop (no hangs) and clearly report confirmed/not confirmed.
-- `c4_room_lights_set` supports `dry_run=true` to preview targets and supports `exclude_names`/`include_names`.
-- Batch executes with bounded concurrency and returns per-device results + elapsed time.
-
-Acceptance details for confirm:
-- Confirm remains best-effort + time-bounded (`confirm_timeout_s`, `poll_interval_s`) but now reports `confirm_reason` and may include `confirm_trace` / `confirm_fallback`.
-
-**Objective B — Keep caching safe and effective**
-
-- Repeated name/device discovery is faster with `C4_ITEMS_CACHE_TTL_S` enabled.
-- No deadlocks: inventory calls must not wait on the gateway loop from inside the loop.
-
-**Objective C — Keep regressions easy to run**
-
-- `tools/validate_listen.py` can run with no args (dry-run) by auto-selecting a room with Listen sources.
-- `tools/validate_mcp_e2e.py` continues to pass against the local server (`--base-url http://127.0.0.1:3333`).
-
-## Guardrails (must-follow)
-
-- Strict layering: `app.py` must not talk to Director/pyControl4 directly.
-- All Control4 network I/O must execute on the gateway’s single asyncio loop thread.
-- Adapter stays passthrough-only; put orchestration (caching/batching/confirm loops) in the gateway.
-- Every tool returns structured JSON and uses explicit timeouts.
-- For writes, support safe patterns: dry-run where appropriate; “accepted vs confirmed”; avoid unbounded polling.
-
-## Links / paths for deeper docs
-
+- `README.md`
 - `docs/project_overview.md`
-- `docs/bootstrap_summary.md`
 - `docs/architecture.md`
-- `tools/validate_mcp_e2e.py`
+- `docs/bootstrap_summary.md`
+- `tools/run_e2e.py`
+- `tools/validate_http_session_memory.py`
 
-## Next prompt to paste
+## Next Prompt to Paste
 
 ```text
 Load context from docs/project_overview.md and docs/context_pack.md.
 
-Today’s goal: verify core MCP health + Watch/Listen diagnostics.
+Today’s goal: validate session memory + prevent hangs.
 
 Steps:
-1) Call c4_server_info and c4_list_rooms.
-2) Pick a known AV room (e.g., TV Room / Basement) and call c4_room_watch_status(room_id=<ID>).
-3) Call c4_room_list_video_devices(room_id=<ID>) and report visible/hidden counts (empty is acceptable if Director returns none).
-4) Pick a known Listen room and run tools/validate_listen.py (dry-run), then optionally tools/validate_listen.py --doit (only if listen.active=false and you can restore).
-5) Run tools/validate_mcp_e2e.py --base-url http://127.0.0.1:3333.
+1) Verify tool discovery: GET /mcp/list.
+2) Run tools/validate_http_session_memory.py against the active server.
+3) Run tools/run_e2e.py (HTTP + STDIO). Record any failures and the exact tool name.
 
-Constraints: preserve strict layering; don’t change existing tool names/signatures; all calls must have bounded timeouts; for writes, report accepted vs confirmed and restore safely.
+Constraints: preserve strict layering; don’t change existing tool names/signatures; all operations must have explicit, bounded timeouts; do not introduce new secrets into the repo.
 ```

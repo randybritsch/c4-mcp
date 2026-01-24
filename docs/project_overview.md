@@ -1,8 +1,3 @@
-Below is a **complete, ready-to-commit `PROJECT_OVERVIEW.md`**, filled in for your **Control4 MCP Server** project based on everything we’ve built and debugged together. You can tweak names or wording later, but this is a solid “project brain” starting point.
-
----
-
-```markdown
 # PROJECT_OVERVIEW.md
 
 ## Project name
@@ -73,11 +68,12 @@ Python dependencies are pinned in `requirements.txt`.
 ├── control4_gateway.py     # Async Control4 integration core (single event loop)
 ├── control4_adapter.py     # Thin synchronous facade over the gateway
 ├── config.json             # Local config (host, credentials) – not committed
+├── session_memory.py       # Session-scoped memory for follow-ups (e.g., “turn it back on”)
 ├── docs/                   # Project documentation (architecture/spec/context)
 ├── tools/                  # Local debug / inspection scripts
 ├── logs/                   # Local logs from debug tools (not committed)
 └── README.md               # Basic setup and usage instructions
-````
+```
 
 **Key principles**
 
@@ -153,6 +149,15 @@ Python dependencies are pinned in `requirements.txt`.
 * Tool contracts are versioned implicitly via MCP tool names
 * Backward compatibility preserved by adding tools, not changing signatures
 
+### Session context (for follow-ups)
+
+Clients should pass a stable session identifier (per device/user session) so the server can retain short-lived context for follow-up commands.
+
+- HTTP clients: send `X-Session-Id: <stable-id>`
+- STDIO clients: use the equivalent session mechanism provided by the client wrapper
+
+This powers tools like `c4_lights_get_last` / `c4_lights_set_last`.
+
 ---
 
 ## 6. API surface
@@ -217,6 +222,13 @@ Python dependencies are pinned in `requirements.txt`.
 * `c4_light_ramp`
 * `c4_light_set_by_name` (fast-path: resolve by name and set level/state in one call)
 * `c4_room_lights_set` (fast-path: set all lights in a room; optional exclude/include, ramp, confirm)
+* `c4_lights_get_last` (read memory: last lights target for the session)
+* `c4_lights_set_last` (write using memory: apply state/level to last lights target)
+
+**Session memory (debug/ops)**
+
+* `c4_memory_get`
+* `c4_memory_clear`
 
 **Locks**
 
@@ -393,7 +405,7 @@ PowerShell (recommended):
 
 ## 11. Coding conventions
 
-* Python 3.11+ (validated on Python 3.13)
+* Python 3.11+ (validated on Python 3.13; Python 3.12 recommended for best wheel availability)
 * Type hints everywhere
 * Explicit timeouts on I/O
 * No silent exception swallowing
@@ -452,10 +464,4 @@ PowerShell (recommended):
 
 ---
 
-```
 
-If you want, next we can:
-- Split this into **`ARCHITECTURE.md` + `RUNBOOK.md`**
-- Add **sequence diagrams** (ASCII or Mermaid)
-- Turn the ADR section into separate numbered ADR files
-```
