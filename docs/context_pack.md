@@ -4,7 +4,7 @@
 
 ## Mini executive summary (≤120 words)
 
-c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP and STDIO. It enforces strict layering: sync tool handlers (`app.py`) → sync facade (`control4_adapter.py`) → async gateway (`control4_gateway.py`) that owns all Director I/O on a single background asyncio loop thread (avoids async deadlocks and flaky behavior). It’s optimized for “common actions” with short-TTL item caching (`C4_ITEMS_CACHE_TTL_S`) and fast-path tools like `c4_light_set_by_name` and `c4_room_lights_set`. Writes remain gated/guardrailed and confirmations are best-effort and time-bounded. Lightweight per-session memory keyed by `X-Session-Id` enables follow-ups like “turn it back on” via `c4_lights_get_last` / `c4_lights_set_last`.
+c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP and STDIO. It enforces strict layering: sync tool handlers (`app.py`) → sync facade (`control4_adapter.py`) → async gateway (`control4_gateway.py`) that owns all Director I/O on a single background asyncio loop thread (avoids async deadlocks and flaky behavior). It’s optimized for “common actions” with short-TTL item caching (`C4_ITEMS_CACHE_TTL_S`) and fast-path tools like `c4_light_set_by_name` and `c4_room_lights_set`. Writes remain gated/guardrailed and confirmations are best-effort and time-bounded. Lightweight per-session memory keyed by `X-Session-Id` enables follow-ups for both lights and TV/media (e.g., “turn it back on”, “turn off the TV”, “mute it”) via the `*_get_last` / `*_last` helper tools.
 
 ## Critical architecture (≤6 bullets)
 
@@ -19,7 +19,7 @@ c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP a
 
 - `app.py` — MCP tool surface, validation, guardrails, transport glue.
 - `control4_gateway.py` — async orchestration: timeouts, caching, confirmations, driver quirks.
-- `session_memory.py` — session-scoped memory and “last lights” helpers.
+- `session_memory.py` — session-scoped memory and “last” helpers for lights + TV/media follow-ups.
 - `tools/run_e2e.py` — fast regression runner (HTTP + STDIO coverage).
 - `tools/validate_http_session_memory.py` — validates `X-Session-Id` memory behavior.
 - `docs/project_overview.md` — source of truth for architecture/tool surface.
@@ -35,14 +35,16 @@ c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP a
 **Tool surface (stability rule)**
 
 - Do not rename or change existing tool signatures; add new tools instead.
-- Follow-up memory tools (required for “turn it back on” style commands): `c4_lights_get_last`, `c4_lights_set_last`.
+- Follow-up memory tools (required for “turn it back on / turn it off / turn it down” style commands):
+	- Lights: `c4_lights_get_last`, `c4_lights_set_last`
+	- TV/media: `c4_tv_get_last`, `c4_tv_off_last`, `c4_tv_remote_last`
 
 ## Today’s objectives and acceptance criteria
 
 **Objective A — Keep follow-ups reliable (session memory)**
 
 - Memory is scoped by `X-Session-Id` and survives multiple sequential tool calls.
-- `c4_lights_set_last` applies the prior target deterministically for the same session.
+- `c4_lights_set_last` and TV/media “last” tools apply the prior target deterministically for the same session.
 
 **Objective B — Prevent hangs and deadlocks**
 
@@ -82,6 +84,7 @@ Steps:
 1) Verify tool discovery: GET /mcp/list.
 2) Run tools/validate_http_session_memory.py against the active server.
 3) Run tools/run_e2e.py (HTTP + STDIO). Record any failures and the exact tool name.
+4) Validate TV/media follow-ups: run a TV command (watch/off/remote) then exercise a `*_last` TV tool in the same `X-Session-Id`.
 
 Constraints: preserve strict layering; don’t change existing tool names/signatures; all operations must have explicit, bounded timeouts; do not introduce new secrets into the repo.
 ```

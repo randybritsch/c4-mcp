@@ -1988,6 +1988,317 @@ def c4_tv_watch_by_name_tool(
     deselect: bool = False,
     dry_run: bool = False,
 ) -> dict:
+    def _resolve_watch_source_from_room_video_devices(
+        rid: int,
+        *,
+        require_unique_: bool,
+        include_candidates_: bool,
+    ) -> dict | None:
+        rv = room_list_video_devices(int(rid))
+        if not isinstance(rv, dict) or not rv.get("ok"):
+            return None
+
+        devices = rv.get("devices")
+        if not isinstance(devices, list) or not devices:
+            return None
+
+        # Control4 API shapes vary; try common id/name keys.
+        id_keys = ("deviceId", "device_id", "id", "deviceid")
+        name_keys = ("name", "label", "display", "displayName")
+
+        last: dict | None = None
+        for id_key in id_keys:
+            for name_key in name_keys:
+                try:
+                    last = resolve_named_candidates(
+                        str(source_device_name or ""),
+                        [d for d in devices if isinstance(d, dict)],
+                        entity="video device",
+                        name_key=str(name_key),
+                        id_key=str(id_key),
+                        max_candidates=10,
+                    )
+                except Exception:
+                    last = None
+                    continue
+
+                if not isinstance(last, dict):
+                    continue
+
+                if last.get("ok"):
+                    out: dict = {
+                        "ok": True,
+                        "device_id": str(last.get("id")),
+                        "name": str(last.get("name")),
+                        "room_id": str(rid),
+                        "match_type": f"room_video_devices:{last.get('match_type')}",
+                        "source": "room_video_devices",
+                    }
+                    if include_candidates_ and isinstance(last.get("candidates"), list):
+                        out["candidates"] = last.get("candidates")
+                    return out
+
+                # If uniqueness is required and the match is ambiguous, surface that.
+                if bool(require_unique_) and str(last.get("error_code") or "").lower() == "ambiguous":
+                    out = {
+                        "ok": False,
+                        "error": "ambiguous",
+                        "details": str(last.get("error") or "video source is ambiguous in this room"),
+                    }
+                    if include_candidates_ and isinstance(last.get("candidates"), list):
+                        out["candidates"] = last.get("candidates")
+                    if isinstance(last.get("matches"), list):
+                        out["matches"] = last.get("matches")
+                    return out
+
+        return None
+
+    def _resolve_watch_source_from_room_select_video_device_command(
+        rid: int,
+        *,
+        require_unique_: bool,
+        include_candidates_: bool,
+    ) -> dict | None:
+        """Resolve the requested Watch source from the room's SELECT_VIDEO_DEVICE command options.
+
+        Some Control4 installs return an empty list from /locations/rooms/{room_id}/video_devices.
+        The room commands endpoint is more universal and often includes enumerated device options.
+        """
+
+        rc_raw = room_list_commands(int(rid), "SELECT_VIDEO_DEVICE")
+        rc = rc_raw if isinstance(rc_raw, dict) else {"ok": True, "result": rc_raw}
+        if not isinstance(rc, dict) or not rc.get("ok"):
+            return None
+
+        cmds = rc.get("commands")
+        if not isinstance(cmds, list) or not cmds:
+            return None
+
+        def _extract_select_video_device_options(cmd: dict) -> list[dict]:
+            # Best-effort extraction: the Director payload shape varies across versions.
+            param_containers = [
+                cmd.get("params"),
+                cmd.get("parameters"),
+                cmd.get("tParams"),
+                cmd.get("args"),
+            ]
+
+            param_name_keys = ("name", "param", "key")
+            wanted_param_names = {
+                "deviceid",
+                "device_id",
+                "device",
+                "deviceId",
+            }
+
+            value_list_keys = ("values", "enum", "items", "options", "list", "candidates")
+            label_keys = ("label", "name", "display", "title", "text")
+            value_keys = ("value", "id", "deviceid", "deviceId")
+
+            def _coerce_option_rows(maybe: object) -> list[dict]:
+                if not isinstance(maybe, list):
+                    return []
+                out: list[dict] = []
+                for row in maybe:
+                    if not isinstance(row, dict):
+                        continue
+                    val = None
+                    for k in value_keys:
+                        if row.get(k) is None:
+                            continue
+                        try:
+                            val = int(row.get(k))
+                            break
+                        except Exception:
+                            continue
+                    if val is None or val <= 0:
+                        continue
+                    lab = None
+                    for k in label_keys:
+                        v = row.get(k)
+                        if isinstance(v, str) and v.strip():
+                            lab = v.strip()
+                            break
+                    out.append({"id": int(val), "name": str(lab or val)})
+                return out
+
+            def _probe_param_dict(param_dict: dict) -> list[dict]:
+                # If this param dict is the device selector, search for an embedded list of options.
+                pn = None
+                for nk in param_name_keys:
+                    v = param_dict.get(nk)
+                    if isinstance(v, str) and v.strip():
+                        pn = v.strip()
+                        break
+
+                if pn and pn.replace("_", "").lower() in {p.replace("_", "").lower() for p in wanted_param_names}:
+                    for lk in value_list_keys:
+                        options = _coerce_option_rows(param_dict.get(lk))
+                        if options:
+                            return options
+
+                # Some payloads embed nested param/value structures; shallow search one level.
+                for lk in value_list_keys:
+                    maybe = param_dict.get(lk)
+                    options = _coerce_option_rows(maybe)
+                    if options:
+                        return options
+                return []
+
+            # Walk known containers first.
+            for container in param_containers:
+                if isinstance(container, list):
+                    for p in container:
+                        if not isinstance(p, dict):
+                            continue
+                        found = _probe_param_dict(p)
+                        if found:
+                            return found
+                elif isinstance(container, dict):
+                    # Sometimes params is keyed dict: {"deviceid": {"values": [...]}}
+                    for k, v in container.items():
+                        if isinstance(k, str) and k.replace("_", "").lower() in {p.replace("_", "").lower() for p in wanted_param_names}:
+                            if isinstance(v, dict):
+                                for lk in value_list_keys:
+                                    found = _coerce_option_rows(v.get(lk))
+                                    if found:
+                                        return found
+                        if isinstance(v, dict):
+                            found = _probe_param_dict(v)
+                            if found:
+                                return found
+
+            return []
+
+        select_cmd: dict | None = None
+        for c in cmds:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("command") or "").strip().upper() == "SELECT_VIDEO_DEVICE":
+                select_cmd = c
+                break
+
+        if not isinstance(select_cmd, dict):
+            return None
+
+        options = _extract_select_video_device_options(select_cmd)
+        if not options:
+            return None
+
+        try:
+            resolved = resolve_named_candidates(
+                str(source_device_name or ""),
+                options,
+                entity="video device",
+                name_key="name",
+                id_key="id",
+                max_candidates=10,
+            )
+        except Exception:
+            resolved = None
+
+        if not isinstance(resolved, dict):
+            return None
+
+        if resolved.get("ok") and resolved.get("id") is not None:
+            out: dict = {
+                "ok": True,
+                "device_id": str(resolved.get("id")),
+                "name": str(resolved.get("name")),
+                "room_id": str(rid),
+                "match_type": f"room_command_select_video_device:{resolved.get('match_type')}",
+                "source": "room_commands",
+            }
+            if include_candidates_ and isinstance(resolved.get("candidates"), list):
+                out["candidates"] = resolved.get("candidates")
+            return out
+
+        # If uniqueness is required and the match is ambiguous, surface that.
+        if bool(require_unique_) and str(resolved.get("error_code") or "").lower() == "ambiguous":
+            out = {
+                "ok": False,
+                "error": "ambiguous",
+                "details": str(resolved.get("error") or "video source is ambiguous in this room"),
+            }
+            if include_candidates_ and isinstance(resolved.get("candidates"), list):
+                out["candidates"] = resolved.get("candidates")
+            if isinstance(resolved.get("matches"), list):
+                out["matches"] = resolved.get("matches")
+            return out
+
+        return None
+
+    def _resolve_watch_source_scoped_in_room(
+        rid: int,
+        *,
+        require_unique_: bool,
+        include_candidates_: bool,
+    ) -> dict | None:
+        """Room-scoped Watch source resolution only.
+
+        This intentionally avoids inventory-based resolve_device, which may return a global device match
+        even when that source is not actually selectable in the candidate room.
+        """
+
+        by_room = _resolve_watch_source_from_room_video_devices(
+            int(rid),
+            require_unique_=bool(require_unique_),
+            include_candidates_=bool(include_candidates_),
+        )
+        if isinstance(by_room, dict):
+            return by_room
+
+        by_cmd = _resolve_watch_source_from_room_select_video_device_command(
+            int(rid),
+            require_unique_=bool(require_unique_),
+            include_candidates_=bool(include_candidates_),
+        )
+        if isinstance(by_cmd, dict):
+            return by_cmd
+
+        return None
+
+    def _resolve_watch_source_in_room(
+        rid: int,
+        *,
+        require_unique_: bool,
+        include_candidates_: bool,
+    ) -> dict:
+        """Resolve the requested Watch source device within a room.
+
+        Prefer the room's own selectable video_devices list (most accurate), then fall back to
+        inventory-based resolve_device with category fallbacks.
+        """
+
+        by_room = _resolve_watch_source_from_room_video_devices(
+            int(rid),
+            require_unique_=bool(require_unique_),
+            include_candidates_=bool(include_candidates_),
+        )
+        if isinstance(by_room, dict):
+            return by_room
+
+        by_cmd = _resolve_watch_source_from_room_select_video_device_command(
+            int(rid),
+            require_unique_=bool(require_unique_),
+            include_candidates_=bool(include_candidates_),
+        )
+        if isinstance(by_cmd, dict):
+            return by_cmd
+
+        last: dict | None = None
+        for cat in ("tv", "media", None):
+            last = resolve_device(
+                str(source_device_name or ""),
+                category=cat,
+                room_id=int(rid),
+                require_unique=bool(require_unique_),
+                include_candidates=bool(include_candidates_),
+            )
+            if isinstance(last, dict) and last.get("ok") and last.get("device_id") is not None:
+                return last
+        return last if isinstance(last, dict) else {"ok": False, "error": "could not resolve video source device"}
+
     resolved_room_id: int | None = None
     rr: dict | None = None
 
@@ -2025,13 +2336,14 @@ def c4_tv_watch_by_name_tool(
                         continue
 
                     # Check whether the requested source can be resolved inside that room.
+                    # IMPORTANT: use only room-scoped signals (video_devices / SELECT_VIDEO_DEVICE options).
+                    # Inventory-based resolve_device can return a global match and cause false positives.
                     try:
-                        rd_try = resolve_device(
-                            str(source_device_name or ""),
-                            category="media",
-                            room_id=cid,
-                            require_unique=True,
-                            include_candidates=False,
+                        # For viability checks, don't require uniqueness; we only care whether a match exists.
+                        rd_try = _resolve_watch_source_scoped_in_room(
+                            int(cid),
+                            require_unique_=False,
+                            include_candidates_=False,
                         )
                     except Exception:
                         rd_try = None
@@ -2074,13 +2386,11 @@ def c4_tv_watch_by_name_tool(
     if resolved_room_id is None:
         return {"ok": False, "error": "room_id could not be resolved", "details": rr}
 
-    # For Watch, we resolve the source device within the room to avoid cross-room ambiguity.
-    rd = resolve_device(
-        str(source_device_name or ""),
-        category="media",
-        room_id=resolved_room_id,
-        require_unique=bool(require_unique),
-        include_candidates=bool(include_candidates),
+    # For Watch, resolve the source device within the room to avoid cross-room ambiguity.
+    rd = _resolve_watch_source_in_room(
+        int(resolved_room_id),
+        require_unique_=bool(require_unique),
+        include_candidates_=bool(include_candidates),
     )
     if not isinstance(rd, dict) or not rd.get("ok"):
         return {"ok": False, "error": "could not resolve video source device", "details": rd}
