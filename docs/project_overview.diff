@@ -1,0 +1,58 @@
+diff --git a/docs/project_overview.md b/docs/project_overview.md
+index 4f28d3b..02e258e 100644
+--- a/docs/project_overview.md
++++ b/docs/project_overview.md
+@@ -3,11 +3,13 @@
+ ## Project name
+ **Control4 MCP Server**
+ 
++**Last Updated:** January 26, 2026
++
+ ---
+ 
+ ## 1. Executive summary
+ 
+-The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, media/AV, room Watch/Listen, plus macros/scheduler/announcements) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. It is optimized for fast “common actions” by caching Director item inventory with a short TTL and offering single-call tools like `c4_light_set_by_name` and `c4_room_lights_set` to reduce round trips. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`). For room-level audio now-playing, the server provides best-effort metadata derived from device variables (driver-dependent), exposed both by device id and by room id. The server also supports short-lived **session memory** (via `X-Session-Id`) to enable follow-ups like “turn it off” or “turn it down” using last-referenced lights and TV/media context.
++The Control4 MCP Server is a local integration layer that exposes Control4 home automation capabilities (lights, locks, thermostats, media/AV, room Watch/Listen, plus macros/scheduler/announcements) as Model Context Protocol (MCP) tools. It runs entirely on the local network, mediates all Control4 interactions through a carefully controlled gateway (single background asyncio loop) to avoid async deadlocks and flaky HTTP behavior, and provides a clean, synchronous tool interface for AI agents and other MCP clients. It is optimized for fast “common actions” by caching Director item inventory with a short TTL and offering single-call tools like `c4_light_set_by_name` and `c4_room_lights_set` to reduce round trips. Some devices (notably certain cloud lock drivers) can physically actuate while Director variables remain stale; tool results separate “Director accepted” from “state confirmed” and provide a best-effort estimate. For Roku app launching, the gateway routes commands across Roku proxy items and confirms success by polling Roku variables (e.g., `CURRENT_APP_ID`). For room-based TV Watch by-name flows, source viability is resolved using room-scoped signals and can fall back to parsing room command options (e.g., `SELECT_VIDEO_DEVICE`) when “room video devices” listings are incomplete, reducing repeated clarification loops. For room-level audio now-playing, the server provides best-effort metadata derived from device variables (driver-dependent), exposed both by device id and by room id. The server also supports short-lived **session memory** (via `X-Session-Id`) to enable follow-ups like “turn it off” or “turn it down” using last-referenced lights and TV/media context.
+ 
+ ---
+ 
+@@ -305,6 +307,9 @@ It also powers TV/media follow-ups like `c4_tv_get_last`, `c4_tv_off_last`, and
+ * **Room Watch before visible media actions**
+   → Selecting the room’s active video device (Watch/HDMI) is required for app launching to be reliably visible on-screen.
+ 
++* **TV Watch source viability fallback (command options)**
++  → Some installs return empty/incomplete room video device lists; for by-name Watch flows, fallback to parsing room command options (e.g., `SELECT_VIDEO_DEVICE`) to validate sources while narrowing ambiguity.
++
+ * **Item inventory cache (short TTL)**
+   → Name resolution and list endpoints rely on `/api/v1/items`; caching with `C4_ITEMS_CACHE_TTL_S` reduces latency dramatically for repeated actions.
+ 
+@@ -385,6 +390,7 @@ It also powers TV/media follow-ups like `c4_tv_get_last`, `c4_tv_off_last`, and
+ 
+ * Local dev (Windows/macOS/Linux)
+ * Same config for prod (on-prem)
++* Container deployments may use a Python override path (e.g., `PYTHONPATH=/app/overrides`) for hotfix validation
+ 
+ ### Configuration
+ 
+@@ -432,6 +438,7 @@ PowerShell (recommended):
+ * Director state/variables may remain stale even when the device physically actuates (locks observed)
+ * Scheduler enable/disable writes can be unreliable (400 server-side timeouts or 200 no-op); treat as best-effort and always check confirmed
+ * Media/app actions can be accepted but not visible if the room is not actively “watching” the correct input
++* Some room-scoped media inventory endpoints can return empty/incomplete data; tools may need command-based fallbacks
+ * Multiple/stale `app.py` processes on Windows can present an incorrect tool registry (use `c4_server_info` to confirm PID/tool_count)
+ * pyControl4 API differences across versions
+ * Limited documentation from Control4
+@@ -454,10 +461,12 @@ PowerShell (recommended):
+ * Add thermostat end-to-end support (read + safe write/confirm patterns)
+ * Add media/AV tooling (remote/navigation, now-playing best-effort, app launching)
+ * Make Roku app launching reliable (Watch/HDMI selection + protocol-group routing + `CURRENT_APP_ID` confirmation)
++* Reduce repeated TV Watch clarification loops by using room-scoped source viability checks with a command-based fallback (`SELECT_VIDEO_DEVICE`) when room video device listings are empty
+ * Add server/process diagnostic tool to detect stale/multiple `app.py` instances on Windows
+ 
+ ### Mid-term (2–8 weeks)
+ 
++* Refactor toward a more “typical MCP” layout (domain tool modules, cleaner transport wiring, smaller files) while preserving existing tool contracts. Start from current known-good HEAD; tag/branch a refactor baseline first for rollback/diffing; refactor in small slices and re-run `tools/run_e2e.py` after each slice.
+ * Room-based commands (e.g., “lock all doors”)
+ * Friendly name resolution (room + device)
+ * Expand room-level media control (power off / end session, volume, input)

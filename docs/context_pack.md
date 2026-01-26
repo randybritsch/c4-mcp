@@ -1,6 +1,6 @@
 # Context Pack — c4-mcp (Control4 MCP Server)
 
-**Last Updated:** January 23, 2026
+**Last Updated:** January 26, 2026
 
 ## Mini executive summary (≤120 words)
 
@@ -14,10 +14,12 @@ c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP a
 - Cache Director item inventory with a short TTL for fast resolution (`C4_ITEMS_CACHE_TTL_S`).
 - Write semantics are bounded: “accepted vs confirmed” with time-bounded polling.
 - Session context is keyed by `X-Session-Id` (HTTP) to support follow-ups.
+- TV Watch by-name resolves source viability using room-scoped signals and can fall back to parsing room command options (e.g., `SELECT_VIDEO_DEVICE`) when room video device listings are incomplete.
 
 ## Current working set (3–7 files/modules)
 
 - `app.py` — MCP tool surface, validation, guardrails, transport glue.
+- `app.py` (`c4_tv_watch_by_name_tool`) — room-scoped TV Watch source resolution and command-based fallback when room video devices are empty.
 - `control4_gateway.py` — async orchestration: timeouts, caching, confirmations, driver quirks.
 - `session_memory.py` — session-scoped memory and “last” helpers for lights + TV/media follow-ups.
 - `tools/run_e2e.py` — fast regression runner (HTTP + STDIO coverage).
@@ -56,6 +58,14 @@ c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP a
 - `c4_light_set_by_name` and `c4_room_lights_set` stay fast via caching and resolve+execute fast paths.
 - With confirmation enabled, results remain time-bounded and clearly report confirmed/not-confirmed.
 
+**Objective D — Enable “typical MCP” refactor safely (docs-first)**
+
+- Define target module boundaries (domain tool modules + transport wiring) without changing any existing tool names/args.
+- Acceptance: `GET /mcp/list` output remains stable (same tool names + arg schemas), and e2e scripts still pass.
+- Start from current known-good HEAD; only rewind to an older commit if you have a specific regression you’re escaping.
+- Before refactor code changes: create a baseline tag/branch (e.g., `refactor-baseline-2026-01-26`) for quick rollback and diffing.
+- Refactor in small, testable slices; run `tools/run_e2e.py` after each slice.
+
 ## Guardrails (from conventions)
 
 - Preserve layering; never call Director/pyControl4 from `app.py`.
@@ -63,6 +73,7 @@ c4-mcp exposes Control4 home automation as safe-by-default MCP tools over HTTP a
 - Never commit secrets; `config.json` is local-only and gitignored.
 - Keep all writes safe-by-default and time-bounded; prefer dry-run where appropriate.
 - Preserve tool names/signatures; contracts evolve by addition.
+- Refactor direction: move toward a more “typical MCP” layout (domain tool modules, smaller files) without breaking tool contracts.
 
 ## Links/paths for deeper docs
 
