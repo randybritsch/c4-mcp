@@ -25,6 +25,16 @@ Turn your Control4 system into a **Model Context Protocol (MCP)** toolset, so an
 - Activate scenes, control shades, query variables/commands, and (optionally) change state (lights/locks/thermostat/media).
 - Use it as a local “home automation brain” for chat + agents without hard-coding your project’s device IDs.
 
+## Non-negotiable rules
+
+1) **`c4-mcp` must remain decoupled from any specific client app (including `c4-mcp-app`).**
+	- Integration is via MCP over HTTP/STDIO only.
+	- No shared code or cross-repo imports; clients should treat `c4-mcp` as an external dependency.
+
+2) **The client (AI/app) owns command interpretation; `c4-mcp` owns execution + safety.**
+	- The client decides which tools to call and with what arguments (and in what sequence).
+	- `c4-mcp` validates inputs, enforces guardrails, executes tool calls, and returns structured results/ambiguity.
+
 ## Example prompts (copy/paste)
 
 These work well in MCP clients like Claude Desktop (the client will call tools under the hood):

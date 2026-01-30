@@ -3,7 +3,7 @@
 ## Project name
 **Control4 MCP Server**
 
-**Last Updated:** January 26, 2026
+**Last Updated:** January 29, 2026
 
 ---
 
@@ -212,8 +212,8 @@ It also powers TV/media follow-ups like `c4_tv_get_last`, `c4_tv_off_last`, and 
 
 * `c4_tv_list`
 * `c4_tv_watch(room_id, source_device_id, deselect)`
-* `c4_tv_watch_by_name(room_name, source_device_name, room_id?, dry_run?, include_candidates?, require_unique?)`
-* `c4_tv_off(room_id, confirm_timeout_s)`
+* `c4_tv_watch_by_name(source_device_name, room_name?, room_id?, dry_run?, include_candidates?, require_unique?, deselect?)`
+* `c4_tv_off(room_id?, room_name?, confirm_timeout_s?)`
 * `c4_tv_off_last(session_id?, confirm_timeout_s)`
 * `c4_tv_remote(room_id, button, press?)`
 * `c4_tv_remote_last(button, session_id?, press?)`

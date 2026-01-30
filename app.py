@@ -802,6 +802,107 @@ def c4_room_watch_status_tool(room_id: str) -> dict:
 
 
 @Mcp.tool(
+    name="c4_room_presence_report",
+    description=(
+        "Resolve a room by id or name and return a consolidated presence/status report (read-only). "
+        "Intended for flows like: user says 'I\'m in <room>' and the client wants a single tool call that "
+        "returns current watch/listen/now-playing status for that room. "
+        "Returns ambiguity candidates when the room name is not unique."
+    ),
+)
+def c4_room_presence_report_tool(
+    room_id: str | None = None,
+    room_name: str | None = None,
+    include_watch_status: bool = True,
+    include_listen_status: bool = True,
+    include_now_playing: bool = True,
+) -> dict:
+    rid: int | None = None
+    rname: str | None = (str(room_name).strip() if room_name is not None else None) or None
+
+    if room_id is not None and str(room_id).strip():
+        try:
+            rid = int(str(room_id).strip())
+        except Exception:
+            return {"ok": False, "error": "invalid_room_id", "details": {"room_id": room_id}}
+
+    if rid is None:
+        if not rname:
+            return {"ok": False, "error": "missing_room", "details": {"message": "room_id or room_name is required"}}
+
+        resolved = resolve_room(rname, require_unique=True, include_candidates=True)
+        if not isinstance(resolved, dict):
+            return {"ok": False, "error": "resolve_room_failed"}
+
+        if not resolved.get("ok", False):
+            # Preserve ambiguity/error payloads as-is so clients can convert to clarification.
+            return resolved
+
+        # Common shape: { ok: true, room_id: <int>, room_name: <str>, ... }
+        rid_val = resolved.get("room_id")
+        if rid_val is None:
+            return {"ok": False, "error": "resolve_room_missing_room_id", "details": resolved}
+
+        try:
+            rid = int(rid_val)
+        except Exception:
+            return {"ok": False, "error": "resolve_room_invalid_room_id", "details": {"room_id": rid_val}}
+
+        rname = (
+            (str(resolved.get("room_name")).strip() if resolved.get("room_name") is not None else "")
+            or (str(resolved.get("name")).strip() if resolved.get("name") is not None else "")
+            or rname
+        )
+
+    # Best-effort: if we only got room_id, try to backfill a human name.
+    if (not rname) and rid is not None:
+        try:
+            rooms = list_rooms()
+            for r in rooms or []:
+                if not isinstance(r, dict):
+                    continue
+                if int(r.get("id")) == int(rid):
+                    nm = r.get("name")
+                    if nm:
+                        rname = str(nm)
+                        break
+        except Exception:
+            # Leave name unset; never fail the whole call for display-only fields.
+            pass
+
+    report: dict = {
+        "ok": True,
+        "room": {
+            "room_id": rid,
+            "room_name": rname,
+        },
+    }
+
+    if rid is None:
+        return {"ok": False, "error": "room_not_resolved"}
+
+    if bool(include_watch_status):
+        try:
+            report["watch_status"] = room_watch_status(int(rid))
+        except Exception as e:
+            report["watch_status"] = {"ok": False, "error": "watch_status_failed", "details": str(e)}
+
+    if bool(include_listen_status):
+        try:
+            report["listen_status"] = room_listen_status(int(rid))
+        except Exception as e:
+            report["listen_status"] = {"ok": False, "error": "listen_status_failed", "details": str(e)}
+
+    if bool(include_now_playing):
+        try:
+            report["now_playing"] = room_now_playing(int(rid))
+        except Exception as e:
+            report["now_playing"] = {"ok": False, "error": "now_playing_failed", "details": str(e)}
+
+    return report
+
+
+@Mcp.tool(
     name="c4_room_send_command",
     description=(
         "Send a named room-level command to a room (POST /rooms/{room_id}/commands). "
@@ -1814,11 +1915,14 @@ def c4_shade_set_position_tool(device_id: str, position: int, confirm_timeout_s:
 )
 def c4_find_devices_tool(
     search: str | None = None,
+    query: str | None = None,
     category: str | None = None,
     room_id: str | None = None,
     limit: int = 20,
     include_raw: bool = False,
 ) -> dict:
+    if (search is None or not str(search).strip()) and query is not None and str(query).strip():
+        search = query
     rid = int(room_id) if room_id is not None and str(room_id).strip() else None
     return find_devices(
         (str(search) if search is not None else None),
@@ -1980,8 +2084,8 @@ def c4_tv_watch_tool(room_id: str, source_device_id: str, deselect: bool = False
     ),
 )
 def c4_tv_watch_by_name_tool(
-    room_name: str,
     source_device_name: str,
+    room_name: str | None = None,
     room_id: str | None = None,
     require_unique: bool = True,
     include_candidates: bool = True,
