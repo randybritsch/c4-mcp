@@ -268,6 +268,8 @@ _WRITE_TOOL_NAMES = {
     "c4_room_remote",
     "c4_room_off",
     "c4_room_select_video_device",
+    "c4_tv_remote",
+    "c4_tv_remote_last",
     "c4_tv_watch_by_name",
     "c4_room_select_audio_device",
     "c4_room_listen",

@@ -534,6 +534,48 @@ def _validate_media_sequence(
     _expect(bool(r.get("ok")) is True, "c4_media_remote_sequence returned ok=false")
 
 
+def _validate_room_remote(
+    base_url: str,
+    room_id: str,
+    do_writes: bool,
+    remote_smoke: bool,
+    remote_button: str,
+    remote_press: str,
+    timeout_s: float,
+    headers: Dict[str, str],
+) -> None:
+    print(f"\n-- Room remote validation (room_id={room_id}) --")
+
+    # Read-only: list rooms to verify the room exists
+    rooms = _unwrap_call_payload(
+        mcp_call(base_url, kind="tool", name="c4_list_rooms", args={}, timeout_s=timeout_s, headers=headers)
+    )
+    _print_json("c4_list_rooms", rooms)
+    _expect(isinstance(rooms.get("rooms"), list), "c4_list_rooms did not return rooms list")
+
+    if do_writes and remote_smoke:
+        # Test c4_tv_remote
+        r = _unwrap_call_payload(
+            mcp_call(
+                base_url,
+                kind="tool",
+                name="c4_tv_remote",
+                args={
+                    "room_id": str(room_id),
+                    "button": str(remote_button),
+                    "press": str(remote_press),
+                },
+                timeout_s=timeout_s,
+                headers=headers,
+            )
+        )
+        _print_json("c4_tv_remote", r)
+        _expect(bool(r.get("ok")) is True, "c4_tv_remote returned ok=false")
+        _expect("room_id" in r, "c4_tv_remote missing room_id")
+        _expect("requested" in r, "c4_tv_remote missing requested")
+        _expect("accepted" in r, "c4_tv_remote missing accepted")
+
+
 def _poll_light(
     base_url: str,
     headers: Dict[str, str],
@@ -653,6 +695,14 @@ def main() -> int:
             "With --do-writes, send a comma-separated sequence of buttons via c4_media_remote_sequence (e.g. 'home,down,down,select')."
         ),
     )
+    p.add_argument("--room-id", type=str, default=None, help="Room ID to validate c4_tv_remote")
+    p.add_argument(
+        "--room-remote-smoke",
+        action="store_true",
+        help="With --do-writes, send a single c4_tv_remote command as a smoke test.",
+    )
+    p.add_argument("--room-remote-button", type=str, default="menu", help="Button for --room-remote-smoke (default: menu)")
+    p.add_argument("--room-remote-press", type=str, default="Tap", help="Press for --room-remote-smoke (Tap|Long Press|Down|Up)")
     p.add_argument("--thermostat-id", type=str, default=None, help="Thermostat device_id to validate")
     p.add_argument(
         "--thermostat-target-f",
@@ -1122,6 +1172,19 @@ def main() -> int:
             buttons=seq,
             press=str(args.media_remote_press),
             delay_ms=200,
+            timeout_s=float(args.timeout),
+            headers=headers,
+        )
+
+    # ---- Room Remote (TV Remote) ----
+    if args.room_id:
+        _validate_room_remote(
+            args.base_url,
+            str(args.room_id),
+            do_writes=bool(args.do_writes),
+            remote_smoke=bool(args.room_remote_smoke),
+            remote_button=str(args.room_remote_button),
+            remote_press=str(args.room_remote_press),
             timeout_s=float(args.timeout),
             headers=headers,
         )
