@@ -3,7 +3,7 @@
 ## Project name
 **Control4 MCP Server**
 
-**Last Updated:** January 29, 2026
+**Last Updated:** February 5, 2026
 
 ---
 
@@ -288,6 +288,9 @@ It also powers TV/media follow-ups like `c4_tv_get_last`, `c4_tv_off_last`, and 
 
 * **Strict layer separation**
   → Keeps Flask simple and recoverable; isolates Control4 quirks.
+
+* **Strict MCP schemas (client normalizes)**
+  → Tools enforce required args and return structured ambiguity; higher-level clients/apps should validate and normalize tool arguments before calling to avoid schema-invalid requests.
 
 * **pyControl4 for all Director access**
   → Avoids 401s and protocol mismatches seen with raw REST calls.

@@ -81,9 +81,8 @@ Anchor links back to `project_overview.md`. Keep each file pragmatic and impleme
 
 ## Prompt C — Create the “Bootstrap Summary” (for new chats)
 
-> **Goal:** A compact, re‑importable brief you can paste to reload context.
+**Goal:** A compact, re‑importable brief you can paste to reload context.
 
-```text
 Create a compact “PROJECT BOOTSTRAP SUMMARY” focused on fast context reloads in new chats. Include:
 
 1) One-line purpose  
@@ -97,8 +96,7 @@ Create a compact “PROJECT BOOTSTRAP SUMMARY” focused on fast context reloads
 9) Links/paths to the full docs (`project_overview.md`, `/docs/...`)
 
 Keep it under ~400–700 words, highly scannable, with bolded section headers.
-Update it in 'docs\bootstrap_summary.md'
-```
+Update it in 'docs/bootstrap_summary.md'
 
 ***
 
@@ -125,19 +123,17 @@ Write as a short, enforceable checklist. Max ~200–300 words. Make it copy-past
 
 ## Prompt E — Diff‑Based Update of `project_overview.md` (use after sessions)
 
-> **Goal:** Keep the “project brain” file accurate without overwriting.
+ **Goal:** Keep the “project brain” file accurate without overwriting.
 
-```text
 We made changes in this session (code/architecture/decisions). Generate:
 1) A concise bullet list of updates  
 2) A unified diff (old → new) for `docs\project_overview.md`  
-3) Update the `docs\project_overview.md`
+3) Update the `docs/project_overview.md`
 
 Rules:
 - Only change sections that truly need updates
 - Preserve existing structure and anchors
 - Be explicit and minimal in the diff
-```
 
 ***
 
